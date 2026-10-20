@@ -221,16 +221,17 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
             }
         }
 
-        // Check if run took > 20 minutes (1200 seconds)
-        if elapsed >= Duration::from_secs(1200) {
-            let mins = elapsed.as_secs() / 60;
-            let secs = elapsed.as_secs() % 60;
-            let reminder = format!(
-                "\n[crew] Note: Agent run took {}m{:02}s (> 20m). Consider rating it with: crew review write <model> \"<task>\"\n",
-                mins, secs
-            );
+        // Long run review reminder note
+        let model = record
+            .args
+            .windows(2)
+            .find(|w| w[0] == "-m" || w[0] == "--model")
+            .map(|w| w[1].as_str())
+            .unwrap_or(&record.provider);
+
+        if let Some(note) = crate::review::long_run_note(elapsed, model) {
             if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(dir.join("stderr")) {
-                let _ = sf.write_all(reminder.as_bytes());
+                let _ = writeln!(sf, "{}", note);
             }
         }
     }

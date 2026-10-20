@@ -332,6 +332,20 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
     Ok(0)
 }
 
+fn extract_model(rec: &RunRecord) -> &str {
+    rec.args
+        .windows(2)
+        .find(|w| w[0] == "-m" || w[0] == "--model")
+        .map(|w| w[1].as_str())
+        .unwrap_or(&rec.provider)
+}
+
+fn run_duration(rec: &RunRecord) -> Option<Duration> {
+    let s = parse_iso_time(rec.started_at.as_deref()?)?;
+    let f = parse_iso_time(rec.finished_at.as_deref()?)?;
+    f.duration_since(s).ok()
+}
+
 pub fn result(name: &str) -> Result<i32, Error> {
     let rec = load_record(name)?;
     let alive = is_process_alive(
@@ -359,6 +373,12 @@ pub fn result(name: &str) -> Result<i32, Error> {
     std::io::stdout()
         .write_all(&bytes)
         .map_err(|e| Error::new(2, format!("write error: {}", e)))?;
+
+    if let Some(dur) = run_duration(&rec) {
+        if let Some(note) = crate::review::long_run_note(dur, extract_model(&rec)) {
+            eprintln!("{}", note);
+        }
+    }
 
     Ok(0)
 }
@@ -419,6 +439,12 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
                     } else {
                         rec.exit_code.unwrap_or(0)
                     };
+
+                    if let Some(dur) = run_duration(&rec) {
+                        if let Some(note) = crate::review::long_run_note(dur, extract_model(&rec)) {
+                            eprintln!("{}", note);
+                        }
+                    }
 
                     if any {
                         println!("{}", name);
