@@ -1,0 +1,66 @@
+# Built-in tier map. A user file at ~/.config/crew/tiers.toml replaces this
+# whole table. Model strings are what the runner puts on the CLI.
+
+[claude.fast]
+model = "haiku"
+effort = "medium"
+
+[claude.balanced]
+model = "sonnet"
+effort = "medium"
+
+[claude.smart]
+model = "opus"
+effort = "high"
+
+[claude.max]
+model = "fable"
+effort = "max"
+
+[codex.fast]
+model = "gpt-6-luna"
+effort = "low"
+
+[codex.balanced]
+model = "gpt-6.1-sol"
+effort = "low"
+
+[codex.smart]
+model = "gpt-6-astra"
+effort = "high"
+
+[codex.max]
+model = "gpt-6-astra"
+effort = "ultra"
+
+[gemini.fast]
+model = "gemini-3.8-flash-low"
+effort = "low"
+
+[gemini.balanced]
+model = "gemini-3.8-flash-medium"
+effort = "medium"
+
+[gemini.smart]
+model = "gemini-3.8-flash-high"
+effort = "high"
+
+[gemini.max]
+model = "gemini-4-argon-high"
+effort = "high"
+
+[grok.fast]
+model = "grok-4.7"
+effort = "low"
+
+[grok.balanced]
+model = "grok-4.7"
+effort = "medium"
+
+[grok.smart]
+model = "grok-4.7"
+effort = "high"
+
+[grok.max]
+model = "grok-4.7"
+effort = "xhigh"
