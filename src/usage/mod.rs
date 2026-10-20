@@ -197,11 +197,48 @@ fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
     Ok(output)
 }
 
+pub(crate) fn parse_codex_rate_limit(resp: &Value) -> Vec<Gauge> {
+    let mut windows = Vec::new();
+    if let Some(rate_limit) = resp.get("rate_limit").and_then(|r| r.as_object()) {
+        for key in ["primary_window", "secondary_window"] {
+            if let Some(win) = rate_limit.get(key).and_then(|w| w.as_object()) {
+                if let Some(pct) = win.get("used_percent").and_then(|u| u.as_f64()) {
+                    let seconds = win
+                        .get("limit_window_seconds")
+                        .and_then(|s| s.as_i64())
+                        .unwrap_or(0);
+                    let window_label = if seconds > 0 && seconds < 48 * 3600 {
+                        format!("{}h", (seconds as f64 / 3600.0).round() as i64)
+                    } else {
+                        "week".to_string()
+                    };
+                    let reset = win.get("reset_at").and_then(|r| {
+                        if let Some(epoch) = r.as_i64() {
+                            Some(epoch.to_string())
+                        } else {
+                            r.as_str().map(|s| s.to_string())
+                        }
+                    });
+                    windows.push(Gauge {
+                        id: format!("codex:{}", key),
+                        label: format!("Codex · {}", window_label),
+                        percent: pct.round().clamp(0.0, 100.0) as u32,
+                        reset,
+                        stale: false,
+                    });
+                }
+            }
+        }
+    }
+    windows
+}
+
 fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
     let home = std::env::var("HOME").unwrap_or_default();
     let auth_path = Path::new(&home).join(".codex/auth.json");
 
     let mut token: Option<String> = None;
+    let mut account_id: Option<String> = None;
     let mut plan: Option<String> = None;
 
     if auth_path.is_file() {
@@ -211,6 +248,17 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
                     token = Some(t.to_string());
                     plan = decode_jwt_plan(t);
                 }
+                if let Some(acc) = val["tokens"]["account_id"].as_str() {
+                    account_id = Some(acc.to_string());
+                }
+                if plan.is_none() {
+                    if let Some(p) = val["account"]["plan_type"].as_str() {
+                        let mut chars = p.chars();
+                        if let Some(first) = chars.next() {
+                            plan = Some(first.to_uppercase().collect::<String>() + chars.as_str());
+                        }
+                    }
+                }
             }
         }
     }
@@ -219,31 +267,25 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
     let mut error = None;
 
     if let Some(ref tok) = token {
-        let output = Command::new("curl")
-            .arg("-s")
+        let mut cmd = Command::new("curl");
+        cmd.arg("-s")
             .arg("-m")
             .arg("10")
             .arg("-H")
             .arg(format!("Authorization: Bearer {}", tok))
             .arg("-H")
-            .arg("Content-Type: application/json")
-            .arg("https://chatgpt.com/backend-api/wham/usage")
-            .output();
+            .arg("User-Agent: UsageBar")
+            .arg("-H")
+            .arg("Content-Type: application/json");
+        if let Some(ref acc) = account_id {
+            cmd.arg("-H").arg(format!("ChatGPT-Account-Id: {}", acc));
+        }
+        cmd.arg("https://chatgpt.com/backend-api/wham/usage");
 
-        if let Ok(out) = output {
+        if let Ok(out) = cmd.output() {
             if out.status.success() {
                 if let Ok(resp) = serde_json::from_slice::<Value>(&out.stdout) {
-                    if let Some(rate_limit) = resp.get("rate_limit") {
-                        if let Some(pct) = rate_limit["used_percent"].as_f64() {
-                            windows.push(Gauge {
-                                id: "codex:primary_window".to_string(),
-                                label: "week".to_string(),
-                                percent: pct.round() as u32,
-                                reset: rate_limit["reset_time"].as_str().map(|s| s.to_string()),
-                                stale: false,
-                            });
-                        }
-                    }
+                    windows = parse_codex_rate_limit(&resp);
                 }
             }
         }
@@ -968,5 +1010,28 @@ mod tests {
             monthly.get("onDemandCap").and_then(|c| c["val"].as_f64())
         };
         assert_eq!(ondemand_cap, Some(50.0));
+    }
+
+    #[test]
+    fn test_parse_codex_rate_limit() {
+        let payload = serde_json::json!({
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 604800,
+                    "reset_after_seconds": 561970,
+                    "reset_at": 1793090890
+                },
+                "secondary_window": null
+            }
+        });
+        let gauges = super::parse_codex_rate_limit(&payload);
+        assert_eq!(gauges.len(), 1);
+        assert_eq!(gauges[0].id, "codex:primary_window");
+        assert_eq!(gauges[0].label, "Codex · week");
+        assert_eq!(gauges[0].percent, 100);
+        assert!(!gauges[0].stale);
     }
 }

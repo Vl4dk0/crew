@@ -68,12 +68,34 @@ pub fn paint(code: &str, text: &str, tty: bool) -> String {
     }
 }
 
+const WINDOW_WORDS: [(&str, &str); 3] = [("týždeň", "week"), ("mesiac", "month"), ("5 h", "5h")];
+
 pub fn window_name(g: &Gauge) -> String {
-    if let Some(pos) = g.label.find('·') {
-        g.label[pos + '·'.len_utf8()..].trim().to_string()
+    let raw = if !g.label.is_empty() { &g.label } else { &g.id };
+    let (left, right) = if let Some(pos) = raw.find('·') {
+        (raw[..pos].trim(), raw[pos + '·'.len_utf8()..].trim())
     } else {
-        g.label.trim().to_string()
+        ("", raw.trim())
+    };
+
+    let mut norm = right.to_string();
+    for (src, dst) in WINDOW_WORDS {
+        norm = norm.replace(src, dst);
     }
+
+    let prefix = match left {
+        "Gemini" => "gemini ",
+        "Other models" => "other models ",
+        other
+            if (g.id.starts_with("antigravity:") || g.id.starts_with("gemini:"))
+                && !other.is_empty() =>
+        {
+            return format!("{} {}", other, norm).trim().to_string();
+        }
+        _ => "",
+    };
+
+    format!("{}{}", prefix, norm).trim().to_string()
 }
 
 fn sort_key(view: &ProviderView) -> (u8, u32, String) {
@@ -217,5 +239,53 @@ mod tests {
         assert!(grok_idx < codex_idx);
         assert!(out.contains("12%  ██▍░░░░░░░░░░░░░░░░░"));
         assert!(out.contains("100%  ████████████████████"));
+    }
+
+    #[test]
+    fn window_name_normalization_and_prefixes() {
+        let g1 = Gauge {
+            id: "claude:session".to_string(),
+            label: "Claude · 5 h".to_string(),
+            percent: 90,
+            reset: None,
+            stale: false,
+        };
+        assert_eq!(window_name(&g1), "5h");
+
+        let g2 = Gauge {
+            id: "claude:weekly_all".to_string(),
+            label: "Claude · týždeň".to_string(),
+            percent: 20,
+            reset: None,
+            stale: false,
+        };
+        assert_eq!(window_name(&g2), "week");
+
+        let g3 = Gauge {
+            id: "codex:primary_window".to_string(),
+            label: "Codex · týždeň".to_string(),
+            percent: 100,
+            reset: None,
+            stale: false,
+        };
+        assert_eq!(window_name(&g3), "week");
+
+        let g4 = Gauge {
+            id: "antigravity:gemini-5h".to_string(),
+            label: "Gemini · 5 h".to_string(),
+            percent: 40,
+            reset: None,
+            stale: false,
+        };
+        assert_eq!(window_name(&g4), "gemini 5h");
+
+        let g5 = Gauge {
+            id: "antigravity:gemini-argon-wtu-weekly".to_string(),
+            label: "Gemini 4 Argon · týždeň".to_string(),
+            percent: 70,
+            reset: None,
+            stale: false,
+        };
+        assert_eq!(window_name(&g5), "Gemini 4 Argon week");
     }
 }
