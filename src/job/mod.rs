@@ -6,7 +6,9 @@ pub mod store;
 pub mod supervisor;
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,7 +18,7 @@ use crate::error::Error;
 use crate::id::Provider;
 use models::{RunRecord, Status, status_of, validate_run_name};
 use process::is_process_alive;
-use store::{load_record, run_dir, runs_dir, save_record, tail_lines};
+use store::{load_record, open_safe_read, run_dir, runs_dir, save_record, tail_lines};
 
 /// A job the supervisor has not started yet.
 pub struct NewJob {
@@ -62,7 +64,7 @@ fn current_iso() -> String {
     )
 }
 
-fn parse_iso_time(s: &str) -> Option<SystemTime> {
+pub fn parse_iso_time(s: &str) -> Option<SystemTime> {
     // Basic parser for RFC3339 timestamps e.g. 2026-10-20T20:00:00.000000Z
     let parts: Vec<&str> = s.split('T').collect();
     if parts.len() != 2 {
@@ -119,7 +121,84 @@ fn format_age(created_at: &str) -> String {
     "?".to_string()
 }
 
+/// Extract only flags from `trailing`, removing the single positional prompt.
+fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String> {
+    if !prompt_is_positional {
+        return trailing.to_vec();
+    }
+
+    let mut flags = Vec::new();
+    let mut i = 0;
+    let mut prompt_removed = false;
+
+    while i < trailing.len() {
+        let token = &trailing[i];
+        if token == "--" {
+            if !prompt_removed && i + 1 < trailing.len() {
+                i += 2;
+                while i < trailing.len() {
+                    flags.push(trailing[i].clone());
+                    i += 1;
+                }
+                break;
+            } else {
+                flags.push(token.clone());
+                i += 1;
+                continue;
+            }
+        }
+
+        if token.starts_with('-') {
+            flags.push(token.clone());
+            let takes_val = matches!(
+                token.as_str(),
+                "-m" | "--model"
+                    | "--tier"
+                    | "-e"
+                    | "--effort"
+                    | "-t"
+                    | "--timeout"
+                    | "-C"
+                    | "--cwd"
+                    | "-r"
+                    | "--resume"
+                    | "--add-dir"
+                    | "--schema"
+                    | "--max-turns"
+                    | "--agent"
+                    | "--base"
+                    | "--commit"
+            );
+            if takes_val && !token.contains('=') {
+                i += 1;
+                if i < trailing.len() {
+                    flags.push(trailing[i].clone());
+                }
+            }
+            i += 1;
+        } else {
+            if !prompt_removed {
+                prompt_removed = true;
+                i += 1;
+            } else {
+                flags.push(token.clone());
+                i += 1;
+            }
+        }
+    }
+
+    flags
+}
+
 pub fn run(job: NewJob) -> Result<i32, Error> {
+    run_internal(job, None, None)
+}
+
+fn run_internal(
+    job: NewJob,
+    parent: Option<String>,
+    resume_session: Option<String>,
+) -> Result<i32, Error> {
     if !validate_run_name(&job.name) {
         return Err(Error::new(
             2,
@@ -137,20 +216,36 @@ pub fn run(job: NewJob) -> Result<i32, Error> {
 
     let invocation = parse_trailing(job.provider, &job.trailing)?;
 
-    // Extract prompt bytes
-    let prompt_bytes = if let Some(ref p) = invocation.prompt {
-        p.as_bytes().to_vec()
+    // Separate flags from prompt bytes
+    let (flags, prompt_bytes) = if let Some(ref p) = invocation.prompt {
+        if p == "-" {
+            if std::io::stdin().is_terminal() {
+                return Err(Error::new(2, "cannot read prompt from terminal stdin"));
+            }
+            let mut buf = Vec::new();
+            let _ = std::io::stdin().read_to_end(&mut buf);
+            if buf.is_empty() {
+                return Err(Error::new(2, "empty prompt"));
+            }
+            (extract_flags(&job.trailing, true), buf)
+        } else {
+            let buf = p.as_bytes().to_vec();
+            if buf.is_empty() {
+                return Err(Error::new(2, "empty prompt"));
+            }
+            (extract_flags(&job.trailing, true), buf)
+        }
     } else {
-        // Read from stdin if piped
-        let mut buffer = Vec::new();
-        let mut stdin = std::io::stdin();
-        let _ = stdin.read_to_end(&mut buffer);
-        buffer
+        if std::io::stdin().is_terminal() {
+            return Err(Error::new(2, "cannot read prompt from terminal stdin"));
+        }
+        let mut buf = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut buf);
+        if buf.is_empty() {
+            return Err(Error::new(2, "empty prompt"));
+        }
+        (extract_flags(&job.trailing, false), buf)
     };
-
-    if prompt_bytes.is_empty() {
-        return Err(Error::new(2, "empty prompt"));
-    }
 
     let cwd = invocation
         .cwd
@@ -168,11 +263,11 @@ pub fn run(job: NewJob) -> Result<i32, Error> {
     let record = RunRecord {
         name: job.name.clone(),
         provider: job.provider.as_str().to_string(),
-        args: job.trailing.clone(),
+        args: flags,
         cwd,
         note: job.note,
-        parent: None,
-        resume_session: None,
+        parent,
+        resume_session,
         created_at: current_iso(),
         started_at: None,
         finished_at: None,
@@ -187,18 +282,26 @@ pub fn run(job: NewJob) -> Result<i32, Error> {
 
     save_record(&job.name, &record)?;
 
-    // Spawn detached supervisor
+    // Spawn detached supervisor daemon with setsid in pre_exec
     let current_exe = std::env::current_exe()
         .map_err(|e| Error::new(127, format!("failed to find current exe: {}", e)))?;
 
-    Command::new(current_exe)
-        .arg("--supervise")
-        .arg(&job.name)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| Error::new(127, format!("failed to spawn supervisor: {}", e)))?;
+    unsafe {
+        Command::new(current_exe)
+            .arg("--supervise")
+            .arg(&job.name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            })
+            .spawn()
+            .map_err(|e| Error::new(127, format!("failed to spawn supervisor: {}", e)))?;
+    }
 
     println!("{}", job.name);
     Ok(0)
@@ -263,16 +366,14 @@ pub fn ls(json: bool) -> Result<i32, Error> {
                 .windows(2)
                 .find(|w| w[0] == "-m" || w[0] == "--model")
                 .map(|w| w[1].as_str())
-                .unwrap_or("default");
-
-            let age = format_age(&rec.created_at);
+                .unwrap_or("-");
             println!(
                 "{:<14}  {:<8}  {:<10}  {:<23}  {:<5}",
                 rec.name,
                 status.as_str(),
                 rec.provider,
                 model,
-                age
+                format_age(&rec.created_at)
             );
         }
     }
@@ -293,7 +394,8 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         val["status"] = serde_json::Value::String(status.as_str().to_string());
         println!("{}", serde_json::to_string_pretty(&val).unwrap());
     } else {
-        println!("name: {}", rec.name);
+        println!("run: {}", rec.name);
+        println!("status: {}", status.as_str());
         println!("provider: {}", rec.provider);
         println!("args: {:?}", rec.args);
         println!("cwd: {}", rec.cwd);
@@ -303,6 +405,9 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         if let Some(ref parent) = rec.parent {
             println!("parent: {}", parent);
         }
+        if let Some(ref res) = rec.resume_session {
+            println!("resume_session: {}", res);
+        }
         println!("created_at: {}", rec.created_at);
         if let Some(ref s) = rec.started_at {
             println!("started_at: {}", s);
@@ -310,26 +415,25 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         if let Some(ref f) = rec.finished_at {
             println!("finished_at: {}", f);
         }
-        if let Some(pid) = rec.supervisor_pid {
-            println!("supervisor_pid: {}", pid);
-        }
-        if let Some(ref start) = rec.supervisor_start {
-            println!("supervisor_start: {}", start);
-        }
-        if let Some(pid) = rec.wrapper_pid {
-            println!("wrapper_pid: {}", pid);
+        if let Some(code) = rec.exit_code {
+            println!("exit_code: {}", code);
         }
         if let Some(ref sid) = rec.session_id {
             println!("session_id: {}", sid);
         }
-        if let Some(code) = rec.exit_code {
-            println!("exit_code: {}", code);
-        }
-        println!("stopped: {}", rec.stopped);
-        println!("status: {}", status.as_str());
     }
 
     Ok(0)
+}
+
+fn run_duration(rec: &RunRecord) -> Option<Duration> {
+    let start = parse_iso_time(rec.started_at.as_deref()?)?;
+    let end = if let Some(ref f) = rec.finished_at {
+        parse_iso_time(f)?
+    } else {
+        SystemTime::now()
+    };
+    end.duration_since(start).ok()
 }
 
 fn extract_model(rec: &RunRecord) -> &str {
@@ -338,12 +442,6 @@ fn extract_model(rec: &RunRecord) -> &str {
         .find(|w| w[0] == "-m" || w[0] == "--model")
         .map(|w| w[1].as_str())
         .unwrap_or(&rec.provider)
-}
-
-fn run_duration(rec: &RunRecord) -> Option<Duration> {
-    let s = parse_iso_time(rec.started_at.as_deref()?)?;
-    let f = parse_iso_time(rec.finished_at.as_deref()?)?;
-    f.duration_since(s).ok()
 }
 
 pub fn result(name: &str) -> Result<i32, Error> {
@@ -355,24 +453,20 @@ pub fn result(name: &str) -> Result<i32, Error> {
     let status = status_of(&rec, alive);
 
     if status == Status::Running {
-        eprintln!("crew: {} is running; stdout is incomplete", name);
-        return Err(Error::new(2, "running"));
+        return Err(Error::new(2, format!("run {} is still running", name)));
     }
     if status == Status::Lost {
-        eprintln!("crew: {} is lost; stdout is unavailable", name);
-        return Err(Error::new(3, "lost"));
+        return Err(Error::new(3, format!("run {} is lost", name)));
     }
 
     let stdout_path = run_dir(name).join("stdout");
-    if !stdout_path.is_file() {
-        return Err(Error::new(2, "stdout is missing"));
+    if stdout_path.is_file() {
+        let mut file = open_safe_read(&stdout_path)?;
+        let mut out = Vec::new();
+        file.read_to_end(&mut out)
+            .map_err(|e| Error::new(2, format!("failed to read stdout: {}", e)))?;
+        let _ = std::io::stdout().write_all(&out);
     }
-
-    let bytes = fs::read(&stdout_path)
-        .map_err(|e| Error::new(2, format!("failed to read stdout: {}", e)))?;
-    std::io::stdout()
-        .write_all(&bytes)
-        .map_err(|e| Error::new(2, format!("write error: {}", e)))?;
 
     if let Some(dur) = run_duration(&rec) {
         if let Some(note) = crate::review::long_run_note(dur, extract_model(&rec)) {
@@ -380,7 +474,11 @@ pub fn result(name: &str) -> Result<i32, Error> {
         }
     }
 
-    Ok(0)
+    if status == Status::Stopped {
+        return Ok(130);
+    }
+
+    Ok(rec.exit_code.unwrap_or(0))
 }
 
 pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
@@ -415,6 +513,12 @@ pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
 pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i32, Error> {
     if names.is_empty() {
         return Ok(0);
+    }
+
+    for name in names {
+        if !run_dir(name).join("run.json").is_file() {
+            return Err(Error::new(2, format!("run {} does not exist", name)));
+        }
     }
 
     let start = Instant::now();
@@ -473,7 +577,6 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
 
         if let Some(limit) = timeout {
             if start.elapsed() >= limit {
-                eprintln!("timed out waiting");
                 return Err(Error::new(4, "timed out waiting"));
             }
         }
@@ -487,6 +590,35 @@ pub fn resume(name: &str, prompt: Option<String>) -> Result<i32, Error> {
     let session_id = parent
         .session_id
         .ok_or_else(|| Error::new(2, format!("run {} has no session id to resume", name)))?;
+
+    let p_dir = run_dir(name);
+    let lock_path = p_dir.join("resume.lock");
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .map_err(|e| Error::new(2, format!("failed to open resume.lock: {}", e)))?;
+
+    use std::os::unix::io::AsRawFd;
+    let fd = lock_file.as_raw_fd();
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
+    if ret != 0 {
+        return Err(Error::new(2, "failed to lock resume.lock"));
+    }
+
+    struct ResumeLockGuard(std::fs::File);
+    impl Drop for ResumeLockGuard {
+        fn drop(&mut self) {
+            let fd = self.0.as_raw_fd();
+            unsafe {
+                libc::flock(fd, libc::LOCK_UN);
+            }
+        }
+    }
+    let _guard = ResumeLockGuard(lock_file);
 
     // Determine candidate name: <base>.<N>
     let base_name = if let Some(idx) = name.rfind('.') {
@@ -508,26 +640,30 @@ pub fn resume(name: &str, prompt: Option<String>) -> Result<i32, Error> {
 
     let provider: Provider = parent.provider.parse()?;
 
-    // Build new args reusing parent args, adding -r <session_id>
+    // Build new args reusing parent args (which contain only flags!)
     let mut new_args = Vec::new();
     let mut skip_next = false;
-    for (i, arg) in parent.args.iter().enumerate() {
+    for arg in &parent.args {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if arg == "-r" || arg == "--resume" {
+        if arg == "-r" || arg == "--resume" || arg == "-C" || arg == "--cwd" {
             skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--resume=") || arg.starts_with("--cwd=") || arg.starts_with("-C") {
             continue;
         }
         if arg == "-c" || arg == "--continue" {
             continue;
         }
-        // Omit trailing prompt from parent args
-        if i == parent.args.len() - 1 && !arg.starts_with('-') {
-            continue;
-        }
         new_args.push(arg.clone());
+    }
+
+    if !parent.cwd.is_empty() {
+        new_args.push("-C".to_string());
+        new_args.push(parent.cwd.clone());
     }
 
     new_args.push("-r".to_string());
@@ -538,13 +674,13 @@ pub fn resume(name: &str, prompt: Option<String>) -> Result<i32, Error> {
     }
 
     let new_job = NewJob {
-        name: next_name.clone(),
+        name: next_name,
         provider,
         note: parent.note.clone(),
         trailing: new_args,
     };
 
-    run(new_job)
+    run_internal(new_job, Some(name.to_string()), Some(session_id))
 }
 
 pub fn stop(name: &str) -> Result<i32, Error> {
@@ -577,6 +713,35 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_flags() {
+        let trailing = vec!["hello".to_string()];
+        assert_eq!(extract_flags(&trailing, true), Vec::<String>::new());
+
+        let trailing = vec![
+            "--tier".to_string(),
+            "fast".to_string(),
+            "-m".to_string(),
+            "custom".to_string(),
+            "hello world".to_string(),
+        ];
+        assert_eq!(
+            extract_flags(&trailing, true),
+            vec!["--tier", "fast", "-m", "custom"]
+        );
+
+        let trailing = vec![
+            "--tier".to_string(),
+            "fast".to_string(),
+            "--".to_string(),
+            "hello".to_string(),
+        ];
+        assert_eq!(extract_flags(&trailing, true), vec!["--tier", "fast"]);
+
+        let trailing = vec!["--tier".to_string(), "fast".to_string()];
+        assert_eq!(extract_flags(&trailing, false), vec!["--tier", "fast"]);
+    }
+
+    #[test]
     fn resume_next_name_logic() {
         let base = "task";
         assert_eq!(format!("{}.2", base), "task.2");
@@ -592,5 +757,13 @@ mod tests {
             dotted
         };
         assert_eq!(base_extracted, "task");
+    }
+
+    #[test]
+    fn wait_on_nonexistent_run_returns_exit_2() {
+        let res = wait(&["nonexistent_xyz_run_12345".to_string()], false, Some(1));
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(err.code, 2);
     }
 }

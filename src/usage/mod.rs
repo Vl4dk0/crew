@@ -3,11 +3,11 @@
 pub mod render;
 
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -67,13 +67,11 @@ fn decode_jwt_plan(token: &str) -> Option<String> {
         return None;
     }
     let payload = parts[1];
-    // Base64url padding
     let mut padded = payload.replace('-', "+").replace('_', "/");
     while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
 
-    // Decode without external base64 crate
     let bytes = simple_base64_decode(&padded)?;
     let json_val: Value = serde_json::from_slice(&bytes).ok()?;
     let plan = json_val["https://api.openai.com/auth"]["chatgpt_plan_type"].as_str()?;
@@ -111,6 +109,92 @@ fn simple_base64_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(buffer)
+}
+
+fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        return Err(Error::new(2, "failed to openpty"));
+    }
+
+    let slave_file = unsafe { fs::File::from_raw_fd(slave) };
+    let slave_file_err = slave_file
+        .try_clone()
+        .map_err(|e| Error::new(2, format!("clone slave failed: {}", e)))?;
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(slave_file));
+    cmd.stderr(Stdio::from(slave_file_err));
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::new(2, format!("failed to spawn on pty: {}", e)))?;
+
+    let mut master_file = unsafe { fs::File::from_raw_fd(master) };
+    let master_fd = master_file.as_raw_fd();
+
+    unsafe {
+        let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
+        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let start = Instant::now();
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    while start.elapsed() < timeout {
+        let mut fds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_SET(master_fd, &mut fds);
+        }
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 100_000,
+        };
+        let ready = unsafe {
+            libc::select(
+                master_fd + 1,
+                &mut fds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+        if ready > 0 {
+            match master_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+        }
+
+        if let Ok(Some(_)) = child.try_wait() {
+            while let Ok(n) = master_file.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n]);
+            }
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(output)
 }
 
 fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
@@ -153,9 +237,9 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
                         if let Some(pct) = rate_limit["used_percent"].as_f64() {
                             windows.push(Gauge {
                                 id: "codex:primary_window".to_string(),
-                                label: "Codex · week".to_string(),
+                                label: "week".to_string(),
                                 percent: pct.round() as u32,
-                                reset: rate_limit["resets_at"].as_str().map(|s| s.to_string()),
+                                reset: rate_limit["reset_time"].as_str().map(|s| s.to_string()),
                                 stale: false,
                             });
                         }
@@ -171,8 +255,8 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
             for w in &mut windows {
                 w.stale = true;
             }
-        } else if token.is_none() {
-            error = Some("not signed in".to_string());
+        } else {
+            error = Some("failed to load usage".to_string());
         }
     }
 
@@ -181,74 +265,6 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
         name: "codex".to_string(),
         mark: "⚛".to_string(),
         plan,
-        windows,
-        error,
-    }
-}
-
-fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = Path::new(&home).join(".grok/auth.json");
-
-    let mut token: Option<String> = None;
-    if auth_path.is_file() {
-        if let Ok(content) = fs::read_to_string(&auth_path) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                if let Some(k) = val["key"].as_str() {
-                    token = Some(k.to_string());
-                } else if let Some(t) = val["tokens"]["access_token"].as_str() {
-                    token = Some(t.to_string());
-                }
-            }
-        }
-    }
-
-    let mut windows = Vec::new();
-    let mut error = None;
-
-    if let Some(ref tok) = token {
-        let output = Command::new("curl")
-            .arg("-s")
-            .arg("-m")
-            .arg("10")
-            .arg("-H")
-            .arg(format!("Authorization: Bearer {}", tok))
-            .arg("https://cli-chat-proxy.grok.com/v1/billing?format=credits")
-            .output();
-
-        if let Ok(out) = output {
-            if out.status.success() {
-                if let Ok(resp) = serde_json::from_slice::<Value>(&out.stdout) {
-                    if let Some(pct) = resp["percent_used"].as_f64() {
-                        windows.push(Gauge {
-                            id: "grok:weekly".to_string(),
-                            label: "Grok · week".to_string(),
-                            percent: pct.round() as u32,
-                            reset: resp["resets_at"].as_str().map(|s| s.to_string()),
-                            stale: false,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if windows.is_empty() {
-        if let Some(saved) = last_ok.and_then(|v| v.get("grok")) {
-            windows = parse_gauges_from_json(Some(saved));
-            for w in &mut windows {
-                w.stale = true;
-            }
-        } else if token.is_none() {
-            error = Some("not signed in".to_string());
-        }
-    }
-
-    ProviderView {
-        key: "grok".to_string(),
-        name: "grok".to_string(),
-        mark: "✕".to_string(),
-        plan: None,
         windows,
         error,
     }
@@ -273,7 +289,6 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
     }
 
     if raw_json.is_none() {
-        // Pre-check TCP connectivity
         let addr = "oauth2.googleapis.com:443"
             .parse::<SocketAddr>()
             .or_else(|_| {
@@ -291,20 +306,16 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
         };
 
         if can_connect {
-            // Run agy with PTY or command
-            let output = Command::new("agy")
-                .arg("-p")
+            let mut cmd = Command::new("agy");
+            cmd.arg("-p")
                 .arg("/usage")
                 .arg("--output-format")
-                .arg("json")
-                .output();
+                .arg("json");
 
-            if let Ok(out) = output {
-                if out.status.success() {
-                    if let Ok(parsed) = serde_json::from_slice::<Value>(&out.stdout) {
-                        let _ = fs::write(&cache_file, &out.stdout);
-                        raw_json = Some(parsed);
-                    }
+            if let Ok(output) = run_on_pty(cmd, Duration::from_secs(25)) {
+                if let Ok(parsed) = serde_json::from_slice::<Value>(&output) {
+                    let _ = fs::write(&cache_file, &output);
+                    raw_json = Some(parsed);
                 }
             }
         }
@@ -313,29 +324,67 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
     let mut windows = Vec::new();
     let mut error = None;
 
-    if let Some(ref val) = raw_json {
-        if let Some(arr) = val.as_array().or_else(|| val["models"].as_array()) {
-            for item in arr {
-                let name = item["name"].as_str().unwrap_or("Model");
-                let window = item["window"].as_str().unwrap_or("week");
-                let percent = item["percent"]
-                    .as_f64()
-                    .or_else(|| {
-                        item["remaining_percent"]
-                            .as_f64()
-                            .map(|rem| (100.0 - rem).max(0.0))
-                    })
-                    .unwrap_or(0.0);
+    if let Some(ref root) = raw_json {
+        let groups = root
+            .get("command")
+            .and_then(|c| c.get("data"))
+            .and_then(|d| d.get("groups"))
+            .or_else(|| root.get("data").and_then(|d| d.get("groups")))
+            .or_else(|| root.get("groups"))
+            .and_then(|g| g.as_array());
 
-                let id = format!("antigravity:{}-{}", name.to_lowercase(), window);
-                let label = format!("{} · {}", name, window);
-                windows.push(Gauge {
-                    id,
-                    label,
-                    percent: percent.round() as u32,
-                    reset: item["reset"].as_str().map(|s| s.to_string()),
-                    stale: false,
-                });
+        if let Some(arr) = groups {
+            for group in arr {
+                let gname = group["displayName"]
+                    .as_str()
+                    .or_else(|| group["name"].as_str())
+                    .unwrap_or("");
+
+                if let Some(buckets) = group["buckets"].as_array() {
+                    for bucket in buckets {
+                        let bid = bucket["bucketId"]
+                            .as_str()
+                            .or_else(|| bucket["id"].as_str())
+                            .unwrap_or("");
+                        let rem = bucket["remainingFraction"]
+                            .as_f64()
+                            .or_else(|| bucket["remaining_fraction"].as_f64())
+                            .unwrap_or(1.0);
+                        let window_type = bucket["window"].as_str().unwrap_or("");
+                        let reset = bucket["resetTime"]
+                            .as_str()
+                            .or_else(|| bucket["reset_time"].as_str())
+                            .map(|s| s.to_string());
+
+                        let percent = ((1.0 - rem) * 100.0).round().clamp(0.0, 100.0) as u32;
+
+                        let label = if gname.contains("Gemini Models") || gname == "Gemini" {
+                            if window_type == "5h" {
+                                "gemini 5h".to_string()
+                            } else {
+                                "gemini week".to_string()
+                            }
+                        } else if gname.contains("Claude") || gname.contains("Other") {
+                            if window_type == "5h" {
+                                "other models 5h".to_string()
+                            } else {
+                                "other models week".to_string()
+                            }
+                        } else if gname.contains("Argon") {
+                            "Gemini 4 Argon week".to_string()
+                        } else {
+                            format!("{} {}", gname, window_type)
+                        };
+
+                        windows.push(Gauge {
+                            id: format!("antigravity:{}", bid),
+                            label,
+                            percent,
+                            reset,
+                            stale: false,
+                        });
+                    }
+                }
             }
         }
     }
@@ -361,6 +410,368 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
     }
 }
 
+fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let auth_path = Path::new(&home).join(".grok/auth.json");
+
+    let extract_token = || -> Option<(String, Option<String>)> {
+        let content = fs::read_to_string(&auth_path).ok()?;
+        let data: Value = serde_json::from_str(&content).ok()?;
+        let obj = data.as_object()?;
+
+        let mut best: Option<(String, String)> = None;
+        for entry in obj.values() {
+            if entry.get("auth_mode").and_then(|m| m.as_str()) == Some("oidc") {
+                if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
+                    let exp = entry
+                        .get("expires_at")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if best.is_none() || exp > best.as_ref().unwrap().1 {
+                        best = Some((key.to_string(), exp));
+                    }
+                }
+            }
+        }
+
+        best.map(|(k, e)| {
+            let exp_opt = if e.is_empty() { None } else { Some(e) };
+            (k, exp_opt)
+        })
+    };
+
+    let refresh_grok = || {
+        let _ = Command::new("grok")
+            .arg("models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+    };
+
+    let mut token_info = extract_token();
+
+    // Check expiry (< 120s)
+    if let Some((_, Some(ref exp_str))) = token_info {
+        if let Some(exp_time) = crate::job::parse_iso_time(exp_str) {
+            if let Ok(remaining) = exp_time.duration_since(SystemTime::now()) {
+                if remaining < Duration::from_secs(120) {
+                    refresh_grok();
+                    token_info = extract_token();
+                }
+            } else {
+                // Already expired
+                refresh_grok();
+                token_info = extract_token();
+            }
+        }
+    }
+
+    let mut windows = Vec::new();
+    let mut error = None;
+
+    if let Some((tok, _)) = token_info {
+        let query_api = |token: &str, query: &str| -> Result<(Value, u16), ()> {
+            let url = format!("https://cli-chat-proxy.grok.com/v1/billing{}", query);
+            let out = Command::new("curl")
+                .arg("-s")
+                .arg("-m")
+                .arg("10")
+                .arg("-w")
+                .arg("\n%{http_code}")
+                .arg("-H")
+                .arg(format!("Authorization: Bearer {}", token))
+                .arg("-H")
+                .arg("X-XAI-Token-Auth: xai-grok-cli")
+                .arg(&url)
+                .output();
+
+            if let Ok(res) = out {
+                let text = String::from_utf8_lossy(&res.stdout);
+                let lines: Vec<&str> = text.trim().lines().collect();
+                if lines.len() >= 2 {
+                    let code: u16 = lines.last().unwrap().parse().unwrap_or(0);
+                    let body = lines[..lines.len() - 1].join("\n");
+                    if let Ok(val) = serde_json::from_str::<Value>(&body) {
+                        return Ok((val, code));
+                    }
+                }
+            }
+            Err(())
+        };
+
+        let mut weekly_res = query_api(&tok, "?format=credits");
+        if let Ok((_, code)) = weekly_res {
+            if code == 401 || code == 403 {
+                refresh_grok();
+                if let Some((new_tok, _)) = extract_token() {
+                    weekly_res = query_api(&new_tok, "?format=credits");
+                }
+            }
+        }
+
+        if let Ok((weekly_val, _)) = weekly_res {
+            let cfg = weekly_val.get("config").unwrap_or(&weekly_val);
+            let mut credit_pct = cfg["creditUsagePercent"].as_f64();
+
+            if credit_pct.is_none() {
+                if let Some(products) = cfg["productUsage"].as_array() {
+                    for item in products {
+                        let name = item["product"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .replace(['-', '_'], "");
+                        if name == "grokbuild" || name == "build" {
+                            credit_pct = item["usagePercent"].as_f64();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if credit_pct.is_none() {
+                if let Some(ptype) = cfg["currentPeriod"]["type"].as_str() {
+                    if ptype.to_uppercase().contains("WEEK") {
+                        credit_pct = Some(0.0);
+                    }
+                }
+            }
+
+            if let Some(pct) = credit_pct {
+                let reset = cfg["currentPeriod"]["end"]
+                    .as_str()
+                    .or_else(|| cfg["billingPeriodEnd"].as_str())
+                    .map(|s| s.to_string());
+
+                windows.push(Gauge {
+                    id: "grok:weekly".to_string(),
+                    label: "week".to_string(),
+                    percent: pct.round().clamp(0.0, 100.0) as u32,
+                    reset,
+                    stale: false,
+                });
+            }
+        }
+    }
+
+    if windows.is_empty() {
+        if let Some(saved) = last_ok.and_then(|v| v.get("grok")) {
+            windows = parse_gauges_from_json(Some(saved));
+            for w in &mut windows {
+                w.stale = true;
+            }
+        } else {
+            error = Some("failed to load usage".to_string());
+        }
+    }
+
+    ProviderView {
+        key: "grok".to_string(),
+        name: "grok".to_string(),
+        mark: "✕".to_string(),
+        plan: None,
+        windows,
+        error,
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut res = String::new();
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            res.push(c);
+        }
+    }
+    res
+}
+
+fn run_claude_pty_probe() -> Result<Vec<Gauge>, Error> {
+    let probe_dir = state_dir().join("ClaudeProbe");
+    let _ = fs::create_dir_all(&probe_dir);
+
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ret != 0 {
+        return Err(Error::new(2, "failed to openpty for claude probe"));
+    }
+
+    unsafe {
+        let ws = libc::winsize {
+            ws_row: 200,
+            ws_col: 160,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
+    }
+
+    let slave_file = unsafe { fs::File::from_raw_fd(slave) };
+    let slave_file_err = slave_file
+        .try_clone()
+        .map_err(|e| Error::new(2, format!("clone slave failed: {}", e)))?;
+
+    let mut cmd = Command::new("claude");
+    cmd.arg("--allowed-tools")
+        .arg("")
+        .arg("--strict-mcp-config")
+        .arg("--settings")
+        .arg("{\"disableAllHooks\":true,\"remoteControlAtStartup\":false}")
+        .current_dir(&probe_dir)
+        .env("TERM", "xterm-256color")
+        .env("DISABLE_AUTOUPDATER", "1")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_SESSION_ACCESS_TOKEN")
+        .env_remove("CLAUDECODE");
+
+    cmd.stdin(Stdio::from(slave_file.try_clone().unwrap()));
+    cmd.stdout(Stdio::from(slave_file));
+    cmd.stderr(Stdio::from(slave_file_err));
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::new(2, format!("failed to spawn claude probe: {}", e)))?;
+
+    let mut master_file = unsafe { fs::File::from_raw_fd(master) };
+    let master_fd = master_file.as_raw_fd();
+
+    unsafe {
+        let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
+        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    let start = Instant::now();
+    let timeout = Duration::from_secs(12);
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut sent_usage = false;
+
+    while start.elapsed() < timeout {
+        if !sent_usage && start.elapsed() > Duration::from_millis(1500) {
+            sent_usage = true;
+            let _ = unsafe { libc::write(master_fd, b"/usage\r".as_ptr() as *const _, 7) };
+        }
+
+        let mut fds: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_SET(master_fd, &mut fds);
+        }
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 100_000,
+        };
+        let ready = unsafe {
+            libc::select(
+                master_fd + 1,
+                &mut fds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+        if ready > 0 {
+            match master_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+        }
+
+        let text = String::from_utf8_lossy(&output);
+        if text.contains("Current session") || text.contains("Current week") {
+            std::thread::sleep(Duration::from_millis(500));
+            while let Ok(n) = master_file.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                output.extend_from_slice(&buf[..n]);
+            }
+            break;
+        }
+
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let text = strip_ansi(&String::from_utf8_lossy(&output));
+    let mut gauges = Vec::new();
+
+    // Parse session
+    if let Some(pos) = text.find("Current session") {
+        let snippet = &text[pos..pos + 200.min(text.len() - pos)];
+        if let Some(pct) = extract_percent_from_text(snippet) {
+            gauges.push(Gauge {
+                id: "claude:session".to_string(),
+                label: "5h".to_string(),
+                percent: pct,
+                reset: None,
+                stale: false,
+            });
+        }
+    }
+
+    // Parse week
+    if let Some(pos) = text.find("Current week") {
+        let snippet = &text[pos..pos + 200.min(text.len() - pos)];
+        if let Some(pct) = extract_percent_from_text(snippet) {
+            gauges.push(Gauge {
+                id: "claude:weekly".to_string(),
+                label: "week".to_string(),
+                percent: pct,
+                reset: None,
+                stale: false,
+            });
+        }
+    }
+
+    if gauges.is_empty() {
+        Err(Error::new(2, "failed to parse claude probe output"))
+    } else {
+        Ok(gauges)
+    }
+}
+
+fn extract_percent_from_text(s: &str) -> Option<u32> {
+    for word in s.split_whitespace() {
+        if let Some(idx) = word.find('%') {
+            let num_part = &word[..idx];
+            if let Ok(pct) = num_part.parse::<f64>() {
+                if s.contains("left") || s.contains("remaining") {
+                    return Some((100.0 - pct).round().clamp(0.0, 100.0) as u32);
+                } else {
+                    return Some(pct.round().clamp(0.0, 100.0) as u32);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
     let mut plan = None;
     let retry_file = state_dir().join("claude_retry.json");
@@ -377,10 +788,35 @@ fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
     let mut windows = Vec::new();
     let mut error = None;
 
+    // Check last_ok age
+    let mut is_fresh = false;
     if let Some(saved) = last_ok.and_then(|v| v.get("claude")) {
+        if let Some(arr) = saved.as_array() {
+            if let Some(first) = arr.first() {
+                if let Some(fetched_at) = first.get("fetched_at").and_then(|f| f.as_str()) {
+                    if let Some(t) = crate::job::parse_iso_time(fetched_at) {
+                        if let Ok(elapsed) = SystemTime::now().duration_since(t) {
+                            if elapsed <= Duration::from_secs(180) {
+                                is_fresh = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         windows = parse_gauges_from_json(Some(saved));
-    } else {
-        error = Some("no recent claude session".to_string());
+    }
+
+    if !is_fresh || windows.is_empty() {
+        if let Ok(fresh) = run_claude_pty_probe() {
+            windows = fresh;
+        } else if !windows.is_empty() {
+            for w in &mut windows {
+                w.stale = true;
+            }
+        } else {
+            error = Some("no recent claude session".to_string());
+        }
     }
 
     ProviderView {
