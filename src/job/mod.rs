@@ -235,8 +235,9 @@ fn run_internal(
             }
             (extract_flags(&job.trailing, true), buf)
         }
-    } else if invocation.review {
-        // A review scope without a prompt does not read stdin.
+    } else if review_scope(&invocation) {
+        // A scope (--uncommitted, --base, --commit) is the prompt. Bare
+        // `--review` still needs one, from argv or stdin.
         (job.trailing.clone(), Vec::new())
     } else {
         if std::io::stdin().is_terminal() {
@@ -427,6 +428,12 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
     }
 
     Ok(0)
+}
+
+/// A Codex review scope stands in for the prompt. Bare `--review` does not.
+fn review_scope(invocation: &crate::cli::Invocation) -> bool {
+    invocation.review
+        && (invocation.uncommitted || invocation.base.is_some() || invocation.commit.is_some())
 }
 
 fn run_duration(rec: &RunRecord) -> Option<Duration> {
@@ -774,7 +781,10 @@ mod tests {
     fn review_scope_without_prompt_parses_without_prompt() {
         let trailing = vec!["--review".to_string(), "--uncommitted".to_string()];
         let inv = parse_trailing(Provider::Codex, &trailing).unwrap();
-        assert!(inv.review);
+        assert!(review_scope(&inv));
         assert!(inv.prompt.is_none());
+
+        let bare = parse_trailing(Provider::Codex, &["--review".to_string()]).unwrap();
+        assert!(!review_scope(&bare));
     }
 }
