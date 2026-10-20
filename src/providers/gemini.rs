@@ -472,7 +472,7 @@ mod tests {
             "medium",
             "hello",
         );
-        assert_eq!(argv[2], "hello");
+        assert_eq!(argv[2], format!("hello\n\n{}", proc::READ_ONLY_LINE));
         invocation.raw = false;
 
         invocation.read_only = false;

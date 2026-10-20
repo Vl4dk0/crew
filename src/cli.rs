@@ -246,7 +246,7 @@ struct SharedArgs {
     /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5).
     #[arg(short = 'e', long)]
     effort: Option<String>,
-    /// Read-only tools. Claude uses its read-only permission mode and a system rule. Gemini omits the skip-permissions flag and appends a read-only sentence to the prompt. Grok tries the read-only sandbox once, then a read-only tool list, and passes a rule. Codex uses its read-only sandbox and appends the same sentence. The sentence is skipped when --schema or --raw is set, and it is not stored on a job.
+    /// Read-only tools. Claude uses its read-only permission mode and a system rule. Gemini omits the skip-permissions flag and appends a read-only sentence to the prompt. Grok tries the read-only sandbox once, then a read-only tool list, and passes a rule. Codex uses its read-only sandbox and appends the same sentence. The sentence is skipped when --schema is set. It is still sent with --raw, and it is not stored on a job.
     #[arg(long, conflicts_with_all = ["write", "auto"])]
     read_only: bool,
     /// Allow edits. Claude: accept-edits style permissions. Gemini: --mode accept-edits. Grok: --sandbox workspace. Codex: its write sandbox.
