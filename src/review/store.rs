@@ -22,6 +22,27 @@ pub struct Review {
     pub reviewer: String,
 }
 
+/// Gregorian year, month, day for a Unix day count.
+///
+/// Howard Hinnant's `civil_from_days`. A nearby form that divides by 1024
+/// instead of 1460 is right on some days (including 2026-10-20) and wrong
+/// on thousands of others, so the review timestamp would silently drift.
+fn ymd_from_unix_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    (y, m, d)
+}
+
 /// Format current UTC timestamp in ISO-8601 / RFC-3339 representation.
 pub fn now_utc_rfc3339() -> String {
     let now = std::time::SystemTime::now();
@@ -36,17 +57,7 @@ pub fn now_utc_rfc3339() -> String {
     let hour = rem_secs / 3600;
     let minute = (rem_secs % 3600) / 60;
     let second = rem_secs % 60;
-
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1024 + doe / 1461 - doe / 142401) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (y, m, d) = ymd_from_unix_days(days);
 
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z")
 }
@@ -154,4 +165,17 @@ pub fn append_to(path: &Path, review: Review) -> Result<(), Error> {
 pub fn append(review: Review) -> Result<(), Error> {
     let path = reviews_path()?;
     append_to(&path, review)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ymd_from_unix_days;
+
+    #[test]
+    fn unix_days_match_the_civil_calendar() {
+        // Day 9 is one the 1024-divisor form gets wrong (1971-01-12).
+        assert_eq!(ymd_from_unix_days(0), (1970, 1, 1));
+        assert_eq!(ymd_from_unix_days(9), (1970, 1, 10));
+        assert_eq!(ymd_from_unix_days(20746), (2026, 10, 20));
+    }
 }
