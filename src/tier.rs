@@ -163,9 +163,8 @@ fn load() -> Result<Loaded, Error> {
 
 /// What the runner should put on the CLI.
 ///
-/// No tier and no `-m` keeps the wrapper's own default. It does not apply
-/// `balanced`, because the wrapper defaults are not the balanced row for grok
-/// (grok omits `-m`) or for the effort grok would have used from the account.
+/// No tier and no `-m` keeps the wrapper's model default and uses effort
+/// `medium`. It does not apply `balanced`, because grok's wrapper omits `-m`.
 pub fn resolve(
     provider: Provider,
     tier: Option<Tier>,
@@ -205,7 +204,7 @@ fn resolve_with(
 fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
     let (model, default_effort) = match provider {
         Provider::Claude => (Some("sonnet".to_string()), "medium"),
-        Provider::Codex => (Some("gpt-6.1-sol".to_string()), "low"),
+        Provider::Codex => (Some("gpt-6.1-sol".to_string()), "medium"),
         Provider::Gemini => (Some("gemini-3.8-flash-medium".to_string()), "medium"),
         // The wrapper omits -m and lets the account default stand.
         Provider::Grok => (None, "medium"),
@@ -255,7 +254,7 @@ mod tests {
         assert_eq!(fast.effort, "medium");
         let max = table.provider(Provider::Grok).get(Tier::Max);
         assert_eq!(max.model, "grok-4.7");
-        assert_eq!(max.effort, "xhigh");
+        assert_eq!(max.effort, "max");
         let smart = table.provider(Provider::Gemini).get(Tier::Smart);
         assert_eq!(smart.model, "gemini-3.8-flash-high");
     }
@@ -280,7 +279,9 @@ mod tests {
         assert_eq!(grok.effort, "medium");
         let codex = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
         assert_eq!(codex.model.as_deref(), Some("gpt-6.1-sol"));
-        assert_eq!(codex.effort, "low");
+        // No tier and no -e is medium, including codex, whose own wrapper
+        // defaults to low. Vladko asked for one default.
+        assert_eq!(codex.effort, "medium");
     }
 
     #[test]

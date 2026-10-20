@@ -31,7 +31,7 @@ effort = "high"
 
 [codex.max]
 model = "gpt-6-astra"
-effort = "ultra"
+effort = "max"
 
 [gemini.fast]
 model = "gemini-3.8-flash-low"
@@ -63,4 +63,4 @@ effort = "high"
 
 [grok.max]
 model = "grok-4.7"
-effort = "xhigh"
+effort = "max"

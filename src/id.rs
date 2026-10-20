@@ -59,8 +59,10 @@ impl FromStr for Provider {
     }
 }
 
-/// Effort words every wrapper already accepts. Rewrites happen in the runner.
-pub const EFFORTS: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+/// Effort words the user types. Runners map `max` onto each CLI's real top
+/// level (`xhigh` for grok, `ultra` for codex models that have it, `high` for
+/// gemini). The wrappers' `xhigh` and `ultra` spellings stay off this CLI.
+pub const EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
 
 pub fn parse_effort(value: &str) -> Result<(), Error> {
     if EFFORTS.contains(&value) {
@@ -84,5 +86,13 @@ mod tests {
         assert_eq!("gpt".parse::<Provider>().unwrap(), Provider::Codex);
         assert_eq!("chatgpt".parse::<Provider>().unwrap(), Provider::Codex);
         assert!("claude-run".parse::<Provider>().is_err());
+    }
+
+    #[test]
+    fn effort_vocabulary_is_four_words() {
+        assert!(parse_effort("medium").is_ok());
+        assert!(parse_effort("max").is_ok());
+        assert!(parse_effort("ultra").is_err());
+        assert!(parse_effort("xhigh").is_err());
     }
 }

@@ -1,6 +1,19 @@
 # crew — plan
 
-Ack this file's commit on `main` before any feature code. The wrapper behavior below is taken from the four `*-run` scripts (survey `roof-read-four`). Where a skill sentence disagrees with the script, the script wins.
+Acked at `dbdee46`, then amended after Vladko's note in the Roof tool thread. The amendment wins where it disagrees with the sections below.
+
+Vladko, 2026-10-20:
+
+- `-e` accepts only `low`, `medium`, `high`, `max`. Default is `medium` when neither `--tier` nor `-e` is passed, including codex (its wrapper default is `low`). `--tier` without `-e` uses the tier row's effort.
+- `max` is mapped per CLI: claude sends `max`; codex sends `ultra` except `gpt-6-luna`, which sends `max`; gemini sends `high`; grok sends `xhigh` (and `high` for `grok-4.5`, which has no `xhigh`). The user never types `xhigh` or `ultra`.
+- Grok's four tiers are all `grok-4.7`. The tier still selects the effort. `grok-4.7-build-fast` stays available only through `-m`.
+- `-m` overrides the tier's model. The built-in table is the default. `~/.config/crew/tiers.toml` replaces it.
+- Default autonomy stays allow-all. `--auto` is the explicit spelling.
+- `-t` defaults to 1800 seconds. The wrapper default of 300 was shorter than real runs.
+- A finished run longer than 20 minutes prints one stderr line telling the orchestrator to rate it later with `crew review write`. crew does not file the review. `review::long_run_note` is that line. Jobs print it from `wait` and `result`.
+- Flag names are shared where the behavior exists on every provider (`--tier`, `-m`, `-e`, `-t`, `-C`, `-r`, `-c`, `--print-id`, the mode flags). `--add-dir`, `--schema`, and `--no-web` are not offered on a provider whose CLI has no such switch. A fake shared flag that then no-ops is worse than exit 2.
+
+The wrapper behavior below is taken from the four `*-run` scripts (survey `roof-read-four`). Where a skill sentence disagrees with the script, the script wins. Where this amendment disagrees with the script's defaults (timeout, effort vocabulary, codex default effort), the amendment wins.
 
 ## Name
 
@@ -42,7 +55,7 @@ Same spelling and default as the wrappers. `--auto` is accepted and ignored: omi
 - `--read-only`, `--write`, `--auto` — mutex
 - `--tier fast|balanced|smart|max` — new. `-m` still wins for the model. Passing neither `--tier` nor `-m` keeps that wrapper's own default. It does not silently apply `balanced`.
 - `-m/--model`, `-e/--effort`
-- `-t/--timeout` seconds, default 300, must be finite and `> 0`, else exit 2
+- `-t/--timeout` seconds, default 1800, must be finite and `> 0`, else exit 2
 - `-C/--cwd`
 - `-r/--resume`, `-c/--continue`, `--print-id`
 - the prompt is trailing, or `-` to read stdin. A non-`-` prompt does not touch stdin. The prompt is a child argv element, never the child's stdin. `-` on a tty is exit 2 (`pass a prompt or pipe one using -`). Empty stdin is exit 2.
@@ -138,30 +151,30 @@ Codex has three families and four tiers, so `smart` and `max` share `gpt-6-astra
 
 Gemini effort is baked into the slug for `flash` and `argon`. The runner must not also pass `--effort` for those aliases. A user `-m` that already ends in `-low`, `-medium`, or `-high` is sent as-is and `--effort` is not added.
 
-Grok is one model. Tiers change effort only. `grok-4.7-build-fast` stays available through `-m`. It is not a tier. The wrapper sends `max` and `ultra` as `xhigh`, so the `max` tier stores `xhigh` and does not trip that rewrite.
+Grok is one model. All four tiers use `grok-4.7` and differ by effort. `grok-4.7-build-fast` stays available through `-m`. It is not a tier. The config stores the user-facing effort `max`. The grok runner sends that as `xhigh`.
 
 | tier | claude `-m` / `-e` | codex `-m` / `-e` | gemini slug | grok `-m` / `-e` |
 |---|---|---|---|---|
 | fast | haiku / medium | gpt-6-luna / low | gemini-3.8-flash-low | grok-4.7 / low |
 | balanced | sonnet / medium | gpt-6.1-sol / low | gemini-3.8-flash-medium | grok-4.7 / medium |
 | smart | opus / high | gpt-6-astra / high | gemini-3.8-flash-high | grok-4.7 / high |
-| max | fable / max | gpt-6-astra / ultra | gemini-4-argon-high | grok-4.7 / xhigh |
+| max | fable / max | gpt-6-astra / max | gemini-4-argon-high | grok-4.7 / max |
 
 Wrapper defaults when `--tier` and `-m` are both absent:
 
 | provider | model argv | effort argv |
 |---|---|---|
 | claude | `--model sonnet` | `--effort medium` |
-| codex | `-m gpt-6.1-sol` | `model_reasoning_effort="low"` |
+| codex | `-m gpt-6.1-sol` | `model_reasoning_effort="medium"` |
 | gemini | `--model gemini-3.8-flash-medium` | no `--effort` flag |
 | grok | `-m` omitted (account default, skill says `grok-4.7`) | `--effort medium` |
 
-Effort vocabulary on every wrapper is `low|medium|high|xhigh|max|ultra`. Rewrites, stderr note included:
+The user-facing vocabulary is `low|medium|high|max`. The runners map `max` and print a stderr note when the wire value differs:
 
-- claude: `ultra` → `max`. `max` is sent as `max`.
-- codex: `ultra` → `max` only when the model string is exactly `gpt-6-luna`. Any other model is sent `ultra` unchanged.
-- gemini: `xhigh`, `max`, and `ultra` → `high`.
-- grok: `max` and `ultra` → `xhigh`. `grok-4.5` rejects `xhigh`. That rejection is grok's exit, not something crew hides.
+- claude: `max` stays `max`.
+- codex: `max` becomes `ultra`, except model `gpt-6-luna`, which stays `max` because that model has no `ultra`.
+- gemini: `max` becomes `high`.
+- grok: `max` becomes `xhigh`. For `grok-4.5` it becomes `high`, because that model rejects `xhigh`.
 
 ## Wrapper quirks
 
@@ -312,8 +325,9 @@ Candidates are only models that already appear in the log. The judge is a random
 
 Under 40. No live network and no live agent in `cargo test`.
 
-- Tiers: four rows per provider, user-file override, unknown key rejected, `-m` overrides the model, omitted tier keeps the wrapper default, gemini alias does not also emit `--effort`.
-- Argv and exit tables: claude denial list, claude empty result, gemini denial regex and the timeout-waiting rewrite, grok `stopReason` normalization including a missing field, grok sandbox retry when the refusal string is in stderr and not when status is 0, codex `turn.failed` after a later `turn.completed`, codex `ultra` remap only for `gpt-6-luna`, exit 124/125/127 selection.
+- Tiers: four rows per provider, user-file override, unknown key rejected, `-m` overrides the model, omitted tier uses effort `medium`, gemini alias does not also emit `--effort`.
+- Argv and exit tables: claude denial list, claude empty result, gemini denial regex and the timeout-waiting rewrite, grok `stopReason` normalization including a missing field, grok sandbox retry when the refusal string is in stderr and not when status is 0, codex `turn.failed` after a later `turn.completed`, codex `max` becomes `ultra` except on `gpt-6-luna`, exit 124/125/127 selection.
+- `long_run_note` is absent at 20 minutes and present above it.
 - Job: bad name, unknown JSON field rejected, every `status_of` arm, resume suffix, `wait` returns 130 while the file holds 143.
 - Usage render: width, one partial block, sort by least-used window, the grok mark is not an error. Parsers take fixtures.
 - Load: format function on a fixed sample, including swap and the `crew` line.

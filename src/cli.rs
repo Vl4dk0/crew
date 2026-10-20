@@ -109,7 +109,8 @@ struct SharedArgs {
     /// Accepted and ignored. Omitting the mode flags is already full autonomy.
     #[arg(long, conflicts_with_all = ["read_only", "write"])]
     auto: bool,
-    #[arg(short = 't', long, default_value_t = 300.0)]
+    /// Seconds. The old wrapper default of 300 was shorter than real runs.
+    #[arg(short = 't', long, default_value_t = 1800.0)]
     timeout: f64,
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
