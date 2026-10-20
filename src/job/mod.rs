@@ -235,6 +235,9 @@ fn run_internal(
             }
             (extract_flags(&job.trailing, true), buf)
         }
+    } else if invocation.review {
+        // A review scope without a prompt does not read stdin.
+        (job.trailing.clone(), Vec::new())
     } else {
         if std::io::stdin().is_terminal() {
             return Err(Error::new(2, "cannot read prompt from terminal stdin"));
@@ -765,5 +768,13 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn review_scope_without_prompt_parses_without_prompt() {
+        let trailing = vec!["--review".to_string(), "--uncommitted".to_string()];
+        let inv = parse_trailing(Provider::Codex, &trailing).unwrap();
+        assert!(inv.review);
+        assert!(inv.prompt.is_none());
     }
 }

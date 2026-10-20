@@ -502,14 +502,24 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
         };
 
         let mut weekly_res = query_api(&tok, "?format=credits");
-        if let Ok((_, code)) = weekly_res {
+        let effective_tok = if let Ok((_, code)) = weekly_res {
             if code == 401 || code == 403 {
                 refresh_grok();
-                if let Some((new_tok, _)) = extract_token() {
-                    weekly_res = query_api(&new_tok, "?format=credits");
-                }
+                extract_token()
+                    .map(|(t, _)| t)
+                    .unwrap_or_else(|| tok.clone())
+            } else {
+                tok.clone()
             }
+        } else {
+            tok.clone()
+        };
+
+        if effective_tok != tok {
+            weekly_res = query_api(&effective_tok, "?format=credits");
         }
+
+        let monthly_res = query_api(&effective_tok, "");
 
         if let Ok((weekly_val, _)) = weekly_res {
             let cfg = weekly_val.get("config").unwrap_or(&weekly_val);
@@ -552,6 +562,50 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     reset,
                     stale: false,
                 });
+            }
+
+            let cap = cfg["onDemandCap"]["val"]
+                .as_f64()
+                .or_else(|| cfg["onDemandCap"].as_f64());
+            let spent = cfg["onDemandUsed"]["val"]
+                .as_f64()
+                .or_else(|| cfg["onDemandUsed"].as_f64());
+            if let (Some(c), Some(s)) = (cap, spent) {
+                if c > 0.0 {
+                    let pct = (s / c * 100.0).round().clamp(0.0, 100.0) as u32;
+                    windows.push(Gauge {
+                        id: "grok:ondemand".to_string(),
+                        label: "pay-as-you-go".to_string(),
+                        percent: pct,
+                        reset: None,
+                        stale: false,
+                    });
+                }
+            }
+        }
+
+        if let Ok((monthly_val, code)) = monthly_res {
+            if code == 200 {
+                let mcfg = monthly_val.get("config").unwrap_or(&monthly_val);
+                let limit = mcfg["monthlyLimit"]["val"]
+                    .as_f64()
+                    .or_else(|| mcfg["monthlyLimit"].as_f64());
+                let used = mcfg["used"]["val"]
+                    .as_f64()
+                    .or_else(|| mcfg["used"].as_f64());
+                if let (Some(lim), Some(u)) = (limit, used) {
+                    if lim > 0.0 {
+                        let pct = (u / lim * 100.0).round().clamp(0.0, 100.0) as u32;
+                        let reset = mcfg["billingPeriodEnd"].as_str().map(|s| s.to_string());
+                        windows.push(Gauge {
+                            id: "grok:monthly".to_string(),
+                            label: "month".to_string(),
+                            percent: pct,
+                            reset,
+                            stale: false,
+                        });
+                    }
+                }
             }
         }
     }

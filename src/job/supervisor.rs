@@ -109,8 +109,10 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
         child_cmd.arg("--print-id");
     }
 
-    // Pass `-` so prompt is read from stdin
-    child_cmd.arg("-");
+    // Pass `-` so prompt is read from stdin if prompt_bytes is not empty
+    if !prompt_bytes.is_empty() {
+        child_cmd.arg("-");
+    }
 
     if !record.cwd.is_empty() {
         child_cmd.current_dir(Path::new(&record.cwd));
@@ -140,10 +142,12 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     record.wrapper_pid = Some(wrapper_pid);
     save_record(name, &record)?;
 
-    // Deliver prompt
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&prompt_bytes);
-        let _ = stdin.flush();
+    // Deliver prompt if non-empty
+    if !prompt_bytes.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&prompt_bytes);
+            let _ = stdin.flush();
+        }
     }
 
     // Set up signal handler flag for SIGTERM
