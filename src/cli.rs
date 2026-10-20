@@ -9,7 +9,47 @@ use crate::tier::{self, Tier};
 
 /// One CLI over the agent runners, named jobs, machine load, and credit usage.
 #[derive(Debug, Parser)]
-#[command(name = "crew", version, arg_required_else_help = true)]
+#[command(
+    name = "crew",
+    version,
+    about = "Run agent CLIs, named jobs, machine load, and credit usage",
+    long_about = "crew is one binary over claude, gemini, grok, and codex.\n\
+        \n\
+        Start with `crew models` for the tier table, then \
+        `crew <provider> --tier fast \"...\"`. Leaving out --read-only and \
+        --write is full autonomy. --auto is that same mode, written out.\n\
+        \n\
+        A run longer than 20 minutes prints one stderr line. Rate it later \
+        with `crew review write`. crew does not file the review itself.\n\
+        \n\
+        `crew help <command>` and `<command> --help` print the same text.\n\
+        \n\
+        Agents\n  \
+        claude\n  \
+        gemini    aliases: agy, antigravity\n  \
+        grok\n  \
+        codex     aliases: gpt, chatgpt\n\
+        \n\
+        Jobs\n  \
+        job       run, ls, show, result, log, wait, resume, stop\n\
+        \n\
+        Machine\n  \
+        load      CPU, memory, GPU, and running agents\n  \
+        usage     credit bars\n\
+        \n\
+        Config\n  \
+        review    rating log and model picker\n  \
+        models    the tier table",
+    after_long_help = "Examples:\n  \
+        crew models\n  \
+        crew grok --tier fast \"Reply with the single word pong\"\n  \
+        crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+        crew job wait demo\n  \
+        crew load\n  \
+        crew usage",
+    arg_required_else_help = true,
+    disable_help_subcommand = false
+)]
 pub struct Cli {
     /// Internal. Re-exec'd by `crew job run` as the detached supervisor.
     #[arg(long, hide = true)]
@@ -21,16 +61,102 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(
+        about = "Run Claude Code",
+        long_about = "Run the claude CLI. Use this for a foreground task. \
+            For a detached run, use `crew job run <name> claude ...` instead.",
+        after_long_help = "Examples:\n  \
+            crew claude --tier fast \"Reply with the single word pong\"\n  \
+            crew claude -m fable -e max \"Read the plan and list the risks\"\n  \
+            crew claude --read-only -C ~/Projects/crew \"What does src/tier.rs decide?\""
+    )]
     Claude(ProviderArgs),
-    #[command(alias = "antigravity", alias = "agy")]
+    #[command(
+        about = "Run the Gemini CLI (agy)",
+        long_about = "Run agy. Aliases: antigravity, agy. Effort is baked into \
+            the model slug (gemini-3.8-flash-low, and so on). crew does not also \
+            pass --effort. A deadline kills the process group and drops the \
+            partial transcript.",
+        after_long_help = "Examples:\n  \
+            crew gemini --tier fast \"Reply with the single word pong\"\n  \
+            crew agy --read-only \"Summarize src/cli.rs\"\n  \
+            crew gemini -m gemini-3.8-flash-high \"Look at the last commit\"",
+        visible_alias = "antigravity",
+        visible_alias = "agy"
+    )]
     Gemini(GeminiArgs),
+    #[command(
+        about = "Run the Grok CLI",
+        long_about = "Run grok. A tier only selects the model (grok-4.7). \
+            It does not select effort. -e does, and the default is medium. \
+            `crew models` prints '-' in the grok effort column.",
+        after_long_help = "Examples:\n  \
+            crew grok --tier fast \"Reply with the single word pong\"\n  \
+            crew grok --tier max -e high \"Review the diff\"\n  \
+            crew grok --read-only -n 4 \"List the files in src/\""
+    )]
     Grok(GrokArgs),
-    #[command(alias = "gpt", alias = "chatgpt")]
+    #[command(
+        about = "Run Codex",
+        long_about = "Run codex. Aliases: gpt, chatgpt. Default effort is \
+            medium. User-facing max is sent as ultra, except on gpt-6-luna, \
+            which stays max. --review with a scope (--uncommitted, --base, \
+            or --commit) does not take a prompt.",
+        after_long_help = "Examples:\n  \
+            crew codex --tier fast \"Reply with the single word pong\"\n  \
+            crew codex --review --uncommitted\n  \
+            crew codex --read-only -m gpt-6-luna \"Explain src/tier.rs\"",
+        visible_alias = "gpt",
+        visible_alias = "chatgpt"
+    )]
     Codex(CodexArgs),
+    #[command(
+        about = "Run, list, and resume named background jobs",
+        long_about = "Detach a provider run under a name and pick it up later. \
+            The store is $CREW_HOME or ~/.local/share/crew. Status is derived \
+            from the process and the recorded exit, not stored as a field.",
+        after_long_help = "Examples:\n  \
+            crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+            crew job ls\n  \
+            crew job wait demo\n  \
+            crew job result demo"
+    )]
     Job(JobArgs),
+    #[command(
+        about = "Show CPU, memory, GPU, and running agent processes",
+        long_about = "Same lines as subagentcounter, plus a crew: line. \
+            macOS only for the GPU figure. Shells whose first argument is -c \
+            are not counted, and neither is this process's own tree.",
+        after_long_help = "Examples:\n  crew load"
+    )]
     Load,
+    #[command(
+        about = "Show provider credit usage",
+        long_about = "Same sources as usagebar: a Claude /usage probe, \
+            agy /usage on a PTY, the Grok billing API, and the Codex usage API. \
+            Bars are sorted by the least-used window. Tokens are not printed.",
+        after_long_help = "Examples:\n  crew usage"
+    )]
     Usage,
+    #[command(
+        about = "Record and query ratings of finished runs",
+        long_about = "The log is ~/.local/share/reviewsubagent/reviews.jsonl, \
+            capped at 30. crew does not write a row when a run finishes. \
+            The orchestrator does that later with `crew review write`.",
+        after_long_help = "Examples:\n  \
+            crew review query all\n  \
+            crew review pick \"fix the date parser\"\n  \
+            crew review write grok-4.7-medium \"pong\" \"replied pong\" 12s - 80 grok"
+    )]
     Review(ReviewArgs),
+    #[command(
+        about = "Print the tier table",
+        long_about = "Print provider, tier, model, effort, and whether the \
+            row is the built-in table or ~/.config/crew/tiers.toml. \
+            CREW_TIERS overrides that path. A user file replaces the whole table. \
+            Grok effort is '-', because -e selects it.",
+        after_long_help = "Examples:\n  crew models"
+    )]
     Models,
 }
 
@@ -40,10 +166,13 @@ struct ProviderArgs {
     shared: SharedArgs,
     #[command(flatten)]
     dirs: AddDirArgs,
+    /// JSON schema. `{...}` is the schema text. Anything else is a file path, with `~` expanded.
     #[arg(long)]
     schema: Option<String>,
+    /// Print the CLI's own output and skip crew's success check.
     #[arg(long)]
     raw: bool,
+    /// Drop web search and web fetch from the tool list.
     #[arg(long)]
     no_web: bool,
 }
@@ -54,8 +183,10 @@ struct GeminiArgs {
     shared: SharedArgs,
     #[command(flatten)]
     dirs: AddDirArgs,
+    /// Named agy agent. With no -m, the tier model is not sent.
     #[arg(long)]
     agent: Option<String>,
+    /// Pass agy's --sandbox.
     #[arg(long)]
     sandbox: bool,
 }
@@ -64,12 +195,16 @@ struct GeminiArgs {
 struct GrokArgs {
     #[command(flatten)]
     shared: SharedArgs,
+    /// JSON schema. `{...}` is the schema text. Anything else is a file path, with `~` expanded.
     #[arg(long)]
     schema: Option<String>,
+    /// Print grok's own output and skip the stopReason check.
     #[arg(long)]
     raw: bool,
+    /// Pass --disable-web-search, and drop web tools from a read-only fallback.
     #[arg(long)]
     no_web: bool,
+    /// Stop after this many turns. Maps to grok --max-turns.
     #[arg(short = 'n', long = "max-turns")]
     max_turns: Option<u32>,
 }
@@ -80,52 +215,68 @@ struct CodexArgs {
     shared: SharedArgs,
     #[command(flatten)]
     dirs: AddDirArgs,
+    /// JSON schema passed through to codex. Not read as a file.
     #[arg(long)]
     schema: Option<String>,
+    /// Print codex's own output and skip the turn.failed check.
     #[arg(long)]
     raw: bool,
+    /// Run `codex review` instead of a normal turn.
     #[arg(long)]
     review: bool,
+    /// Review scope: uncommitted changes. Does not take a prompt. Requires --review.
     #[arg(long)]
     uncommitted: bool,
+    /// Review scope: changes against this base branch. Requires --review.
     #[arg(long)]
     base: Option<String>,
+    /// Review scope: this commit. Requires --review.
     #[arg(long)]
     commit: Option<String>,
 }
 
 #[derive(Debug, Args)]
 struct SharedArgs {
+    /// fast, balanced, smart, or max. See `crew models`. -m overrides the row's model. A grok tier does not set effort.
     #[arg(long, value_enum)]
     tier: Option<Tier>,
+    /// Override the tier model. Passed through. Claude short names: haiku, sonnet, opus, fable.
     #[arg(short = 'm', long)]
     model: Option<String>,
+    /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5).
     #[arg(short = 'e', long)]
     effort: Option<String>,
+    /// Read-only tools. Claude uses its read-only permission mode. Gemini omits the skip-permissions flag. Grok tries the read-only sandbox once, then a read-only tool list. Codex uses its read-only sandbox.
     #[arg(long, conflicts_with_all = ["write", "auto"])]
     read_only: bool,
+    /// Allow edits. Claude: accept-edits style permissions. Gemini: --mode accept-edits. Grok: --sandbox workspace. Codex: its write sandbox.
     #[arg(long, conflicts_with_all = ["read_only", "auto"])]
     write: bool,
     /// Accepted and ignored. Omitting the mode flags is already full autonomy.
     #[arg(long, conflicts_with_all = ["read_only", "write"])]
     auto: bool,
-    /// Seconds. The old wrapper default of 300 was shorter than real runs.
+    /// Seconds before the process group is killed. Default 1800. Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds, and the partial output is dropped.
     #[arg(short = 't', long, default_value_t = 1800.0)]
     timeout: f64,
+    /// Working directory for the child. Maps to the CLI's own cwd flag where it has one.
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
+    /// Resume this session id. Claude and Codex reject -r together with -c. Grok keeps -r and drops -c. Gemini forwards both.
     #[arg(short = 'r', long)]
     resume: Option<String>,
+    /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
+    /// Write SESSION_ID=<id> to stderr when the CLI reports one.
     #[arg(long = "print-id")]
     print_id: bool,
-    /// Prompt text, or `-` to read stdin. Omitted means the same as `-`.
+    /// Prompt text, or `-` to read stdin. Omitted means the same as `-`. `-` on a terminal is an error. The prompt is an argument to the child CLI, not the child's stdin.
     prompt: Option<String>,
 }
 
 #[derive(Debug, Args, Default)]
 struct AddDirArgs {
+    /// Extra directory the CLI may read. Repeatable. grok rejects this flag.
     #[arg(long = "add-dir")]
     add_dir: Vec<PathBuf>,
 }
@@ -166,47 +317,127 @@ struct JobArgs {
 
 #[derive(Debug, Subcommand)]
 enum JobCommand {
-    /// Detach a provider run under a durable name.
+    #[command(
+        about = "Detach a provider run under a name",
+        long_about = "Start `crew <provider> ...` in the background and print the name. \
+            The flags after the provider are the same flags as a foreground run.",
+        after_long_help = "Examples:\n  \
+            crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+            crew job run audit claude --read-only -C ~/Projects/crew \"List the risky spots\"\n  \
+            crew job run --note \"nightly\" rev codex --review --uncommitted"
+    )]
     Run(JobRunArgs),
+    #[command(
+        about = "List jobs, oldest first",
+        long_about = "Print name, derived status, provider, model, and age. \
+            Status is running, lost, stopped, ok, timeout, unclean, or failed.",
+        after_long_help = "Examples:\n  crew job ls\n  crew job ls --json"
+    )]
     Ls {
+        /// Print one JSON array instead of the table.
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Show one job's record and derived status",
+        long_about = "Print the stored record. The status line is computed, not stored.",
+        after_long_help = "Examples:\n  crew job show demo\n  crew job show demo --json"
+    )]
     Show {
+        /// Job name.
+        #[arg(value_name = "NAME")]
         name: String,
+        /// Print the record as JSON, including the derived status.
         #[arg(long)]
         json: bool,
     },
+    #[command(
+        about = "Print a finished job's stdout",
+        long_about = "Exit 2 while the job is running, 3 if the supervisor is gone \
+            without a recorded exit. Refuses a symlink. A run longer than 20 minutes \
+            also prints the review reminder on stderr.",
+        after_long_help = "Examples:\n  crew job result demo"
+    )]
     Result {
+        /// Job name.
+        #[arg(value_name = "NAME")]
         name: String,
     },
+    #[command(
+        about = "Print the tail of a job's stderr",
+        long_about = "Stderr holds the session id line and crew's own notes. Default is 20 lines.",
+        after_long_help = "Examples:\n  crew job log demo\n  crew job log demo -n 50"
+    )]
     Log {
+        /// Job name.
+        #[arg(value_name = "NAME")]
         name: String,
+        /// How many lines from the end. Default 20.
         #[arg(short = 'n', default_value_t = 20)]
         lines: usize,
     },
+    #[command(
+        about = "Block until the named jobs finish",
+        long_about = "Exit with the job's code. A stopped job returns 130. \
+            An unknown name is exit 2. --timeout expiring is exit 4. \
+            A run longer than 20 minutes prints the review reminder.",
+        after_long_help = "Examples:\n  \
+            crew job wait demo\n  \
+            crew job wait one two --any\n  \
+            crew job wait demo --timeout 600"
+    )]
     Wait {
+        /// One or more job names.
+        #[arg(value_name = "NAME")]
         names: Vec<String>,
+        /// Return when the first named job finishes, and print that name.
         #[arg(long)]
         any: bool,
+        /// Give up after this many seconds. Exit 4.
         #[arg(long)]
         timeout: Option<u64>,
     },
+    #[command(
+        about = "Start <name>.2 (then .3, ...) in the parent's directory",
+        long_about = "Holds the parent's resume.lock while the child name is chosen. \
+            The child gets the parent's flags, -C of the parent's directory, \
+            and -r of the parent's session id. Pass a new prompt, or omit it to read stdin.",
+        after_long_help = "Examples:\n  \
+            crew job resume demo \"Look at the tests you skipped\"\n  \
+            crew job resume demo"
+    )]
     Resume {
+        /// Parent job name.
+        #[arg(value_name = "NAME")]
         name: String,
+        /// New prompt. Omit it to read stdin. At most one argument.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
     },
+    #[command(
+        about = "Stop a running job",
+        long_about = "SIGTERM the supervisor. It SIGTERMs the child group, waits 10 seconds, \
+            then SIGKILL. The stored exit is the raw signal code (143 or 137). \
+            `crew job wait` returns 130 for a stopped job.",
+        after_long_help = "Examples:\n  crew job stop demo"
+    )]
     Stop {
+        /// Job name.
+        #[arg(value_name = "NAME")]
         name: String,
     },
 }
 
 #[derive(Debug, Args)]
 struct JobRunArgs {
+    /// Free-text note stored on the job. Not sent to the provider.
     #[arg(long)]
     note: Option<String>,
+    /// Job name. Must match ^[a-z0-9][a-z0-9._-]{0,63}$.
+    #[arg(value_name = "NAME")]
     name: String,
+    /// claude, gemini (agy, antigravity), grok, or codex (gpt, chatgpt).
+    #[arg(value_name = "PROVIDER")]
     provider: String,
     /// Wrapper flags and the prompt. Passed through to `crew <provider>`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -221,19 +452,59 @@ struct ReviewArgs {
 
 #[derive(Debug, Subcommand)]
 enum ReviewCommand {
+    #[command(
+        about = "Append one rating",
+        long_about = "Append a row and keep the newest 30. The model is \
+            <id>-<effort>, for example grok-4.7-medium. Duration is seconds \
+            or 1h30m15s. Cost is a number, nan, or '-'. Score is an integer 0 through 100.",
+        after_long_help = "Examples:\n  \
+            crew review write grok-4.7-medium \"pong\" \"replied pong\" 12s - 80 grok\n  \
+            crew review write claude-haiku-5-5-medium \"audit\" \"listed three risks\" 1h30m15s 0.05 70 claude"
+    )]
     Write {
+        /// Model id and effort, joined by a hyphen: grok-4.7-medium.
+        #[arg(value_name = "MODEL")]
         model: String,
+        /// What the run was asked to do.
+        #[arg(value_name = "TASK")]
         task: String,
+        /// What it actually did.
+        #[arg(value_name = "WHAT")]
         what: String,
+        /// Seconds, or a clock like 1h30m15s.
+        #[arg(value_name = "DURATION")]
         duration: String,
+        /// A number, nan, or '-'.
+        #[arg(value_name = "COST")]
         cost: String,
+        /// Integer 0 through 100.
+        #[arg(value_name = "SCORE")]
         score: String,
+        /// Who is writing the rating.
+        #[arg(value_name = "REVIEWER")]
         reviewer: String,
     },
+    #[command(
+        about = "Print the rating table",
+        long_about = "Harness is all, codex, claude, agy, or grok. An empty log still prints the header.",
+        after_long_help = "Examples:\n  crew review query all\n  crew review query grok"
+    )]
     Query {
+        /// all, codex, claude, agy, or grok.
+        #[arg(value_name = "HARNESS")]
         harness: String,
     },
+    #[command(
+        about = "Ask a judge which logged model should take a task",
+        long_about = "Candidates are models already in the log. The judge is a \
+            random one of claude/haiku, gemini/gemini-3.8-flash, or codex/gpt-6-luna, \
+            effort high, read-only, 300 seconds. If that judge fails to launch, \
+            the other two are tried. An empty log is exit 2.",
+        after_long_help = "Examples:\n  crew review pick \"fix the date parser\""
+    )]
     Pick {
+        /// The task the chosen model would do.
+        #[arg(value_name = "TASK")]
         task: String,
     },
 }
@@ -487,6 +758,8 @@ fn invocation_from_codex(args: CodexArgs) -> Result<Invocation, Error> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Invocation, Error> {
@@ -541,5 +814,43 @@ mod tests {
     fn timeout_must_be_positive() {
         let err = parse(&["claude", "-t", "0", "hi"]).unwrap_err();
         assert_eq!(err.code, 2);
+    }
+
+    /// Help is the interface. A blank about or a blank option is a regression,
+    /// including on commands added later.
+    #[test]
+    fn every_command_and_option_has_help() {
+        fn assert_documented(cmd: &clap::Command) {
+            let name = cmd.get_name().to_string();
+            // clap's own `help` subcommand has an about and no long_about.
+            let builtin_help = name == "help";
+            let about = cmd.get_about().map(|s| s.to_string()).unwrap_or_default();
+            assert!(!about.is_empty(), "{name} about");
+            if !builtin_help {
+                let long_about = cmd
+                    .get_long_about()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                assert!(!long_about.is_empty(), "{name} long_about");
+                let examples = cmd
+                    .get_after_long_help()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                assert!(!examples.is_empty(), "{name} examples");
+            }
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if id == "help" || id == "version" {
+                    continue;
+                }
+                let help = arg.get_help().map(|s| s.to_string()).unwrap_or_default();
+                assert!(!help.is_empty(), "{name} option {id}");
+            }
+            for sub in cmd.get_subcommands() {
+                assert_documented(sub);
+            }
+        }
+
+        assert_documented(&Cli::command());
     }
 }
