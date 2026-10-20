@@ -2,6 +2,8 @@ mod claude;
 mod codex;
 mod gemini;
 mod grok;
+mod proc;
+mod pty;
 
 use crate::cli::Invocation;
 use crate::error::Error;
