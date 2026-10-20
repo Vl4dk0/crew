@@ -74,12 +74,28 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    let rc = if captured.timed_out {
-        124
+    // Our own deadline kills the group and drops the partial PTY transcript.
+    // A child that exits by itself with "timeout waiting for response" still
+    // goes through present_gemini, which keeps that message.
+    let mut presented = if captured.timed_out {
+        let (_, before) = judge_gemini("", 124, invocation.read_only);
+        let before = if before.is_empty() {
+            format!(
+                "[crew] timed out after {}s\n",
+                proc::format_secs(invocation.timeout_secs)
+            )
+        } else {
+            before
+        };
+        proc::Report {
+            code: 124,
+            before_stderr: before,
+            stdout: String::new(),
+            after_stderr: String::new(),
+        }
     } else {
-        captured.code
+        present_gemini(&captured.stdout, captured.code, invocation.read_only)
     };
-    let mut presented = present_gemini(&captured.stdout, rc, invocation.read_only);
     if invocation.print_id {
         let resume = invocation.resume.as_deref().filter(|id| !id.is_empty());
         let id = if resume.is_some() {
