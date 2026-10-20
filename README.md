@@ -1,42 +1,162 @@
 # crew
 
-One Rust CLI over the agent runners (`claude`, `codex`, `agy`, `grok`), named background jobs, machine load, and provider credit usage.
+One unified Rust CLI over Vladko's AI agent runners (`claude`, `codex`, `agy`/`gemini`, `grok`), durable background jobs, macOS machine load telemetry, and provider subscription credit usage.
 
-## Name
+The binary name is **`crew`**.
 
-The command is `crew`.
+Alternatives considered and recorded:
+- `roof`: The initial working title; dropped because it describes a position rather than active workers.
+- `span`: Explored as a structural metaphor; less intuitive than a team of agents.
+- `baton`: Existing tool name; unclear and associated with relays rather than autonomous execution.
+- `desk`, `aide`, `nest`: Dropped because they conflict with existing Homebrew formulas or macOS commands.
 
-- `crew` — chosen. `crew claude`, `crew job ls`, and `crew load` are plain English. Not on `PATH`. No Homebrew formula.
-- `roof` — the working title. Also clear of `PATH` and Homebrew. Rejected as a metaphor, which is the same failure as `baton`.
-- `span` — one binary spanning the tools. Rejected as less obvious.
+---
 
-`desk`, `aide`, and `nest` were dropped because they are Homebrew formulas.
+## Quick Start
 
-## Quick start
+### 1. Direct Agent Runs
+Invoke the provider directly as the subcommand. Default permission mode is full autonomy (`--auto`); use `--read-only` or `--write` to restrict permissions.
 
-```sh
-cargo build
-./target/debug/crew models
-./target/debug/crew load
-./target/debug/crew usage
+```console
+# Fast run using intelligence tiers
+$ crew gemini --tier fast "Fix typo in src/main.rs"
 
-./target/debug/crew grok --tier fast "Reply with the single word pong"
-./target/debug/crew claude --tier fast "Reply with the single word pong"
-./target/debug/crew gemini --tier fast "Reply with the single word pong"
+# Explicit model and effort override
+$ crew claude -m claude-3-5-sonnet -e high "Refactor error handling"
+
+# Grok execution (effort set via -e, default medium)
+$ crew grok --tier smart -e low "Summarize latest git log"
+
+# Review git diff using Codex
+$ crew codex --review --uncommitted
 ```
 
-`--tier` is `fast`, `balanced`, `smart`, or `max`. `-m` overrides that row's model. `-e` is `low`, `medium`, `high`, or `max`, and the default is `medium`. A grok tier does not select effort; `-e` does, and `crew models` prints `-` in that column.
+Aliases supported:
+- `gemini`: `antigravity`, `agy`
+- `codex`: `gpt`, `chatgpt`
 
-Omitting the mode flags is full autonomy. `--auto` is the explicit spelling of that and is otherwise ignored. `--read-only` and `--write` are the other modes. `-t` is seconds and defaults to 1800.
+### 2. Intelligence Tiers (`crew models`)
+Map semantic tiers (`fast`, `balanced`, `smart`, `max`) without remembering exact provider model slugs:
 
-`~/.config/crew/tiers.toml` replaces the built-in table. `CREW_TIERS` overrides that path. Jobs live in `$CREW_HOME` or `~/.local/share/crew`.
-
-```sh
-./target/debug/crew job run demo grok --tier fast "Reply with the single word pong"
-./target/debug/crew job wait demo
-./target/debug/crew job result demo
+```console
+$ crew models
+provider  tier      model                      effort  source
+claude    fast      haiku                      medium  builtin
+claude    balanced  sonnet                     medium  builtin
+claude    smart     opus                       high    builtin
+claude    max       fable                      max     builtin
+codex     fast      gpt-6-luna                 low     builtin
+codex     balanced  gpt-6.1-sol                low     builtin
+codex     smart     gpt-6-astra                high    builtin
+codex     max       gpt-6-astra                max     builtin
+gemini    fast      gemini-3.8-flash-low       low     builtin
+gemini    balanced  gemini-3.8-flash-medium    medium  builtin
+gemini    smart     gemini-3.8-flash-high      high    builtin
+gemini    max       gemini-4-argon-high        high    builtin
+grok      fast      grok-4.7                   -       builtin
+grok      balanced  grok-4.7                   -       builtin
+grok      smart     grok-4.7                   -       builtin
+grok      max       grok-4.7                   -       builtin
 ```
 
-A finished run longer than 20 minutes prints one stderr line telling the orchestrator to rate it later with `crew review write`. crew does not file that review.
+### 3. Durable Background Jobs (`crew job`)
+Supervisor-monitored detached background execution with state stored under `$CREW_HOME` (default `~/.local/share/crew/runs/<name>/`):
 
-The plan is [PLAN.md](PLAN.md). A real run of each provider that had credits is in [docs/demo.md](docs/demo.md). Nothing here replaces the old tools; see [MIGRATION.md](MIGRATION.md).
+```console
+# Start a detached job (streams prompt to child stdin)
+$ crew job run audit claude -- --tier fast "Audit dependencies for vulnerabilities"
+
+# Check active and completed jobs
+$ crew job ls
+NAME            STATUS    WRAPPER     MODEL                    AGE  
+audit           running   claude      haiku                    12s  
+
+# Tail stderr logs
+$ crew job log audit -n 50
+
+# Wait synchronously for completion
+$ crew job wait audit
+
+# Read stdout safely (with symlink verification)
+$ crew job result audit
+
+# Resume an existing session under an incremented name (audit.2)
+$ crew job resume audit "Check Cargo.lock too"
+
+# Stop a running job gracefully (SIGTERM, 10s grace, SIGKILL)
+$ crew job stop audit
+```
+
+### 4. Hardware Load Telemetry (`crew load`)
+Instant macOS hardware metrics (CPU, used/total RAM via Mach page calculation, swap, GPU via IOKit) and active subagent process tracking with descendant tree exclusion:
+
+```console
+$ crew load
+load: CPU 11% (load 2.1 / 10 cores) | RAM 19.0 / 24.0 GB (79%), swap 0.7 GB | GPU 26%
+claude-run: 0
+agy-run: 1 | 79810
+codex-run: 0
+grok-run: 2 | 75237; 79803
+crew: 0
+```
+
+### 5. Subscription Quota Meters (`crew usage`)
+Visual 20-column eighth-block meters (`▏▎▍▌▋▊▉█`) sorted by least-used window first. Reads tokens safely without ever printing or logging secrets:
+
+```console
+$ crew usage
+✕ grok
+  week                  15%  ███░░░░░░░░░░░░░░░░░
+
+✦ antigravity
+  gemini week           39%  ███████▊░░░░░░░░░░░░
+  gemini 5h             29%  █████▊░░░░░░░░░░░░░░
+  other models week      0%  ░░░░░░░░░░░░░░░░░░░░
+  other models 5h        0%  ░░░░░░░░░░░░░░░░░░░░
+  Gemini 4 Argon week   55%  ███████████░░░░░░░░░
+
+✳ claude
+  5 h                   74%  ██████████████▊░░░░░
+  týždeň                18%  ███▌░░░░░░░░░░░░░░░░
+
+⚛ codex  Pro
+  týždeň               100%  ████████████████████  stale
+```
+
+### 6. Autonomous Model Reviews (`crew review`)
+Records, queries, and autonomously selects benchmark review models from historical scores (`~/.local/share/reviewsubagent/reviews.jsonl`, capped at 30 entries):
+
+```console
+# Record a review entry
+$ crew review write --model opus --task "refactor" --what "Clean async loop" --duration 120 --cost 0.04 --score 5 --reviewer claude
+
+# Query reviews by harness
+$ crew review query claude
+
+# Autonomously pick best judge model based on scores and available usage
+$ crew review pick "code review"
+```
+
+---
+
+## Architectural Highlights & Wrapper Quirks Preserved
+
+- **PTY Execution for Gemini/Antigravity**: Runs `agy` within a pseudo-terminal (`libc::openpty`), bypassing the bug where `agy -p` drops output under non-PTY pipes.
+- **PTY Probe for Claude Code**: Probes `/usage` inside a pseudo-terminal with isolated settings (`--allowed-tools ""`), falling back to stale cache on rate limits.
+- **Process Group Isolation**: Each runner and supervisor child lives in its own process group (`setpgid(0, 0)`), ensuring timeouts and cancellations clean up all descendants.
+- **Denial & Failure Detection**: Matches wrapper exit codes:
+  - Exit 124: Timeout
+  - Exit 125: Tool denial or empty output
+  - Exit 127: Binary missing or spawn failure
+  - Exit 130: Process terminated by SIGTERM / SIGINT
+- **Symlink Protection**: Run store files (`run.json`, `stdout`, `stderr`, `resume.lock`) are opened with `O_NOFOLLOW | O_NONBLOCK` and verified via `fstat` as regular files.
+- **Civil Calendar Math**: Timestamp calculations implement Howard Hinnant's algorithm to eliminate leap-year and day-of-year drift.
+- **Zero Hacks & Minimal Flags**: Validated inputs, `< 100` targeted unit tests, zero warnings on `cargo clippy --all-targets -- -D warnings`.
+
+---
+
+## Documentation Links
+
+- [PLAN.md](PLAN.md): Specification, CLI surface agreement, and architecture layout.
+- [MIGRATION.md](MIGRATION.md): Proposed shims for replacing legacy shell wrappers.
+- [docs/demo.md](docs/demo.md): Recorded execution transcripts from live test runs.
