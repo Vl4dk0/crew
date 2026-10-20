@@ -118,7 +118,13 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
         child_cmd.current_dir(Path::new(&record.cwd));
     }
 
-    child_cmd.stdin(Stdio::piped());
+    // An empty prompt must not leave the write end open. The child would
+    // block on read until the deadline. A review scope does not read stdin.
+    if prompt_bytes.is_empty() {
+        child_cmd.stdin(Stdio::null());
+    } else {
+        child_cmd.stdin(Stdio::piped());
+    }
     child_cmd.stdout(Stdio::from(stdout_file));
     child_cmd.stderr(Stdio::from(stderr_file));
 
