@@ -6,7 +6,7 @@ Vladko, 2026-10-20:
 
 - `-e` accepts only `low`, `medium`, `high`, `max`. Default is `medium` when neither `--tier` nor `-e` is passed, including codex (its wrapper default is `low`). `--tier` without `-e` uses the tier row's effort.
 - `max` is mapped per CLI: claude sends `max`; codex sends `ultra` except `gpt-6-luna`, which sends `max`; gemini sends `high`; grok sends `xhigh` (and `high` for `grok-4.5`, which has no `xhigh`). The user never types `xhigh` or `ultra`.
-- Grok's four tiers are all `grok-4.7`. The tier still selects the effort. `grok-4.7-build-fast` stays available only through `-m`.
+- Grok's four tiers are all `grok-4.7` and do not select effort. `-e` does, default `medium`. A grok row that sets `effort` is a config error. `grok-4.7-build-fast` stays available only through `-m`.
 - `-m` overrides the tier's model. The built-in table is the default. `~/.config/crew/tiers.toml` replaces it.
 - Default autonomy stays allow-all. `--auto` is the explicit spelling.
 - `-t` defaults to 1800 seconds. The wrapper default of 300 was shorter than real runs.
@@ -151,14 +151,14 @@ Codex has three families and four tiers, so `smart` and `max` share `gpt-6-astra
 
 Gemini effort is baked into the slug for `flash` and `argon`. The runner must not also pass `--effort` for those aliases. A user `-m` that already ends in `-low`, `-medium`, or `-high` is sent as-is and `--effort` is not added.
 
-Grok is one model. All four tiers use `grok-4.7` and differ by effort. `grok-4.7-build-fast` stays available through `-m`. It is not a tier. The config stores the user-facing effort `max`. The grok runner sends that as `xhigh`.
+Grok is one model. All four tiers use `grok-4.7` and do not carry an effort. `-e` selects it, default `medium`. The grok runner sends user-facing `max` as `xhigh`. `grok-4.7-build-fast` stays available through `-m`. It is not a tier.
 
 | tier | claude `-m` / `-e` | codex `-m` / `-e` | gemini slug | grok `-m` / `-e` |
 |---|---|---|---|---|
 | fast | haiku / medium | gpt-6-luna / low | gemini-3.8-flash-low | grok-4.7 / low |
 | balanced | sonnet / medium | gpt-6.1-sol / low | gemini-3.8-flash-medium | grok-4.7 / medium |
 | smart | opus / high | gpt-6-astra / high | gemini-3.8-flash-high | grok-4.7 / high |
-| max | fable / max | gpt-6-astra / max | gemini-4-argon-high | grok-4.7 / max |
+| max | fable / max | gpt-6-astra / max | gemini-4-argon-high | grok-4.7 / `-e`, default medium |
 
 Wrapper defaults when `--tier` and `-m` are both absent:
 

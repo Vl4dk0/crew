@@ -48,7 +48,9 @@ enum Source {
 #[serde(deny_unknown_fields)]
 struct Row {
     model: String,
-    effort: String,
+    /// Absent for grok. A grok tier does not select effort. `-e` does.
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,16 +111,37 @@ fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
     ] {
         for tier in Tier::all() {
             let row = table.provider(provider).get(tier);
-            parse_effort(&row.effort).map_err(|err| {
-                Error::new(
-                    2,
-                    format!(
-                        "tier config {origin}: {provider} {} effort: {}",
-                        tier.as_str(),
-                        err.message
-                    ),
-                )
-            })?;
+            match (provider, row.effort.as_deref()) {
+                (Provider::Grok, Some(_)) => {
+                    return Err(Error::new(
+                        2,
+                        format!(
+                            "tier config {origin}: grok {} must not set effort. Pass -e.",
+                            tier.as_str()
+                        ),
+                    ));
+                }
+                (Provider::Grok, None) => {}
+                (_, None) => {
+                    return Err(Error::new(
+                        2,
+                        format!(
+                            "tier config {origin}: {provider} {} is missing effort",
+                            tier.as_str()
+                        ),
+                    ));
+                }
+                (_, Some(effort)) => parse_effort(effort).map_err(|err| {
+                    Error::new(
+                        2,
+                        format!(
+                            "tier config {origin}: {provider} {} effort: {}",
+                            tier.as_str(),
+                            err.message
+                        ),
+                    )
+                })?,
+            }
             if row.model.is_empty() {
                 return Err(Error::new(
                     2,
@@ -190,7 +213,14 @@ fn resolve_with(
     }
     let (row_model, row_effort) = if let Some(tier) = tier {
         let row = table.provider(provider).get(tier);
-        (row.model.clone(), row.effort.clone())
+        let row_effort = if provider == Provider::Grok {
+            "medium".to_string()
+        } else {
+            row.effort.clone().ok_or_else(|| {
+                Error::new(2, format!("{provider} {} is missing effort", tier.as_str()))
+            })?
+        };
+        (row.model.clone(), row_effort)
     } else {
         let default = wrapper_default(provider, None);
         (default.model.unwrap_or_default(), default.effort)
@@ -230,12 +260,13 @@ pub fn print() -> Result<i32, Error> {
     ] {
         for tier in Tier::all() {
             let row = loaded.table.provider(provider).get(tier);
+            let effort = row.effort.as_deref().unwrap_or("-");
             println!(
                 "{:<8}  {:<8}  {:<25}  {:<6}  {source}",
                 provider.as_str(),
                 tier.as_str(),
                 row.model,
-                row.effort,
+                effort,
             );
         }
     }
@@ -251,10 +282,14 @@ mod tests {
         let table = parse_table(BUILTIN, "builtin").unwrap();
         let fast = table.provider(Provider::Claude).get(Tier::Fast);
         assert_eq!(fast.model, "haiku");
-        assert_eq!(fast.effort, "medium");
+        assert_eq!(fast.effort.as_deref(), Some("medium"));
         let max = table.provider(Provider::Grok).get(Tier::Max);
         assert_eq!(max.model, "grok-4.7");
-        assert_eq!(max.effort, "max");
+        assert_eq!(max.effort, None);
+        let fast = table.provider(Provider::Grok).get(Tier::Fast);
+        let resolved = resolve_with(&table, Provider::Grok, Some(Tier::Fast), None, None).unwrap();
+        assert_eq!(resolved.model.as_deref(), Some(fast.model.as_str()));
+        assert_eq!(resolved.effort, "medium");
         let smart = table.provider(Provider::Gemini).get(Tier::Smart);
         assert_eq!(smart.model, "gemini-3.8-flash-high");
     }

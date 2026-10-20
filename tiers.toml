@@ -49,18 +49,15 @@ effort = "high"
 model = "gemini-4-argon-high"
 effort = "high"
 
+# Effort is not a grok tier. -e sets it, and the default is medium.
 [grok.fast]
 model = "grok-4.7"
-effort = "low"
 
 [grok.balanced]
 model = "grok-4.7"
-effort = "medium"
 
 [grok.smart]
 model = "grok-4.7"
-effort = "high"
 
 [grok.max]
 model = "grok-4.7"
-effort = "max"
