@@ -129,10 +129,11 @@ pub(super) fn gemini_argv(
         resolved_model,
         resolved_effort,
     );
+    let prompt = proc::read_only_prompt(invocation, prompt);
     let mut argv = vec![
         "agy".to_string(),
         "-p".to_string(),
-        prompt.to_string(),
+        prompt,
         "--print-timeout".to_string(),
         print_timeout(invocation.timeout_secs),
     ];
@@ -462,6 +463,17 @@ mod tests {
         assert!(!has(&argv, "--mode"));
         assert!(has(&argv, "--sandbox"));
         assert_eq!(flag(&argv, "--add-dir"), Some("~/notes"));
+        assert_eq!(argv[2], format!("hello\n\n{}", proc::READ_ONLY_LINE));
+
+        invocation.raw = true;
+        let (argv, _, _) = gemini_argv(
+            &invocation,
+            Some("gemini-3.8-flash-medium"),
+            "medium",
+            "hello",
+        );
+        assert_eq!(argv[2], format!("hello\n\n{}", proc::READ_ONLY_LINE));
+        invocation.raw = false;
 
         invocation.read_only = false;
         invocation.write = true;

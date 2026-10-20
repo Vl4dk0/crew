@@ -157,7 +157,7 @@ pub(super) fn codex_argv(
     }
     if let Some(prompt) = prompt {
         argv.push("--".to_string());
-        argv.push(prompt.to_string());
+        argv.push(proc::read_only_prompt(invocation, prompt));
     }
     (argv, note)
 }
@@ -316,6 +316,18 @@ mod tests {
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
         assert_eq!(flag(&argv, "-s"), Some("read-only"));
         assert!(!has(&argv, "--dangerously-bypass-approvals-and-sandbox"));
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some(format!("hello\n\n{}", proc::READ_ONLY_LINE)).as_deref()
+        );
+
+        invocation.schema = Some("{}".to_string());
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        assert_eq!(argv.last().map(String::as_str), Some("hello"));
+        invocation.schema = None;
+
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
+        assert!(!has(&argv, "--"));
 
         invocation.read_only = false;
         invocation.write = true;
@@ -338,6 +350,7 @@ mod tests {
         invocation.continue_session = false;
         invocation.review = true;
         invocation.uncommitted = true;
+        invocation.read_only = true;
         assert!(codex_scope(&invocation));
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
         assert!(has(&argv, "review"));
@@ -348,6 +361,7 @@ mod tests {
         invocation.schema = Some("{".to_string());
         invocation.add_dir = vec!["~/nope".into()];
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        assert_eq!(argv.last().map(String::as_str), Some("hello"));
         let schema = flag(&argv, "--output-schema").unwrap();
         assert!(Path::new(schema).is_absolute());
         assert!(schema.contains('{'));
