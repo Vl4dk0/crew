@@ -22,7 +22,7 @@ Invoke the provider directly as the subcommand. Default permission mode is full 
 $ crew gemini --tier fast "Fix typo in src/main.rs"
 
 # Explicit model and effort override
-$ crew claude -m claude-3-5-sonnet -e high "Refactor error handling"
+$ crew claude -m sonnet -e high "Refactor error handling"
 
 # Grok execution (effort set via -e, default medium)
 $ crew grok --tier smart -e low "Summarize latest git log"

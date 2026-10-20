@@ -264,7 +264,7 @@ fn run_internal(
     fs::write(dir.join("prompt.bin"), &prompt_bytes)
         .map_err(|e| Error::new(2, format!("failed to write prompt: {}", e)))?;
 
-    let record = RunRecord {
+    let mut record = RunRecord {
         name: job.name.clone(),
         provider: job.provider.as_str().to_string(),
         args: flags,
@@ -290,7 +290,7 @@ fn run_internal(
     let current_exe = std::env::current_exe()
         .map_err(|e| Error::new(127, format!("failed to find current exe: {}", e)))?;
 
-    unsafe {
+    let child = unsafe {
         Command::new(current_exe)
             .arg("--supervise")
             .arg(&job.name)
@@ -304,8 +304,13 @@ fn run_internal(
                 Ok(())
             })
             .spawn()
-            .map_err(|e| Error::new(127, format!("failed to spawn supervisor: {}", e)))?;
-    }
+            .map_err(|e| Error::new(127, format!("failed to spawn supervisor: {}", e)))?
+    };
+
+    let sup_pid = child.id();
+    record.supervisor_pid = Some(sup_pid);
+    record.supervisor_start = process::get_process_lstart(sup_pid);
+    save_record(&job.name, &record)?;
 
     println!("{}", job.name);
     Ok(0)

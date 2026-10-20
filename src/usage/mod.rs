@@ -521,8 +521,9 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
 
         let monthly_res = query_api(&effective_tok, "");
 
+        let mut weekly_cfg: Option<Value> = None;
         if let Ok((weekly_val, _)) = weekly_res {
-            let cfg = weekly_val.get("config").unwrap_or(&weekly_val);
+            let cfg = weekly_val.get("config").unwrap_or(&weekly_val).clone();
             let mut credit_pct = cfg["creditUsagePercent"].as_f64();
 
             if credit_pct.is_none() {
@@ -564,29 +565,13 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                 });
             }
 
-            let cap = cfg["onDemandCap"]["val"]
-                .as_f64()
-                .or_else(|| cfg["onDemandCap"].as_f64());
-            let spent = cfg["onDemandUsed"]["val"]
-                .as_f64()
-                .or_else(|| cfg["onDemandUsed"].as_f64());
-            if let (Some(c), Some(s)) = (cap, spent) {
-                if c > 0.0 {
-                    let pct = (s / c * 100.0).round().clamp(0.0, 100.0) as u32;
-                    windows.push(Gauge {
-                        id: "grok:ondemand".to_string(),
-                        label: "pay-as-you-go".to_string(),
-                        percent: pct,
-                        reset: None,
-                        stale: false,
-                    });
-                }
-            }
+            weekly_cfg = Some(cfg);
         }
 
+        let mut monthly_cfg: Option<Value> = None;
         if let Ok((monthly_val, code)) = monthly_res {
             if code == 200 {
-                let mcfg = monthly_val.get("config").unwrap_or(&monthly_val);
+                let mcfg = monthly_val.get("config").unwrap_or(&monthly_val).clone();
                 let limit = mcfg["monthlyLimit"]["val"]
                     .as_f64()
                     .or_else(|| mcfg["monthlyLimit"].as_f64());
@@ -606,6 +591,62 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                         });
                     }
                 }
+                monthly_cfg = Some(mcfg);
+            }
+        }
+
+        // Check onDemandCap from weekly, falling back to monthly if missing on weekly
+        let (ondemand_cap, ondemand_spent, ondemand_reset) = {
+            let weekly_cap = weekly_cfg.as_ref().and_then(|c| {
+                c["onDemandCap"]["val"]
+                    .as_f64()
+                    .or_else(|| c["onDemandCap"].as_f64())
+            });
+            let weekly_spent = weekly_cfg.as_ref().and_then(|c| {
+                c["onDemandUsed"]["val"]
+                    .as_f64()
+                    .or_else(|| c["onDemandUsed"].as_f64())
+            });
+
+            if weekly_cap.is_some() {
+                let reset = weekly_cfg.as_ref().and_then(|c| {
+                    c["billingPeriodEnd"]
+                        .as_str()
+                        .or_else(|| c["currentPeriod"]["end"].as_str())
+                        .map(|s| s.to_string())
+                });
+                (weekly_cap, weekly_spent, reset)
+            } else {
+                let monthly_cap = monthly_cfg.as_ref().and_then(|c| {
+                    c["onDemandCap"]["val"]
+                        .as_f64()
+                        .or_else(|| c["onDemandCap"].as_f64())
+                });
+                let monthly_spent = monthly_cfg.as_ref().and_then(|c| {
+                    c["onDemandUsed"]["val"]
+                        .as_f64()
+                        .or_else(|| c["onDemandUsed"].as_f64())
+                });
+                let reset = monthly_cfg.as_ref().and_then(|c| {
+                    c["billingPeriodEnd"]
+                        .as_str()
+                        .or_else(|| c["currentPeriod"]["end"].as_str())
+                        .map(|s| s.to_string())
+                });
+                (monthly_cap, monthly_spent, reset)
+            }
+        };
+
+        if let (Some(cap), Some(spent)) = (ondemand_cap, ondemand_spent) {
+            if cap > 0.0 {
+                let pct = (spent / cap * 100.0).round().clamp(0.0, 100.0) as u32;
+                windows.push(Gauge {
+                    id: "grok:ondemand".to_string(),
+                    label: "pay-as-you-go".to_string(),
+                    percent: pct,
+                    reset: ondemand_reset,
+                    stale: false,
+                });
             }
         }
     }
@@ -899,4 +940,33 @@ pub fn print_usage() -> Result<i32, Error> {
     print!("{}", rendered);
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_ondemand_cap_fallback_to_monthly() {
+        let weekly = serde_json::json!({
+            "creditUsagePercent": 15.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                "end": "2026-10-23T06:26:08Z"
+            }
+        });
+        let monthly = serde_json::json!({
+            "monthlyLimit": { "val": 100.0 },
+            "used": { "val": 20.0 },
+            "onDemandCap": { "val": 50.0 },
+            "onDemandUsed": { "val": 10.0 },
+            "billingPeriodEnd": "2026-10-31T00:00:00Z"
+        });
+
+        let weekly_cap = weekly.get("onDemandCap").and_then(|c| c["val"].as_f64());
+        let ondemand_cap = if weekly_cap.is_some() {
+            weekly_cap
+        } else {
+            monthly.get("onDemandCap").and_then(|c| c["val"].as_f64())
+        };
+        assert_eq!(ondemand_cap, Some(50.0));
+    }
 }
