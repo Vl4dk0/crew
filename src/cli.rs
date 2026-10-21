@@ -124,9 +124,10 @@ enum Command {
     Job(JobArgs),
     #[command(
         about = "Show CPU, memory, GPU, and running agents per provider",
-        long_about = "One machine line, then a line per provider (claude, gemini, \
-            grok, codex) with the count and pids of running crew agents. Foreground \
-            runs and detached jobs each count once. macOS only for the GPU figure.",
+        long_about = "One machine line, then a line for each provider (claude, gemini, \
+            grok, codex) that has running crew agents, with their count and pids. \
+            Idle providers are not listed. Foreground runs and detached jobs each \
+            count once. macOS only for the GPU figure.",
         after_long_help = "Examples:\n  crew load"
     )]
     Load,

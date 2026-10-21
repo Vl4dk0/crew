@@ -341,7 +341,28 @@ pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<&'sta
     matches
 }
 
-/// Print the machine line, then one line per provider with its running crew agents.
+/// One line per provider that has running crew agents, in print order. Idle
+/// providers are left out so the output lists only work that is in flight.
+pub fn format_provider_lines(agent_pids: &HashMap<&'static str, Vec<u32>>) -> Vec<String> {
+    PROVIDERS
+        .iter()
+        .filter_map(|&(provider, _)| {
+            let pids = &agent_pids[provider];
+            if pids.is_empty() {
+                return None;
+            }
+            let pid_strs: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+            Some(format!(
+                "{}: {} | {}",
+                provider,
+                pids.len(),
+                pid_strs.join("; ")
+            ))
+        })
+        .collect()
+}
+
+/// Print the machine line, then the provider lines for agents that are running.
 pub fn print_load() -> Result<i32, Error> {
     let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
     let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
@@ -349,16 +370,8 @@ pub fn print_load() -> Result<i32, Error> {
 
     println!("{}", format_load_line(&metrics));
 
-    let agent_pids = find_agent_pids(&processes);
-
-    for &(provider, _) in &PROVIDERS {
-        let pids = &agent_pids[provider];
-        if pids.is_empty() {
-            println!("{}: 0", provider);
-        } else {
-            let pid_strs: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-            println!("{}: {} | {}", provider, pids.len(), pid_strs.join("; "));
-        }
+    for line in format_provider_lines(&find_agent_pids(&processes)) {
+        println!("{}", line);
     }
 
     Ok(0)
@@ -427,5 +440,14 @@ mod tests {
         assert_eq!(agents["gemini"], vec![104]);
         assert_eq!(agents["grok"], Vec::<u32>::new());
         assert_eq!(agents["codex"], vec![105]);
+    }
+
+    #[test]
+    fn provider_lines_skip_idle_providers() {
+        let mut agents = find_agent_pids(&HashMap::new());
+        assert!(format_provider_lines(&agents).is_empty());
+
+        agents.get_mut("gemini").unwrap().push(104);
+        assert_eq!(format_provider_lines(&agents), vec!["gemini: 1 | 104"]);
     }
 }

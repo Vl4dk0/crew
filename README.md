@@ -88,15 +88,13 @@ $ crew job stop audit
 ```
 
 ### 4. Hardware Load Telemetry (`crew load`)
-Instant macOS hardware metrics (CPU, used/total RAM via Mach page calculation, swap, GPU via IOKit) and running crew agents counted per provider:
+Instant macOS hardware metrics (CPU, used/total RAM via Mach page calculation, swap, GPU via IOKit) and running crew agents counted per provider. Providers with no running agents are omitted:
 
 ```console
 $ crew load
 CPU 11% (load 2.1 / 10 cores) | RAM 19.0 / 24.0 GB (79%), swap 0.7 GB | GPU 26%
-claude: 0
 gemini: 1 | 79810
 grok: 2 | 75237; 79803
-codex: 0
 ```
 
 ### 5. Subscription Quota Meters (`crew usage`)
