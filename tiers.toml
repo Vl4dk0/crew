@@ -26,12 +26,12 @@ model = "gpt-6.1-sol"
 effort = "low"
 
 [codex.smart]
-model = "gpt-6-astra"
-effort = "high"
+model = "gpt-6.1-sol"
+effort = "medium"
 
 [codex.max]
-model = "gpt-6-astra"
-effort = "max"
+model = "gpt-6.1-sol"
+effort = "high"
 
 [gemini.fast]
 model = "gemini-3.8-flash-low"
