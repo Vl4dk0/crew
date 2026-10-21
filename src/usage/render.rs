@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 
 pub const BAR_WIDTH: usize = 20;
@@ -10,6 +12,9 @@ pub struct Gauge {
     pub percent: u32,
     #[serde(default)]
     pub reset: Option<String>,
+    /// Length of the quota window. Absent when the payload does not say.
+    #[serde(default)]
+    pub window_secs: Option<u64>,
     #[serde(default)]
     pub stale: bool,
 }
@@ -21,6 +26,7 @@ pub struct ProviderView {
     pub mark: String,
     pub plan: Option<String>,
     pub windows: Vec<Gauge>,
+    pub spend: Option<String>,
     pub error: Option<String>,
 }
 
@@ -164,20 +170,143 @@ pub fn render_blocks(views: &[ProviderView], tty: bool) -> String {
                 } else {
                     String::new()
                 };
+                let reset_text = g
+                    .reset
+                    .as_deref()
+                    .and_then(reset_label)
+                    .map(|label| paint("2", &format!("  resets {label}"), tty))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "  {}  {}{}",
-                    name_padded, colored_meter, stale_text
+                    "  {name_padded}  {colored_meter}{reset_text}{stale_text}"
                 ));
             }
             if let Some(ref err) = v.error {
-                lines.push(format!("  {}", err));
+                lines.push(format!("  {err}"));
             }
+        }
+        if let Some(ref spend) = v.spend {
+            lines.push(format!("  {spend}"));
         }
 
         block_strings.push(lines.join("\n"));
     }
 
     block_strings.join("\n\n") + "\n"
+}
+
+/// Instant the quota window ends, when `reset` is an epoch or a UTC timestamp.
+/// A human "Resets …" phrase is not an instant.
+pub(crate) fn reset_instant(reset: &str) -> Option<SystemTime> {
+    let reset = reset.trim();
+    if reset.is_empty() {
+        return None;
+    }
+    if reset.bytes().all(|byte| byte.is_ascii_digit()) {
+        let secs: u64 = reset.parse().ok()?;
+        // 2000-01-01 through 2100-01-01. Anything else is not a quota reset.
+        if !(946_684_800..=4_102_444_800).contains(&secs) {
+            return None;
+        }
+        return Some(UNIX_EPOCH + Duration::from_secs(secs));
+    }
+    let normalized = normalize_utc(reset)?;
+    crate::job::parse_iso_time(&normalized)
+}
+
+fn normalize_utc(reset: &str) -> Option<String> {
+    if let Some(plus) = reset.rfind('+') {
+        let offset = &reset[plus..];
+        if offset == "+00:00" || offset == "+0000" || offset == "+00" {
+            return Some(format!("{}Z", reset[..plus].trim_end()));
+        }
+        return None;
+    }
+    if let Some(tpos) = reset.find('T') {
+        let time = &reset[tpos + 1..];
+        if let Some(idx) = time.rfind('-') {
+            let offset = &time[idx..];
+            if offset == "-00:00" || offset == "-0000" || offset == "-00" {
+                return Some(format!("{}Z", reset[..tpos + 1 + idx].trim_end()));
+            }
+            if offset.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+        }
+    }
+    Some(reset.to_string())
+}
+
+pub(crate) fn reset_label(reset: &str) -> Option<String> {
+    let trimmed = reset.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(instant) = reset_instant(trimmed) {
+        return format_local(instant);
+    }
+    let phrase = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars = phrase.chars().count();
+    if !(6..64).contains(&chars)
+        || !phrase.to_ascii_lowercase().contains("reset")
+        || tokenish(&phrase)
+    {
+        return None;
+    }
+    // The bar already says "resets", so the stored "Resets …" word is not repeated.
+    let shown = phrase
+        .strip_prefix("Resets")
+        .or_else(|| phrase.strip_prefix("resets"))
+        .unwrap_or(phrase.as_str())
+        .trim();
+    if shown.is_empty() {
+        return None;
+    }
+    Some(shown.to_string())
+}
+
+fn tokenish(text: &str) -> bool {
+    let mut run = 0;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            run += 1;
+            if run >= 24 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn format_local(instant: SystemTime) -> Option<String> {
+    let unix = instant.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let Ok(secs) = libc::time_t::try_from(unix) else {
+        return None;
+    };
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    // localtime_r writes only the tm we own and does not keep the pointer.
+    let ptr = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ptr.is_null() {
+        return None;
+    }
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let Ok(mon) = usize::try_from(tm.tm_mon) else {
+        return None;
+    };
+    if mon >= MONTHS.len()
+        || !(1..=31).contains(&tm.tm_mday)
+        || !(0..=23).contains(&tm.tm_hour)
+        || !(0..=59).contains(&tm.tm_min)
+    {
+        return None;
+    }
+    Some(format!(
+        "{} {} {:02}:{:02}",
+        MONTHS[mon], tm.tm_mday, tm.tm_hour, tm.tm_min
+    ))
 }
 
 #[cfg(test)]
@@ -208,11 +337,13 @@ mod tests {
             name: "grok".to_string(),
             mark: "✕".to_string(),
             plan: None,
+            spend: None,
             windows: vec![Gauge {
                 id: "grok:weekly".to_string(),
                 label: "Grok · week".to_string(),
                 percent: 12,
                 reset: None,
+                window_secs: None,
                 stale: false,
             }],
             error: None,
@@ -222,11 +353,13 @@ mod tests {
             name: "codex".to_string(),
             mark: "⚛".to_string(),
             plan: Some("Pro".to_string()),
+            spend: None,
             windows: vec![Gauge {
                 id: "codex:week".to_string(),
                 label: "Codex · week".to_string(),
                 percent: 100,
                 reset: None,
+                window_secs: None,
                 stale: false,
             }],
             error: None,
@@ -239,6 +372,7 @@ mod tests {
         assert!(grok_idx < codex_idx);
         assert!(out.contains("12%  ██▍░░░░░░░░░░░░░░░░░"));
         assert!(out.contains("100%  ████████████████████"));
+        assert!(!out.contains("resets"));
     }
 
     #[test]
@@ -248,6 +382,7 @@ mod tests {
             label: "Claude · 5 h".to_string(),
             percent: 90,
             reset: None,
+            window_secs: None,
             stale: false,
         };
         assert_eq!(window_name(&g1), "5h");
@@ -257,6 +392,7 @@ mod tests {
             label: "Claude · týždeň".to_string(),
             percent: 20,
             reset: None,
+            window_secs: None,
             stale: false,
         };
         assert_eq!(window_name(&g2), "week");
@@ -266,6 +402,7 @@ mod tests {
             label: "Codex · týždeň".to_string(),
             percent: 100,
             reset: None,
+            window_secs: None,
             stale: false,
         };
         assert_eq!(window_name(&g3), "week");
@@ -275,6 +412,7 @@ mod tests {
             label: "Gemini · 5 h".to_string(),
             percent: 40,
             reset: None,
+            window_secs: None,
             stale: false,
         };
         assert_eq!(window_name(&g4), "gemini 5h");
@@ -284,6 +422,7 @@ mod tests {
             label: "Gemini 4 Argon · týždeň".to_string(),
             percent: 70,
             reset: None,
+            window_secs: None,
             stale: false,
         };
         assert_eq!(window_name(&g5), "Gemini 4 Argon week");

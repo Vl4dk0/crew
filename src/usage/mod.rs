@@ -1,6 +1,9 @@
 #![allow(clippy::collapsible_if)]
 
+mod plan;
+mod prices;
 pub mod render;
+mod spend;
 
 use std::fs;
 use std::io::{IsTerminal, Read};
@@ -46,6 +49,7 @@ fn parse_gauges_from_json(val: Option<&Value>) -> Vec<Gauge> {
             let label = item["label"].as_str().unwrap_or("").to_string();
             let percent = item["percent"].as_u64().unwrap_or(0) as u32;
             let reset = item["reset"].as_str().map(|s| s.to_string());
+            let window_secs = item["window_secs"].as_u64();
             let stale = item["stale"].as_bool().unwrap_or(false);
             if !label.is_empty() {
                 gauges.push(Gauge {
@@ -53,62 +57,13 @@ fn parse_gauges_from_json(val: Option<&Value>) -> Vec<Gauge> {
                     label,
                     percent,
                     reset,
+                    window_secs,
                     stale,
                 });
             }
         }
     }
     gauges
-}
-
-fn decode_jwt_plan(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let payload = parts[1];
-    let mut padded = payload.replace('-', "+").replace('_', "/");
-    while !padded.len().is_multiple_of(4) {
-        padded.push('=');
-    }
-
-    let bytes = simple_base64_decode(&padded)?;
-    let json_val: Value = serde_json::from_slice(&bytes).ok()?;
-    let plan = json_val["https://api.openai.com/auth"]["chatgpt_plan_type"].as_str()?;
-    if plan.is_empty() {
-        None
-    } else {
-        let mut chars = plan.chars();
-        match chars.next() {
-            None => None,
-            Some(first) => {
-                let capitalized = first.to_uppercase().collect::<String>() + chars.as_str();
-                Some(capitalized)
-            }
-        }
-    }
-}
-
-fn simple_base64_decode(input: &str) -> Option<Vec<u8>> {
-    const B64_TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut buffer = Vec::new();
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-
-    for &b in input.as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let val = B64_TABLE.iter().position(|&x| x == b)? as u32;
-        acc = (acc << 6) | val;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            buffer.push((acc >> bits) as u8);
-        }
-    }
-    Some(buffer)
 }
 
 fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
@@ -219,11 +174,17 @@ pub(crate) fn parse_codex_rate_limit(resp: &Value) -> Vec<Gauge> {
                             r.as_str().map(|s| s.to_string())
                         }
                     });
+                    let window_secs = if seconds > 0 {
+                        Some(seconds as u64)
+                    } else {
+                        None
+                    };
                     windows.push(Gauge {
                         id: format!("codex:{}", key),
                         label: format!("Codex · {}", window_label),
                         percent: pct.round().clamp(0.0, 100.0) as u32,
                         reset,
+                        window_secs,
                         stale: false,
                     });
                 }
@@ -239,25 +200,15 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
 
     let mut token: Option<String> = None;
     let mut account_id: Option<String> = None;
-    let mut plan: Option<String> = None;
 
     if auth_path.is_file() {
         if let Ok(content) = fs::read_to_string(&auth_path) {
             if let Ok(val) = serde_json::from_str::<Value>(&content) {
                 if let Some(t) = val["tokens"]["access_token"].as_str() {
                     token = Some(t.to_string());
-                    plan = decode_jwt_plan(t);
                 }
                 if let Some(acc) = val["tokens"]["account_id"].as_str() {
                     account_id = Some(acc.to_string());
-                }
-                if plan.is_none() {
-                    if let Some(p) = val["account"]["plan_type"].as_str() {
-                        let mut chars = p.chars();
-                        if let Some(first) = chars.next() {
-                            plan = Some(first.to_uppercase().collect::<String>() + chars.as_str());
-                        }
-                    }
                 }
             }
         }
@@ -306,8 +257,9 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
         key: "codex".to_string(),
         name: "codex".to_string(),
         mark: "⚛".to_string(),
-        plan,
+        plan: None,
         windows,
+        spend: None,
         error,
     }
 }
@@ -418,11 +370,17 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
                             format!("{} {}", gname, window_type)
                         };
 
+                        let window_secs = match window_type {
+                            "5h" => Some(5 * 3600),
+                            "weekly" => Some(7 * 24 * 3600),
+                            _ => None,
+                        };
                         windows.push(Gauge {
                             id: format!("antigravity:{}", bid),
                             label,
                             percent,
                             reset,
+                            window_secs,
                             stale: false,
                         });
                     }
@@ -448,6 +406,7 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
         mark: "✦".to_string(),
         plan: None,
         windows,
+        spend: None,
         error,
     }
 }
@@ -597,12 +556,21 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     .as_str()
                     .or_else(|| cfg["billingPeriodEnd"].as_str())
                     .map(|s| s.to_string());
+                let weekly_type = cfg["currentPeriod"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.to_uppercase().contains("WEEK"));
+                let window_secs = period_window_secs(
+                    cfg["currentPeriod"]["start"].as_str(),
+                    cfg["currentPeriod"]["end"].as_str(),
+                    weekly_type && reset.is_some(),
+                );
 
                 windows.push(Gauge {
                     id: "grok:weekly".to_string(),
                     label: "week".to_string(),
                     percent: pct.round().clamp(0.0, 100.0) as u32,
                     reset,
+                    window_secs,
                     stale: false,
                 });
             }
@@ -624,11 +592,17 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     if lim > 0.0 {
                         let pct = (u / lim * 100.0).round().clamp(0.0, 100.0) as u32;
                         let reset = mcfg["billingPeriodEnd"].as_str().map(|s| s.to_string());
+                        let window_secs = period_window_secs(
+                            mcfg["currentPeriod"]["start"].as_str(),
+                            mcfg["currentPeriod"]["end"].as_str(),
+                            false,
+                        );
                         windows.push(Gauge {
                             id: "grok:monthly".to_string(),
                             label: "month".to_string(),
                             percent: pct,
                             reset,
+                            window_secs,
                             stale: false,
                         });
                     }
@@ -687,6 +661,7 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     label: "pay-as-you-go".to_string(),
                     percent: pct,
                     reset: ondemand_reset,
+                    window_secs: None,
                     stale: false,
                 });
             }
@@ -710,8 +685,25 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
         mark: "✕".to_string(),
         plan: None,
         windows,
+        spend: None,
         error,
     }
+}
+
+/// Measured start/end when both parse. A weekly period type is 7 days only
+/// when the payload says so and an end exists; a missing start is not guessed.
+fn period_window_secs(start: Option<&str>, end: Option<&str>, weekly: bool) -> Option<u64> {
+    if let (Some(start), Some(end)) = (start, end) {
+        if let (Some(start), Some(end)) = (render::reset_instant(start), render::reset_instant(end))
+        {
+            if let Ok(span) = end.duration_since(start) {
+                if span.as_secs() > 0 {
+                    return Some(span.as_secs());
+                }
+            }
+        }
+    }
+    if weekly { Some(7 * 24 * 3600) } else { None }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -861,12 +853,14 @@ fn run_claude_pty_probe() -> Result<Vec<Gauge>, Error> {
     // Parse session
     if let Some(pos) = text.find("Current session") {
         let snippet = &text[pos..pos + 200.min(text.len() - pos)];
+        let wide = &text[pos..pos + 4000.min(text.len() - pos)];
         if let Some(pct) = extract_percent_from_text(snippet) {
             gauges.push(Gauge {
                 id: "claude:session".to_string(),
                 label: "5h".to_string(),
                 percent: pct,
-                reset: None,
+                reset: extract_reset_phrase(wide),
+                window_secs: Some(5 * 3600),
                 stale: false,
             });
         }
@@ -875,12 +869,14 @@ fn run_claude_pty_probe() -> Result<Vec<Gauge>, Error> {
     // Parse week
     if let Some(pos) = text.find("Current week") {
         let snippet = &text[pos..pos + 200.min(text.len() - pos)];
+        let wide = &text[pos..pos + 4000.min(text.len() - pos)];
         if let Some(pct) = extract_percent_from_text(snippet) {
             gauges.push(Gauge {
                 id: "claude:weekly".to_string(),
                 label: "week".to_string(),
                 percent: pct,
-                reset: None,
+                reset: extract_reset_phrase(wide),
+                window_secs: Some(7 * 24 * 3600),
                 stale: false,
             });
         }
@@ -891,6 +887,50 @@ fn run_claude_pty_probe() -> Result<Vec<Gauge>, Error> {
     } else {
         Ok(gauges)
     }
+}
+
+/// Display-only. A "Resets …" phrase is not used as the API-dollar window start.
+fn extract_reset_phrase(snippet: &str) -> Option<String> {
+    // Keep a reset that shares the header line, and stop before the next section.
+    let body = snippet
+        .find(|c: char| c.is_whitespace())
+        .map(|idx| &snippet[idx..])
+        .unwrap_or(snippet);
+    // The reset sits in this section, before the next quota block or the
+    // "what's contributing" breakdown. Extra usage is not a boundary.
+    let lower = body.to_ascii_lowercase();
+    let next = [
+        "current session",
+        "current week",
+        "current month",
+        "what's contributing",
+        "what’s contributing",
+    ]
+    .iter()
+    .filter_map(|marker| lower.find(marker))
+    .min()
+    .unwrap_or(body.len());
+    let body = &body[..next];
+    let start = body.to_ascii_lowercase().find("resets")?;
+    let region = &body[start..];
+    let line = region.lines().next().unwrap_or(region);
+    let phrase = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars = phrase.chars().count();
+    if !(6..64).contains(&chars) {
+        return None;
+    }
+    let mut run = 0;
+    for c in phrase.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            run += 1;
+            if run >= 24 {
+                return None;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    Some(phrase)
 }
 
 fn extract_percent_from_text(s: &str) -> Option<u32> {
@@ -910,18 +950,6 @@ fn extract_percent_from_text(s: &str) -> Option<u32> {
 }
 
 fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
-    let mut plan = None;
-    let retry_file = state_dir().join("claude_retry.json");
-    if retry_file.is_file() {
-        if let Ok(content) = fs::read_to_string(&retry_file) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                if let Some(p) = val["plan"].as_str() {
-                    plan = Some(p.to_string());
-                }
-            }
-        }
-    }
-
     let mut windows = Vec::new();
     let mut error = None;
 
@@ -960,26 +988,40 @@ fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
         key: "claude".to_string(),
         name: "claude".to_string(),
         mark: "✳".to_string(),
-        plan,
+        plan: None,
         windows,
+        spend: None,
         error,
     }
 }
 
-/// Print the usagebar layout from the same sources. Never log credential values.
+/// Plan, quota bars, and API-equivalent cost. Never log credential values.
 pub fn print_usage() -> Result<i32, Error> {
+    let plans = plan::load()?;
     let last_ok = load_last_ok();
 
-    let views = vec![
+    let mut views = vec![
         fetch_claude(last_ok.as_ref()),
         fetch_gemini(last_ok.as_ref()),
         fetch_codex(last_ok.as_ref()),
         fetch_grok(last_ok.as_ref()),
     ];
+    let book = prices::book();
+    for view in &mut views {
+        let signal = match view.key.as_str() {
+            "claude" => plan::detect_claude(),
+            "grok" => plan::detect_grok(),
+            "codex" => plan::detect_codex(),
+            _ => plan::PlanSignal::Unknown,
+        };
+        let shown = plan::show(&view.key, signal, &plans);
+        view.plan = shown.header;
+        view.spend = spend::line(&view.key, &view.windows, shown.monthly_usd, &book);
+    }
 
     let tty = std::io::stdout().is_terminal();
     let rendered = render_blocks(&views, tty);
-    print!("{}", rendered);
+    print!("{rendered}");
 
     Ok(0)
 }
@@ -1032,6 +1074,7 @@ mod tests {
         assert_eq!(gauges[0].id, "codex:primary_window");
         assert_eq!(gauges[0].label, "Codex · week");
         assert_eq!(gauges[0].percent, 100);
+        assert_eq!(gauges[0].window_secs, Some(604800));
         assert!(!gauges[0].stale);
     }
 }

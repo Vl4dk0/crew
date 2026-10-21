@@ -35,7 +35,7 @@ use crate::tier::{self, Tier};
         \n\
         Machine\n  \
         load      CPU, memory, GPU, and running agents\n  \
-        usage     credit bars\n\
+        usage     plans, bars, API cost\n\
         \n\
         Config\n  \
         review    rating log and model picker\n  \
@@ -131,10 +131,27 @@ enum Command {
     )]
     Load,
     #[command(
-        about = "Show provider credit usage",
-        long_about = "Same sources as usagebar: a Claude /usage probe, \
-            agy /usage on a PTY, the Grok billing API, and the Codex usage API. \
-            Bars are sorted by the least-used window. Tokens are not printed.",
+        about = "Show plan, quota bars, and API-equivalent cost",
+        long_about = "Bars come from a Claude /usage probe, agy /usage, the Grok \
+            billing API, and the Codex usage API. A reset is printed only when \
+            that payload includes one. Bars are sorted by the least-used window.\n\
+            \n\
+            The plan name is organizationType in ~/.claude.json (the same value \
+            as `claude auth status`), chatgpt_plan_type in the local Codex login, \
+            and subscription_tier_display in ~/.grok/settings_cache.json. \
+            Antigravity reports no plan. ~/.config/crew/plans.toml, or CREW_PLANS, \
+            fills a gap and the line says \"(from config)\". The antigravity row \
+            is [gemini]. A price with no such note is the public monthly list \
+            price of that exact plan, not the invoice.\n\
+            \n\
+            The api figure prices this machine's Claude Code and Codex session \
+            logs over the quota window, or the last 7 days when that window's \
+            start is unknown. Prices are LiteLLM's \
+            model_prices_and_context_window.json, cached under \
+            ~/.local/share/crew and reused offline. Tokens whose model is missing \
+            from that table are left out. Grok and Antigravity write no \
+            input/output ledger, so they have no api line. The figure is every \
+            local session of that CLI, not only crew runs.",
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,
