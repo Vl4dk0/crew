@@ -14,7 +14,7 @@ model = "opus"
 effort = "high"
 
 [claude.max]
-model = "fable"
+model = "opus"
 effort = "max"
 
 [codex.fast]
