@@ -1,13 +1,18 @@
 #![allow(clippy::collapsible_if)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
 use crate::error::Error;
 
-const WRAPPERS: [&str; 5] = ["claude-run", "agy-run", "codex-run", "grok-run", "crew"];
-const SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ksh"];
+/// Providers in print order, with the subcommand names that select each.
+const PROVIDERS: [(&str, &[&str]); 4] = [
+    ("claude", &["claude"]),
+    ("gemini", &["gemini", "agy", "antigravity"]),
+    ("grok", &["grok"]),
+    ("codex", &["codex", "gpt", "chatgpt"]),
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemMetrics {
@@ -299,74 +304,44 @@ pub fn format_load_line(metrics: &SystemMetrics) -> String {
         .unwrap_or_else(|| "?%".to_string());
 
     format!(
-        "load: CPU {} (load {} / {} cores) | RAM {} | GPU {}",
+        "CPU {} (load {} / {} cores) | RAM {} | GPU {}",
         cpu_text, load_text, cores_text, ram_text, gpu_text
     )
 }
 
-/// Filter processes, excluding current process tree and shells running `-c`.
-pub fn find_wrapper_pids(
-    processes: &HashMap<u32, ProcessRecord>,
-    self_pid: u32,
-) -> HashMap<&'static str, Vec<u32>> {
-    // Build descendant exclusion set
-    let mut excluded = HashSet::new();
-    excluded.insert(self_pid);
-
-    loop {
-        let mut added = false;
-        for record in processes.values() {
-            if excluded.contains(&record.ppid) && !excluded.contains(&record.pid) {
-                excluded.insert(record.pid);
-                added = true;
-            }
-        }
-        if !added {
-            break;
-        }
-    }
-
-    let mut matches: HashMap<&'static str, Vec<u32>> = HashMap::new();
-    for &wrapper in &WRAPPERS {
-        matches.insert(wrapper, Vec::new());
-    }
+/// Running crew agents per provider. A run is exactly one `crew <provider>`
+/// process: detached jobs are supervised by `crew --supervise <name>`, which
+/// spawns that same process, so supervisors and the provider CLI's own
+/// children never count a run twice.
+pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<&'static str, Vec<u32>> {
+    let mut matches: HashMap<&'static str, Vec<u32>> = PROVIDERS
+        .iter()
+        .map(|&(name, _)| (name, Vec::new()))
+        .collect();
 
     for record in processes.values() {
-        if excluded.contains(&record.pid) || record.executable.is_empty() {
+        let is_crew = Path::new(&record.executable)
+            .file_name()
+            .is_some_and(|n| n == "crew");
+        if !is_crew {
             continue;
         }
-
-        let exec_base = Path::new(&record.executable)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
-        let arg1_base = Path::new(&record.arg1)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
-        if SHELLS.contains(&exec_base) && record.arg1 == "-c" {
-            continue;
-        }
-
-        for &wrapper in &WRAPPERS {
-            if exec_base == wrapper || arg1_base == wrapper {
-                matches.get_mut(wrapper).unwrap().push(record.pid);
-            }
+        if let Some(&(name, _)) = PROVIDERS
+            .iter()
+            .find(|(_, names)| names.contains(&record.arg1.as_str()))
+        {
+            matches.get_mut(name).unwrap().push(record.pid);
         }
     }
 
-    // Sort and deduplicate PIDs
     for pids in matches.values_mut() {
         pids.sort_unstable();
-        pids.dedup();
     }
 
     matches
 }
 
-/// Print the same lines as subagentcounter, then a `crew:` line.
+/// Print the machine line, then one line per provider with its running crew agents.
 pub fn print_load() -> Result<i32, Error> {
     let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
     let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
@@ -374,16 +349,15 @@ pub fn print_load() -> Result<i32, Error> {
 
     println!("{}", format_load_line(&metrics));
 
-    let self_pid = std::process::id();
-    let wrapper_pids = find_wrapper_pids(&processes, self_pid);
+    let agent_pids = find_agent_pids(&processes);
 
-    for &wrapper in &WRAPPERS {
-        let pids = &wrapper_pids[wrapper];
+    for &(provider, _) in &PROVIDERS {
+        let pids = &agent_pids[provider];
         if pids.is_empty() {
-            println!("{}: 0", wrapper);
+            println!("{}: 0", provider);
         } else {
             let pid_strs: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-            println!("{}: {} | {}", wrapper, pids.len(), pid_strs.join("; "));
+            println!("{}: {} | {}", provider, pids.len(), pid_strs.join("; "));
         }
     }
 
@@ -410,7 +384,7 @@ mod tests {
         let line = format_load_line(&metrics);
         assert_eq!(
             line,
-            "load: CPU 12% (load 2.4 / 10 cores) | RAM 16.2 / 24.0 GB (68%), swap 0.5 GB | GPU 4%"
+            "CPU 12% (load 2.4 / 10 cores) | RAM 16.2 / 24.0 GB (68%), swap 0.5 GB | GPU 4%"
         );
     }
 
@@ -429,32 +403,29 @@ mod tests {
         let line = format_load_line(&metrics);
         assert_eq!(
             line,
-            "load: CPU 5% (load 1.5 / 8 cores) | RAM 8.0 / 16.0 GB (50%) | GPU 0%"
+            "CPU 5% (load 1.5 / 8 cores) | RAM 8.0 / 16.0 GB (50%) | GPU 0%"
         );
     }
 
     #[test]
-    fn ps_parsing_and_descendant_exclusion() {
+    fn ps_parsing_and_agent_detection() {
         let sample = "\
-100 1 2.0 /usr/bin/bash -c claude-run\n\
-101 1 5.0 /Users/vladko/.local/bin/claude-run task1\n\
-102 101 1.0 /usr/local/bin/node /path/to/claude\n\
-200 1 10.0 /Users/vladko/.cargo/bin/crew load\n\
-201 200 1.0 /bin/ps -axww -o pid=,ppid=,%cpu=,command=\n\
-300 1 0.5 python3 /Users/vladko/.local/bin/agy-run\n\
+100 1 2.0 /bin/zsh -c crew claude task\n\
+101 100 5.0 /Users/vladko/.cargo/bin/crew claude -m sonnet -\n\
+102 101 1.0 claude --output-format json\n\
+103 1 0.5 crew --supervise demo\n\
+104 103 0.5 /repo/target/debug/crew agy --print-id\n\
+105 1 0.5 crew gpt -\n\
+200 1 10.0 crew load\n\
 ";
         let (procs, cpu_sum) = parse_ps_snapshot(sample);
-        assert_eq!(procs.len(), 6);
+        assert_eq!(procs.len(), 7);
         assert!((cpu_sum - 19.5).abs() < 1e-6);
 
-        // If self_pid is 200, 201 should be excluded as descendant
-        let wrapper_matches = find_wrapper_pids(&procs, 200);
-
-        // claude-run: pid 101 matches (100 is skipped because bash -c)
-        assert_eq!(wrapper_matches["claude-run"], vec![101]);
-        // agy-run: pid 300 matches via arg1
-        assert_eq!(wrapper_matches["agy-run"], vec![300]);
-        // crew: pid 200 was self, so excluded!
-        assert_eq!(wrapper_matches["crew"], Vec::<u32>::new());
+        let agents = find_agent_pids(&procs);
+        assert_eq!(agents["claude"], vec![101]);
+        assert_eq!(agents["gemini"], vec![104]);
+        assert_eq!(agents["grok"], Vec::<u32>::new());
+        assert_eq!(agents["codex"], vec![105]);
     }
 }
