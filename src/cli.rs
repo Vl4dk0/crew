@@ -34,7 +34,7 @@ use crate::tier::{self, Tier};
         job       run, ls, show, result, log, wait, resume, stop\n\
         \n\
         Machine\n  \
-        load      CPU, memory, GPU, and running agents\n  \
+        load      CPU, memory, GPU, and running agents per provider\n  \
         usage     plans, bars, API cost\n\
         \n\
         Config\n  \
@@ -123,10 +123,11 @@ enum Command {
     )]
     Job(JobArgs),
     #[command(
-        about = "Show CPU, memory, GPU, and running agent processes",
-        long_about = "Same lines as subagentcounter, plus a crew: line. \
-            macOS only for the GPU figure. Shells whose first argument is -c \
-            are not counted, and neither is this process's own tree.",
+        about = "Show CPU, memory, GPU, and running agents per provider",
+        long_about = "One machine line, then a line for each provider (claude, gemini, \
+            grok, codex) that has running crew agents, with their count and pids. \
+            Idle providers are not listed. Foreground runs and detached jobs each \
+            count once. macOS only for the GPU figure.",
         after_long_help = "Examples:\n  crew load"
     )]
     Load,
