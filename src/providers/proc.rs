@@ -239,6 +239,37 @@ pub(super) fn py_display(value: Option<&Value>) -> String {
     }
 }
 
+/// Exit code for a run that stopped because the provider's usage, quota,
+/// rate, or credit limit was hit. EX_TEMPFAIL: retrying later can succeed,
+/// which is what separates it from a failed or denied run (125).
+pub(super) const USAGE_LIMIT_EXIT: i32 = 75;
+
+/// Last-resort text match for CLIs whose limit message carries no structured
+/// marker. Callers only ask it about a run that already failed.
+pub(super) fn looks_like_usage_limit(text: &str) -> bool {
+    let text = text.to_lowercase().replace('\u{2019}', "'");
+    [
+        "hit your",
+        "usage limit",
+        "out of usage credits",
+        "out of credits",
+        "credit balance",
+        "rate limit",
+        "rate-limit",
+        "quota",
+        "resource_exhausted",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+        && !text.trim().is_empty()
+}
+
+/// The one stderr line every provider prints for a usage-limit stop.
+pub(super) fn usage_limit_line(provider: &str, message: &str) -> String {
+    let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("[crew] {provider} usage limit: {message}\n")
+}
+
 pub(super) fn code_or_one(code: i32) -> i32 {
     if code == 0 { 1 } else { code }
 }

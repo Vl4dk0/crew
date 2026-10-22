@@ -15,7 +15,8 @@ use crate::id::Provider;
 use crate::tier;
 
 use super::proc::{
-    self, KillStyle, Report, StdioKind, format_secs, map_effort, public_code, take_prompt,
+    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, format_secs, looks_like_usage_limit,
+    map_effort, public_code, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -73,8 +74,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     if !captured.stderr.is_empty() {
         after.push_str(&captured.stderr);
     }
-    let code = select_codex_exit(captured.code, parsed.success, captured.timed_out);
-    if captured.timed_out {
+    let mut code = select_codex_exit(captured.code, parsed.success, captured.timed_out);
+    if let Some(message) = parsed
+        .usage_limit
+        .as_deref()
+        .filter(|_| !captured.timed_out && !parsed.success)
+    {
+        code = USAGE_LIMIT_EXIT;
+        after.push_str(&usage_limit_line("codex", message));
+    } else if captured.timed_out {
         after.push_str(&format!(
             "[crew] timed out after {}s\n",
             format_secs(invocation.timeout_secs)
@@ -159,6 +167,21 @@ pub(super) struct CodexParse {
     thread_id: Option<String>,
     success: bool,
     notices: Vec<String>,
+    usage_limit: Option<String>,
+}
+
+/// The message of an `error` or `turn.failed` event when it is a usage-limit
+/// stop. Codex tags it `usage_limit_exceeded`; the text match covers a stream
+/// that only carries the message.
+fn limit_message(event: &Value) -> Option<String> {
+    let error = event.get("error").unwrap_or(event);
+    let message = match error {
+        Value::String(text) => text.as_str(),
+        _ => error.get("message").and_then(Value::as_str).unwrap_or(""),
+    };
+    let tagged =
+        error.get("codex_error_info").and_then(Value::as_str) == Some("usage_limit_exceeded");
+    (tagged || looks_like_usage_limit(message)).then(|| message.to_string())
 }
 
 pub(super) fn parse_events(stdout: &str) -> CodexParse {
@@ -167,12 +190,20 @@ pub(super) fn parse_events(stdout: &str) -> CodexParse {
     let mut completed = false;
     let mut failed = false;
     let mut notices = Vec::new();
+    let mut usage_limit = None;
     for line in stdout.lines() {
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue;
         };
         if !event.is_object() {
             continue;
+        }
+        if matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("error" | "turn.failed")
+        ) && let Some(message) = limit_message(&event)
+        {
+            usage_limit = Some(message);
         }
         match event.get("type").and_then(Value::as_str) {
             Some("thread.started") => {
@@ -208,6 +239,7 @@ pub(super) fn parse_events(stdout: &str) -> CodexParse {
         thread_id,
         success,
         notices,
+        usage_limit,
     }
 }
 
@@ -251,6 +283,16 @@ mod tests {
         assert!(parsed.success);
         assert_eq!(parsed.notices.len(), 1);
         assert_eq!(select_codex_exit(0, parsed.success, false), 0);
+    }
+
+    #[test]
+    fn codex_usage_limit_event_is_detected() {
+        let stdout = "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again at 9:48 AM.\"}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Try again at 9:48 AM.\"}}\n";
+        let parsed = parse_events(stdout);
+        assert!(!parsed.success);
+        assert!(parsed.usage_limit.unwrap().contains("9:48 AM"));
+        let warn = parse_events("{\"type\":\"error\",\"message\":\"warn\"}\n");
+        assert!(warn.usage_limit.is_none());
     }
 
     #[test]

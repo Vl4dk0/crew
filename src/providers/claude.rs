@@ -13,8 +13,8 @@ use crate::id::Provider;
 use crate::tier;
 
 use super::proc::{
-    self, KillStyle, Report, StdioKind, code_or_one, format_secs, map_effort, py_display,
-    py_truthy, take_prompt,
+    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, format_secs,
+    looks_like_usage_limit, map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -138,6 +138,9 @@ pub(super) fn assess_claude(raw: bool, schema: bool, child: i32, out: &str, err:
         match serde_json::from_str::<Value>(out) {
             Ok(value) => value,
             Err(_) => {
+                if looks_like_usage_limit(out) && child != 0 {
+                    return limit_report(out, before, stdout);
+                }
                 if !raw {
                     push_trimmed_line(&mut stdout, out);
                 }
@@ -177,9 +180,13 @@ pub(super) fn assess_claude(raw: bool, schema: bool, child: i32, out: &str, err:
         return report(125, before, stdout, after);
     }
     if claude_failed(&data, &text) {
-        let detail = failure_detail(&data);
+        if hit_usage_limit(&data, &text) {
+            after.push_str(&usage_limit_line("claude", &text));
+            return report(USAGE_LIMIT_EXIT, before, stdout, after);
+        }
+        let detail = failure_detail(&data, &text);
         let suffix = errors_suffix(&data);
-        after.push_str(&format!("[crew] run ended early: {detail}.{suffix}\n"));
+        after.push_str(&format!("[crew] run did not complete: {detail}.{suffix}\n"));
         return report(125, before, stdout, after);
     }
     report(child, before, stdout, after)
@@ -217,13 +224,43 @@ fn claude_failed(data: &Value, text: &str) -> bool {
         || text.trim().is_empty()
 }
 
-fn failure_detail(data: &Value) -> String {
-    for key in ["subtype", "terminal_reason"] {
-        if py_truthy(data.get(key)) {
-            return py_display(data.get(key));
-        }
+/// Claude exits 0 for an error result, so the reason has to come from the
+/// JSON. A `success` subtype is never the reason: it is what the CLI reports
+/// even when `is_error` is set.
+fn failure_detail(data: &Value, text: &str) -> String {
+    if let Some(subtype) = data
+        .get("subtype")
+        .and_then(Value::as_str)
+        .filter(|subtype| *subtype != "success")
+    {
+        return subtype.to_string();
+    }
+    if py_truthy(data.get("is_error")) {
+        return "claude reported an error".to_string();
+    }
+    if text.trim().is_empty() {
+        return "empty answer".to_string();
+    }
+    if py_truthy(data.get("terminal_reason")) {
+        return py_display(data.get("terminal_reason"));
     }
     "incomplete".to_string()
+}
+
+/// A failed result is a usage limit when the API said 429 or the message is
+/// the CLI's own limit notice (synthetic, so it carries no status).
+fn hit_usage_limit(data: &Value, text: &str) -> bool {
+    data.get("api_error_status").and_then(Value::as_u64) == Some(429)
+        || looks_like_usage_limit(text)
+}
+
+fn limit_report(message: &str, before: String, stdout: String) -> Report {
+    report(
+        USAGE_LIMIT_EXIT,
+        before,
+        stdout,
+        usage_limit_line("claude", message),
+    )
 }
 
 fn errors_suffix(data: &Value) -> String {
@@ -346,10 +383,33 @@ mod tests {
         let empty = r#"{"type":"result","subtype":"success","is_error":false,"result":"  ","permission_denials":[]}"#;
         let report = assess_claude(false, false, 0, empty, "");
         assert_eq!(report.code, 125);
-        assert!(report.after_stderr.contains("run ended early"));
+        assert!(report.after_stderr.contains("empty answer"));
+        assert!(!report.after_stderr.contains("success"));
 
         let errored = r#"{"type":"result","subtype":"success","is_error":true,"result":"nope","permission_denials":[]}"#;
         assert_eq!(assess_claude(false, false, 0, errored, "").code, 125);
+    }
+
+    #[test]
+    fn usage_limit_is_its_own_exit_and_never_success() {
+        let limit = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've hit your session limit · resets 7:40pm (Europe/Bratislava)","permission_denials":[]}"#;
+        let report = assess_claude(false, false, 0, limit, "");
+        assert_eq!(report.code, USAGE_LIMIT_EXIT);
+        assert!(report.after_stderr.contains(
+            "[crew] claude usage limit: You've hit your session limit · resets 7:40pm (Europe/Bratislava)"
+        ));
+        assert!(!report.after_stderr.contains("success"));
+
+        let credits = r#"{"type":"result","subtype":"success","is_error":true,"result":"You're out of usage credits. Switch to another model.","num_turns":1,"permission_denials":[]}"#;
+        assert_eq!(
+            assess_claude(false, false, 0, credits, "").code,
+            USAGE_LIMIT_EXIT
+        );
+        let plain = "You've hit your session limit · resets 7:40pm";
+        assert_eq!(
+            assess_claude(false, false, 1, plain, "").code,
+            USAGE_LIMIT_EXIT
+        );
     }
 
     #[test]

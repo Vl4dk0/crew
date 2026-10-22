@@ -251,6 +251,12 @@ fn judge_gemini(clean: &str, rc: i32) -> (i32, String) {
         );
         return (125, note);
     }
+    if rc != 0 && proc::looks_like_usage_limit(clean) {
+        return (
+            proc::USAGE_LIMIT_EXIT,
+            proc::usage_limit_line("gemini", clean),
+        );
+    }
     if clean.contains("timeout waiting for response") && rc != 0 {
         let note = "[crew] agy timed out waiting for a response (124). Raise -t for genuinely long tasks.\n";
         return (124, note.to_string());

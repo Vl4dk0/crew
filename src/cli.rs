@@ -18,6 +18,9 @@ use crate::tier::{self, Tier};
         Start with `crew models` for the tier table, then \
         `crew <provider> --tier fast \"...\"`. Every run has full autonomy.\n\
         \n\
+        Run exit codes: 0 ok, 75 usage/quota/rate/credit limit, 124 timeout, \
+        125 denied tool or incomplete run, 127 CLI missing.\n\
+        \n\
         A run longer than 20 minutes prints one stderr line. Rate it later \
         with `crew review write`. crew does not file the review itself.\n\
         \n\

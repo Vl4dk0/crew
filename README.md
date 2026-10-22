@@ -142,6 +142,7 @@ $ crew review pick "code review"
 - **PTY Probe for Claude Code**: Probes `/usage` inside a pseudo-terminal with isolated settings (`--allowed-tools ""`), falling back to stale cache on rate limits.
 - **Process Group Isolation**: Each runner and supervisor child lives in its own process group (`setpgid(0, 0)`), ensuring timeouts and cancellations clean up all descendants.
 - **Denial & Failure Detection**: Matches wrapper exit codes:
+  - Exit 75: Usage, quota, rate, or credit limit hit
   - Exit 124: Timeout
   - Exit 125: Tool denial or empty output
   - Exit 127: Binary missing or spawn failure

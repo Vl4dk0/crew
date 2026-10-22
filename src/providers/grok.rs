@@ -12,8 +12,8 @@ use crate::id::Provider;
 use crate::tier;
 
 use super::proc::{
-    self, KillStyle, Report, StdioKind, code_or_one, format_secs, map_effort, py_display,
-    py_truthy, take_prompt,
+    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, format_secs,
+    looks_like_usage_limit, map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -139,6 +139,14 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
         match serde_json::from_str::<Value>(out) {
             Ok(value) => value,
             Err(_) => {
+                if child != 0 && looks_like_usage_limit(out) {
+                    return report(
+                        USAGE_LIMIT_EXIT,
+                        String::new(),
+                        String::new(),
+                        usage_limit_line("grok", out),
+                    );
+                }
                 let mut stdout = String::new();
                 let trimmed = out.trim();
                 if !trimmed.is_empty() {
@@ -166,6 +174,14 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
             None => out.to_string(),
             Some(value) => py_display(Some(value)),
         };
+        if looks_like_usage_limit(&message) {
+            return report(
+                USAGE_LIMIT_EXIT,
+                String::new(),
+                String::new(),
+                usage_limit_line("grok", &message),
+            );
+        }
         return report(
             code_or_one(child),
             String::new(),
