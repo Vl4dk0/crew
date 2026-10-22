@@ -46,12 +46,11 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         .or_else(|| invocation.agent.clone())
         .unwrap_or_else(|| "gemini".to_string());
     let home = cli_home();
-    let track_files = invocation.print_id
-        && invocation
-            .resume
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .is_none();
+    let track_files = invocation
+        .resume
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .is_none();
     let before = if track_files {
         conv_snapshot(&home.join("conversations"))
     } else {
@@ -78,7 +77,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     // A child that exits by itself with "timeout waiting for response" still
     // goes through present_gemini, which keeps that message.
     let mut presented = if captured.timed_out {
-        let (_, before) = judge_gemini("", 124, invocation.read_only);
+        let (_, before) = judge_gemini("", 124);
         let before = if before.is_empty() {
             format!(
                 "[crew] timed out after {}s\n",
@@ -94,22 +93,20 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             after_stderr: String::new(),
         }
     } else {
-        present_gemini(&captured.stdout, captured.code, invocation.read_only)
+        present_gemini(&captured.stdout, captured.code)
     };
-    if invocation.print_id {
-        let resume = invocation.resume.as_deref().filter(|id| !id.is_empty());
-        let id = if resume.is_some() {
-            pick_session(resume, None, None)
-        } else {
-            let workdir = real_workdir(invocation.cwd.as_deref());
-            let key = path_string(&workdir);
-            let mapped = last_map_id(&home, &key);
-            let newest = newest_changed(&before, &conv_snapshot(&home.join("conversations")));
-            pick_session(None, mapped.as_deref(), newest.as_deref())
-        };
-        if let Some(id) = id.filter(|id| !id.is_empty()) {
-            presented.after_stderr = format!("SESSION_ID={id}\n");
-        }
+    let resume = invocation.resume.as_deref().filter(|id| !id.is_empty());
+    let id = if resume.is_some() {
+        pick_session(resume, None, None)
+    } else {
+        let workdir = real_workdir(invocation.cwd.as_deref());
+        let key = path_string(&workdir);
+        let mapped = last_map_id(&home, &key);
+        let newest = newest_changed(&before, &conv_snapshot(&home.join("conversations")));
+        pick_session(None, mapped.as_deref(), newest.as_deref())
+    };
+    if let Some(id) = id.filter(|id| !id.is_empty()) {
+        presented.after_stderr = format!("SESSION_ID={id}\n");
     }
     proc::emit_report(&presented);
     proc::note_long_run(started, &label);
@@ -129,11 +126,10 @@ pub(super) fn gemini_argv(
         resolved_model,
         resolved_effort,
     );
-    let prompt = proc::read_only_prompt(invocation, prompt);
     let mut argv = vec![
         "agy".to_string(),
         "-p".to_string(),
-        prompt,
+        prompt.to_string(),
         "--print-timeout".to_string(),
         print_timeout(invocation.timeout_secs),
     ];
@@ -152,11 +148,7 @@ pub(super) fn gemini_argv(
     if invocation.continue_session {
         argv.push("-c".to_string());
     }
-    if invocation.write {
-        proc::push_pair(&mut argv, "--mode", "accept-edits");
-    } else if !invocation.read_only {
-        argv.push("--dangerously-skip-permissions".to_string());
-    }
+    argv.push("--dangerously-skip-permissions".to_string());
     if invocation.sandbox {
         argv.push("--sandbox".to_string());
     }
@@ -240,10 +232,10 @@ fn print_timeout(secs: f64) -> String {
     format!("{}s", (whole - 10).max(10))
 }
 
-pub(super) fn present_gemini(raw: &str, rc: i32, read_only: bool) -> Report {
+pub(super) fn present_gemini(raw: &str, rc: i32) -> Report {
     let clean = strip_ansi(raw).replace('\r', "");
     let clean = clean.trim().to_string();
-    let (code, before) = judge_gemini(&clean, rc, read_only);
+    let (code, before) = judge_gemini(&clean, rc);
     Report {
         code,
         before_stderr: before,
@@ -252,19 +244,15 @@ pub(super) fn present_gemini(raw: &str, rc: i32, read_only: bool) -> Report {
     }
 }
 
-fn judge_gemini(clean: &str, rc: i32, read_only: bool) -> (i32, String) {
+fn judge_gemini(clean: &str, rc: i32) -> (i32, String) {
     if let Some(tool) = denial_tool(clean).filter(|_| rc == 0) {
         let note = format!(
-            "[crew] tool '{tool}' auto-denied by headless permission checks (125). Allow it in ~/.gemini/antigravity-cli/settings.json under permissions.allow — e.g. \"read_file(*)\" or \"command(ls *)\" (args need the ' *' wildcard) — or re-run with --write for edits, or drop the mode flag for full autonomy.\n"
+            "[crew] tool '{tool}' auto-denied by headless permission checks (125). Allow it in ~/.gemini/antigravity-cli/settings.json under permissions.allow — e.g. \"read_file(*)\" or \"command(ls *)\" (args need the ' *' wildcard).\n"
         );
         return (125, note);
     }
     if clean.contains("timeout waiting for response") && rc != 0 {
-        let note = "[crew] agy timed out waiting for a response (124). Raise -t for genuinely long tasks; with --read-only, a tool blocked on approval can also cause this — extend permissions.allow, or pass --write for edits, or drop the mode flag for full autonomy.\n";
-        return (124, note.to_string());
-    }
-    if rc == 124 && read_only {
-        let note = "[crew] timed out (124). If agy needed a tool outside the permissions.allow list it may block on an approval prompt; extend the allowlist, or pass --write for edits, or drop the mode flag for full autonomy.\n";
+        let note = "[crew] agy timed out waiting for a response (124). Raise -t for genuinely long tasks.\n";
         return (124, note.to_string());
     }
     (rc, String::new())
@@ -450,7 +438,6 @@ mod tests {
         assert_eq!(flag(&argv, "--agent"), Some("reviewer"));
 
         invocation.agent = None;
-        invocation.read_only = true;
         invocation.sandbox = true;
         invocation.add_dir = vec!["~/notes".into()];
         let (argv, _, _) = gemini_argv(
@@ -459,38 +446,17 @@ mod tests {
             "medium",
             "hello",
         );
-        assert!(!has(&argv, "--dangerously-skip-permissions"));
-        assert!(!has(&argv, "--mode"));
+        assert!(has(&argv, "--dangerously-skip-permissions"));
         assert!(has(&argv, "--sandbox"));
         assert_eq!(flag(&argv, "--add-dir"), Some("~/notes"));
-        assert_eq!(argv[2], format!("hello\n\n{}", proc::READ_ONLY_LINE));
-
-        invocation.raw = true;
-        let (argv, _, _) = gemini_argv(
-            &invocation,
-            Some("gemini-3.8-flash-medium"),
-            "medium",
-            "hello",
-        );
-        assert_eq!(argv[2], format!("hello\n\n{}", proc::READ_ONLY_LINE));
-        invocation.raw = false;
-
-        invocation.read_only = false;
-        invocation.write = true;
-        let (argv, _, _) = gemini_argv(
-            &invocation,
-            Some("gemini-3.8-flash-medium"),
-            "medium",
-            "hello",
-        );
-        assert_eq!(flag(&argv, "--mode"), Some("accept-edits"));
+        assert_eq!(argv[2], "hello");
     }
 
     #[test]
     fn denial_and_timeout_waiting() {
         let denied =
             "\u{1b}[31mno output produced \u{2014} a tool required the \"read_file\"\u{1b}[0m";
-        let report = present_gemini(denied, 0, true);
+        let report = present_gemini(denied, 0);
         assert_eq!(report.code, 125);
         assert!(report.stdout.contains("read_file"));
         assert!(report.stdout.contains('\u{2014}'));
@@ -498,20 +464,15 @@ mod tests {
         assert!(report.before_stderr.contains("125"));
 
         let hyphenated = "no output produced \u{2014} a tool required the \"read-file\"";
-        assert_eq!(present_gemini(hyphenated, 0, false).code, 0);
+        assert_eq!(present_gemini(hyphenated, 0).code, 0);
         let ascii_dash = "no output produced - a tool required the \"read_file\"";
-        assert_eq!(present_gemini(ascii_dash, 0, false).code, 0);
-        assert_eq!(present_gemini(denied, 1, false).code, 1);
+        assert_eq!(present_gemini(ascii_dash, 0).code, 0);
+        assert_eq!(present_gemini(denied, 1).code, 1);
 
         let waiting = "timeout waiting for response";
-        assert_eq!(present_gemini(waiting, 1, false).code, 124);
-        assert_eq!(present_gemini(waiting, 0, false).code, 0);
-        assert_eq!(present_gemini("", 0, false).stdout, "\n");
-
-        let timed = present_gemini("still working", 124, true);
-        assert_eq!(timed.code, 124);
-        assert!(timed.before_stderr.contains("permissions.allow"));
-        assert!(timed.stdout.contains("still working"));
+        assert_eq!(present_gemini(waiting, 1).code, 124);
+        assert_eq!(present_gemini(waiting, 0).code, 0);
+        assert_eq!(present_gemini("", 0).stdout, "\n");
     }
 
     #[test]

@@ -37,7 +37,6 @@ Candidates: {candidates_json}\nReview history: {history_json}\nNew task: {task}"
 pub fn judge_args(provider: &str, model: &str) -> Vec<String> {
     vec![
         provider.to_string(),
-        "--read-only".to_string(),
         "-m".to_string(),
         model.to_string(),
         "-e".to_string(),

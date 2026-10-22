@@ -15,7 +15,7 @@ Alternatives considered and recorded:
 ## Quick Start
 
 ### 1. Direct Agent Runs
-Invoke the provider directly as the subcommand. Default permission mode is full autonomy (`--auto`); use `--read-only` or `--write` to restrict permissions.
+Invoke the provider directly as the subcommand. Every run has full autonomy, and crew writes `SESSION_ID=<id>` to stderr when the CLI reports one; pass it to `-r` to resume.
 
 ```console
 # Fast run using intelligence tiers

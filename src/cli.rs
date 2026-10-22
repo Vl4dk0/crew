@@ -16,8 +16,7 @@ use crate::tier::{self, Tier};
     long_about = "crew is one binary over claude, gemini, grok, and codex.\n\
         \n\
         Start with `crew models` for the tier table, then \
-        `crew <provider> --tier fast \"...\"`. Leaving out --read-only and \
-        --write is full autonomy. --auto is that same mode, written out.\n\
+        `crew <provider> --tier fast \"...\"`. Every run has full autonomy.\n\
         \n\
         A run longer than 20 minutes prints one stderr line. Rate it later \
         with `crew review write`. crew does not file the review itself.\n\
@@ -68,7 +67,7 @@ enum Command {
         after_long_help = "Examples:\n  \
             crew claude --tier fast \"Reply with the single word pong\"\n  \
             crew claude -m fable -e max \"Read the plan and list the risks\"\n  \
-            crew claude --read-only -C ~/Projects/crew \"What does src/tier.rs decide?\""
+            crew claude -C ~/Projects/crew \"What does src/tier.rs decide?\""
     )]
     Claude(ProviderArgs),
     #[command(
@@ -79,7 +78,7 @@ enum Command {
             partial transcript.",
         after_long_help = "Examples:\n  \
             crew gemini --tier fast \"Reply with the single word pong\"\n  \
-            crew agy --read-only \"Summarize src/cli.rs\"\n  \
+            crew agy \"Summarize src/cli.rs\"\n  \
             crew gemini -m gemini-3.8-flash-high \"Look at the last commit\"",
         visible_alias = "antigravity",
         visible_alias = "agy"
@@ -93,7 +92,7 @@ enum Command {
         after_long_help = "Examples:\n  \
             crew grok --tier fast \"Reply with the single word pong\"\n  \
             crew grok --tier max -e high \"Review the diff\"\n  \
-            crew grok --read-only -n 4 \"List the files in src/\""
+            crew grok -n 4 \"List the files in src/\""
     )]
     Grok(GrokArgs),
     #[command(
@@ -105,7 +104,7 @@ enum Command {
         after_long_help = "Examples:\n  \
             crew codex --tier fast \"Reply with the single word pong\"\n  \
             crew codex --review --uncommitted\n  \
-            crew codex --read-only -m gpt-6-luna \"Explain src/tier.rs\"",
+            crew codex -m gpt-6-luna \"Explain src/tier.rs\"",
         visible_alias = "gpt",
         visible_alias = "chatgpt"
     )]
@@ -219,7 +218,7 @@ struct GrokArgs {
     /// Print grok's own output and skip the stopReason check.
     #[arg(long)]
     raw: bool,
-    /// Pass --disable-web-search, and drop web tools from a read-only fallback.
+    /// Pass --disable-web-search.
     #[arg(long)]
     no_web: bool,
     /// Stop after this many turns. Maps to grok --max-turns.
@@ -264,30 +263,18 @@ struct SharedArgs {
     /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5).
     #[arg(short = 'e', long)]
     effort: Option<String>,
-    /// Read-only tools. Claude uses its read-only permission mode and a system rule. Gemini omits the skip-permissions flag and appends a read-only sentence to the prompt. Grok tries the read-only sandbox once, then a read-only tool list, and passes a rule. Codex uses its read-only sandbox and appends the same sentence. The sentence is skipped when --schema is set. It is still sent with --raw, and it is not stored on a job.
-    #[arg(long, conflicts_with_all = ["write", "auto"])]
-    read_only: bool,
-    /// Allow edits. Claude: accept-edits style permissions. Gemini: --mode accept-edits. Grok: --sandbox workspace. Codex: its write sandbox.
-    #[arg(long, conflicts_with_all = ["read_only", "auto"])]
-    write: bool,
-    /// Accepted and ignored. Omitting the mode flags is already full autonomy.
-    #[arg(long, conflicts_with_all = ["read_only", "write"])]
-    auto: bool,
     /// Seconds before the process group is killed. Default 1800. Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds, and the partial output is dropped.
     #[arg(short = 't', long, default_value_t = 1800.0)]
     timeout: f64,
     /// Working directory for the child. Maps to the CLI's own cwd flag where it has one.
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
-    /// Resume this session id. Claude and Codex reject -r together with -c. Grok keeps -r and drops -c. Gemini forwards both.
+    /// Resume this session id, the one crew printed as SESSION_ID. Claude and Codex reject -r together with -c. Grok keeps -r and drops -c. Gemini forwards both.
     #[arg(short = 'r', long)]
     resume: Option<String>,
     /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
-    /// Write SESSION_ID=<id> to stderr when the CLI reports one.
-    #[arg(long = "print-id")]
-    print_id: bool,
     /// Prompt text, or `-` to read stdin. Omitted means the same as `-`. `-` on a terminal is an error. The prompt is an argument to the child CLI, not the child's stdin.
     prompt: Option<String>,
 }
@@ -306,13 +293,10 @@ pub struct Invocation {
     pub tier: Option<Tier>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    pub read_only: bool,
-    pub write: bool,
     pub timeout_secs: f64,
     pub cwd: Option<PathBuf>,
     pub resume: Option<String>,
     pub continue_session: bool,
-    pub print_id: bool,
     pub prompt: Option<String>,
     pub add_dir: Vec<PathBuf>,
     pub schema: Option<String>,
@@ -341,7 +325,7 @@ enum JobCommand {
             The flags after the provider are the same flags as a foreground run.",
         after_long_help = "Examples:\n  \
             crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
-            crew job run audit claude --read-only -C ~/Projects/crew \"List the risky spots\"\n  \
+            crew job run audit claude -C ~/Projects/crew \"List the risky spots\"\n  \
             crew job run --note \"nightly\" rev codex --review --uncommitted"
     )]
     Run(JobRunArgs),
@@ -516,7 +500,7 @@ enum ReviewCommand {
         about = "Ask a judge which logged model should take a task",
         long_about = "Candidates are models already in the log. The judge is a \
             random one of claude/haiku, gemini/gemini-3.8-flash, or codex/gpt-6-luna, \
-            effort high, read-only, 300 seconds. If that judge fails to launch, \
+            effort high, 300 seconds. If that judge fails to launch, \
             the other two are tried. An empty log is exit 2.",
         after_long_help = "Examples:\n  crew review pick \"fix the date parser\""
     )]
@@ -676,13 +660,10 @@ fn finish(
         tier: shared.tier,
         model: shared.model,
         effort: shared.effort,
-        read_only: shared.read_only,
-        write: shared.write,
         timeout_secs: shared.timeout,
         cwd: shared.cwd,
         resume: shared.resume,
         continue_session: shared.continue_session,
-        print_id: shared.print_id,
         prompt: shared.prompt,
         add_dir,
         schema: extra.schema,

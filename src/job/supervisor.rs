@@ -97,17 +97,7 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     let mut child_cmd = Command::new(&current_exe);
     child_cmd.arg(&record.provider);
 
-    // Pass args, ensuring --print-id is included
-    let mut has_print_id = false;
-    for arg in &record.args {
-        if arg == "--print-id" {
-            has_print_id = true;
-        }
-        child_cmd.arg(arg);
-    }
-    if !has_print_id {
-        child_cmd.arg("--print-id");
-    }
+    child_cmd.args(&record.args);
 
     // Pass `-` so prompt is read from stdin if prompt_bytes is not empty
     if !prompt_bytes.is_empty() {

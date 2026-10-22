@@ -430,17 +430,7 @@ mod tests {
         let claude = picker::judge_args("claude", "haiku");
         assert_eq!(
             claude,
-            vec![
-                "claude",
-                "--read-only",
-                "-m",
-                "haiku",
-                "-e",
-                "high",
-                "-t",
-                "300",
-                "-"
-            ]
+            vec!["claude", "-m", "haiku", "-e", "high", "-t", "300", "-"]
         );
 
         let gemini = picker::judge_args("gemini", "gemini-3.8-flash");
@@ -448,7 +438,6 @@ mod tests {
             gemini,
             vec![
                 "gemini",
-                "--read-only",
                 "-m",
                 "gemini-3.8-flash",
                 "-e",
@@ -462,17 +451,7 @@ mod tests {
         let codex = picker::judge_args("codex", "gpt-6-luna");
         assert_eq!(
             codex,
-            vec![
-                "codex",
-                "--read-only",
-                "-m",
-                "gpt-6-luna",
-                "-e",
-                "high",
-                "-t",
-                "300",
-                "-"
-            ]
+            vec!["codex", "-m", "gpt-6-luna", "-e", "high", "-t", "300", "-"]
         );
     }
 

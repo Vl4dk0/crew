@@ -59,9 +59,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     for line in &parsed.notices {
         before.push_str(&format!("[crew] {line}\n"));
     }
-    if invocation.print_id
-        && let Some(id) = parsed.thread_id.as_deref().filter(|id| !id.is_empty())
-    {
+    if let Some(id) = parsed.thread_id.as_deref().filter(|id| !id.is_empty()) {
         before.push_str(&format!("SESSION_ID={id}\n"));
     }
     let mut stdout = String::new();
@@ -113,13 +111,7 @@ pub(super) fn codex_argv(
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
     ];
-    if invocation.read_only {
-        proc::push_pair(&mut argv, "-s", "read-only");
-    } else if invocation.write {
-        proc::push_pair(&mut argv, "-s", "workspace-write");
-    } else {
-        argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    }
+    argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     for directory in &invocation.add_dir {
         let resolved = proc::resolve_no_tilde(directory);
         let resolved = resolved.to_string_lossy();
@@ -157,7 +149,7 @@ pub(super) fn codex_argv(
     }
     if let Some(prompt) = prompt {
         argv.push("--".to_string());
-        argv.push(proc::read_only_prompt(invocation, prompt));
+        argv.push(prompt.to_string());
     }
     (argv, note)
 }
@@ -312,29 +304,14 @@ mod tests {
         assert!(note.is_none());
 
         let mut invocation = bare(Provider::Codex);
-        invocation.read_only = true;
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
-        assert_eq!(flag(&argv, "-s"), Some("read-only"));
-        assert!(!has(&argv, "--dangerously-bypass-approvals-and-sandbox"));
-        assert_eq!(
-            argv.last().map(String::as_str),
-            Some(format!("hello\n\n{}", proc::READ_ONLY_LINE)).as_deref()
-        );
+        assert!(has(&argv, "--dangerously-bypass-approvals-and-sandbox"));
 
-        invocation.schema = Some("{}".to_string());
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
         assert_eq!(argv.last().map(String::as_str), Some("hello"));
-        invocation.schema = None;
 
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
         assert!(!has(&argv, "--"));
 
-        invocation.read_only = false;
-        invocation.write = true;
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
-        assert_eq!(flag(&argv, "-s"), Some("workspace-write"));
-
-        invocation.write = false;
         invocation.resume = Some("abc".to_string());
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
         assert!(has(&argv, "resume"));
@@ -350,7 +327,6 @@ mod tests {
         invocation.continue_session = false;
         invocation.review = true;
         invocation.uncommitted = true;
-        invocation.read_only = true;
         assert!(codex_scope(&invocation));
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
         assert!(has(&argv, "review"));

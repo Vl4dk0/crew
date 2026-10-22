@@ -17,8 +17,6 @@ use super::proc::{
     py_truthy, take_prompt,
 };
 
-const READ_RULE: &str = "This is a read-only session. You may use Read, Glob, Grep, and web tools only. File edits, shell commands, and subagents are unavailable. Do not hunt for workarounds. If the task needs a modification or a shell command, say so and stop.";
-
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let resolved = tier::resolve(
         invocation.provider,
@@ -75,7 +73,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
     let report = assess_claude(
         invocation.raw,
-        invocation.print_id,
         schema_set,
         captured.code,
         &captured.stdout,
@@ -101,19 +98,8 @@ pub(super) fn claude_argv(
         "--permission-prompts".to_string(),
         "none".to_string(),
     ];
-    if invocation.write {
-        proc::push_pair(&mut argv, "--permission-mode", "auto");
-    } else if invocation.read_only {
-        let tools = claude_tools(invocation.no_web);
-        proc::push_pair(&mut argv, "--permission-mode", "dontAsk");
-        proc::push_pair(&mut argv, "--tools", &tools);
-        proc::push_pair(&mut argv, "--allowed-tools", &tools);
-        argv.push("--strict-mcp-config".to_string());
-        proc::push_pair(&mut argv, "--append-system-prompt", READ_RULE);
-    } else {
-        argv.push("--dangerously-skip-permissions".to_string());
-    }
-    if invocation.no_web && !invocation.read_only {
+    argv.push("--dangerously-skip-permissions".to_string());
+    if invocation.no_web {
         proc::push_pair(&mut argv, "--disallowed-tools", "WebSearch,WebFetch");
     }
     proc::push_pair(&mut argv, "--model", model);
@@ -134,22 +120,7 @@ pub(super) fn claude_argv(
     (argv, note)
 }
 
-fn claude_tools(no_web: bool) -> String {
-    ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
-        .into_iter()
-        .filter(|name| !(no_web && name.starts_with("Web")))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(super) fn assess_claude(
-    raw: bool,
-    print_id: bool,
-    schema: bool,
-    child: i32,
-    out: &str,
-    err: &str,
-) -> Report {
+pub(super) fn assess_claude(raw: bool, schema: bool, child: i32, out: &str, err: &str) -> Report {
     let mut before = String::new();
     let mut stdout = String::new();
     if !err.trim().is_empty() {
@@ -186,8 +157,7 @@ pub(super) fn assess_claude(
         stdout.push('\n');
     }
     let mut after = String::new();
-    if print_id
-        && let Some(id) = data.get("session_id").and_then(Value::as_str)
+    if let Some(id) = data.get("session_id").and_then(Value::as_str)
         && !id.is_empty()
     {
         after.push_str(&format!("SESSION_ID={id}\n"));
@@ -203,9 +173,7 @@ pub(super) fn assess_claude(
             .map(|name| format!("'{name}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        after.push_str(&format!(
-            "[crew] tool {names} auto-denied. --read-only has no shell and cannot write. Drop the mode flag for full autonomy.\n"
-        ));
+        after.push_str(&format!("[crew] tool {names} auto-denied.\n"));
         return report(125, before, stdout, after);
     }
     if claude_failed(&data, &text) {
@@ -354,38 +322,21 @@ mod tests {
         assert!(note.is_none());
         assert_eq!(flag(&argv, "--effort"), Some("max"));
 
-        invocation.read_only = true;
         invocation.no_web = true;
         invocation.add_dir = vec!["~/extra".into()];
-        let (argv, _) = claude_argv(&invocation, "haiku", "high", "hello", None);
-        assert_eq!(flag(&argv, "--permission-mode"), Some("dontAsk"));
-        assert_eq!(flag(&argv, "--tools"), Some("Read,Glob,Grep"));
-        assert_eq!(flag(&argv, "--allowed-tools"), Some("Read,Glob,Grep"));
-        assert!(has(&argv, "--strict-mcp-config"));
-        assert!(!has(&argv, "--disallowed-tools"));
-        assert!(!has(&argv, "--dangerously-skip-permissions"));
-        assert_eq!(flag(&argv, "--add-dir"), Some("~/extra"));
-
-        invocation.read_only = false;
-        invocation.write = false;
         let (argv, _) = claude_argv(&invocation, "sonnet", "medium", "hello", None);
         assert_eq!(
             flag(&argv, "--disallowed-tools"),
             Some("WebSearch,WebFetch")
         );
         assert!(has(&argv, "--dangerously-skip-permissions"));
-
-        invocation.write = true;
-        invocation.no_web = false;
-        let (argv, _) = claude_argv(&invocation, "sonnet", "medium", "hello", None);
-        assert_eq!(flag(&argv, "--permission-mode"), Some("auto"));
-        assert!(!has(&argv, "--dangerously-skip-permissions"));
+        assert_eq!(flag(&argv, "--add-dir"), Some("~/extra"));
     }
 
     #[test]
     fn denial_and_empty_result_are_125() {
         let denied = r#"{"type":"result","subtype":"success","is_error":false,"result":"answer","session_id":"abc","permission_denials":[{"tool_name":"Bash"},{"tool_name":"Bash"},{"tool_name":"Write"}]}"#;
-        let report = assess_claude(false, true, false, 0, denied, "");
+        let report = assess_claude(false, false, 0, denied, "");
         assert_eq!(report.code, 125);
         assert_eq!(report.stdout, "answer\n");
         assert!(report.after_stderr.contains("SESSION_ID=abc"));
@@ -393,19 +344,19 @@ mod tests {
         assert!(!report.after_stderr.contains("'Bash', 'Bash'"));
 
         let empty = r#"{"type":"result","subtype":"success","is_error":false,"result":"  ","permission_denials":[]}"#;
-        let report = assess_claude(false, false, false, 0, empty, "");
+        let report = assess_claude(false, false, 0, empty, "");
         assert_eq!(report.code, 125);
         assert!(report.after_stderr.contains("run ended early"));
 
         let errored = r#"{"type":"result","subtype":"success","is_error":true,"result":"nope","permission_denials":[]}"#;
-        assert_eq!(assess_claude(false, false, false, 0, errored, "").code, 125);
+        assert_eq!(assess_claude(false, false, 0, errored, "").code, 125);
     }
 
     #[test]
     fn success_keeps_the_child_status() {
         let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","permission_denials":[]}"#;
-        assert_eq!(assess_claude(false, false, false, 0, ok, "").code, 0);
-        let report = assess_claude(false, false, false, 1, ok, "");
+        assert_eq!(assess_claude(false, false, 0, ok, "").code, 0);
+        let report = assess_claude(false, false, 1, ok, "");
         assert_eq!(report.code, 1);
         assert_eq!(report.stdout, "ok\n");
     }

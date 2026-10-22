@@ -1,8 +1,6 @@
 //! Grok headless runner.
 //!
-//! A missing `stopReason` is a finished turn. The read-only sandbox on this Mac
-//! often refuses to start, so that one failure is retried with a tool allowlist
-//! that still cannot write or spawn a shell.
+//! A missing `stopReason` is a finished turn.
 
 use std::time::Instant;
 
@@ -17,9 +15,6 @@ use super::proc::{
     self, KillStyle, Report, StdioKind, code_or_one, format_secs, map_effort, py_display,
     py_truthy, take_prompt,
 };
-
-const KERNEL_RULE: &str = "This is a read-only session. You can read files and run read-only shell commands, but any write fails at the OS level. Do not attempt writes and do not hunt for workarounds. If the task needs a modification, say so and stop.";
-const FALLBACK_RULE: &str = "This is a read-only session with no shell. You may use read_file, grep, list_dir, and web tools only. File edits, shell commands, and subagents are unavailable. Do not hunt for workarounds. If the task needs a modification or a shell command, say so and stop.";
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let resolved = tier::resolve(
@@ -48,53 +43,24 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &resolved.effort,
         &prompt,
         schema.as_deref(),
-        true,
     );
     proc::write_effort_note(&note);
     let started = Instant::now();
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let launch = |argv: &[String]| {
-        proc::launch_or_note(
-            proc::capture(
-                argv,
-                None,
-                timeout,
-                StdioKind::Piped,
-                KillStyle::TermThenKill,
-                true,
-            ),
-            started,
-            &label,
-        )
-    };
-    let first = match launch(&argv) {
+    let captured = match proc::launch_or_note(
+        proc::capture(
+            &argv,
+            None,
+            timeout,
+            StdioKind::Piped,
+            KillStyle::TermThenKill,
+            true,
+        ),
+        started,
+        &label,
+    ) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
-    };
-    let captured = if should_retry_readonly(
-        invocation.read_only,
-        first.timed_out,
-        first.code,
-        &first.stderr,
-    ) {
-        let detail = sandbox_detail(&first.stderr);
-        proc::write_stderr_line(&format!(
-            "[crew] read-only sandbox did not start ({detail}). Using a read-only tool allowlist with no shell."
-        ));
-        let (argv, _) = grok_argv(
-            invocation,
-            resolved.model.as_deref(),
-            &resolved.effort,
-            &prompt,
-            schema.as_deref(),
-            false,
-        );
-        match launch(&argv) {
-            Ok(captured) => captured,
-            Err(code) => return Ok(code),
-        }
-    } else {
-        first
     };
     if captured.timed_out {
         proc::write_stderr_line(&format!(
@@ -107,9 +73,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
     let report = assess_grok(
         invocation.raw,
-        invocation.print_id,
         schema_set,
-        invocation.read_only,
         captured.code,
         &captured.stdout,
         &captured.stderr,
@@ -125,7 +89,6 @@ pub(super) fn grok_argv(
     effort: &str,
     prompt: &str,
     schema: Option<&str>,
-    readonly_sandbox: bool,
 ) -> (Vec<String>, Option<String>) {
     let (wire, note) = map_effort(Provider::Grok, model, effort);
     let mut argv = vec![
@@ -137,17 +100,6 @@ pub(super) fn grok_argv(
         "json".to_string(),
         "--always-approve".to_string(),
     ];
-    if invocation.write {
-        proc::push_pair(&mut argv, "--sandbox", "workspace");
-    } else if invocation.read_only && readonly_sandbox {
-        proc::push_pair(&mut argv, "--sandbox", "read-only");
-        proc::push_pair(&mut argv, "--rules", KERNEL_RULE);
-    } else if invocation.read_only {
-        proc::push_pair(&mut argv, "--tools", &fallback_tools(invocation.no_web));
-        argv.push("--no-subagents".to_string());
-        proc::push_pair(&mut argv, "--deny", "MCPTool");
-        proc::push_pair(&mut argv, "--rules", FALLBACK_RULE);
-    }
     if let Some(model) = model {
         proc::push_pair(&mut argv, "-m", model);
     }
@@ -173,46 +125,7 @@ pub(super) fn grok_argv(
     (argv, note)
 }
 
-fn fallback_tools(no_web: bool) -> String {
-    ["read_file", "grep", "list_dir", "web_search", "web_fetch"]
-        .into_iter()
-        .filter(|name| !(no_web && name.starts_with("web_")))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(super) fn should_retry_readonly(
-    read_only: bool,
-    timed_out: bool,
-    code: i32,
-    stderr: &str,
-) -> bool {
-    read_only && !timed_out && code != 0 && code != 124 && sandbox_refused(stderr)
-}
-
-fn sandbox_refused(stderr: &str) -> bool {
-    stderr.contains("sandbox could not be applied")
-        || (stderr.contains("could not apply the") && stderr.contains("sandbox profile"))
-}
-
-pub(super) fn sandbox_detail(stderr: &str) -> String {
-    stderr
-        .lines()
-        .map(str::trim)
-        .find(|line| line.to_ascii_lowercase().contains("sandbox"))
-        .unwrap_or("read-only sandbox refused to start")
-        .to_string()
-}
-
-pub(super) fn assess_grok(
-    raw: bool,
-    print_id: bool,
-    schema: bool,
-    read_only: bool,
-    child: i32,
-    out: &str,
-    err: &str,
-) -> Report {
+pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &str) -> Report {
     if raw {
         let mut after = String::new();
         if !err.trim().is_empty() {
@@ -267,8 +180,7 @@ pub(super) fn assess_grok(
         stdout.push('\n');
     }
     let mut after = String::new();
-    if print_id
-        && let Some(id) = data.get("sessionId").and_then(Value::as_str)
+    if let Some(id) = data.get("sessionId").and_then(Value::as_str)
         && !id.is_empty()
     {
         after.push_str(&format!("SESSION_ID={id}\n"));
@@ -280,7 +192,7 @@ pub(super) fn assess_grok(
     if let Some(stop) = stop_reason(&data)
         && norm_stop(&stop) != "endturn"
     {
-        let hint = early_stop_hint(&stop, read_only);
+        let hint = early_stop_hint(&stop);
         after.push_str(&format!(
             "[crew] run ended early: stopReason={stop}.{hint}\n"
         ));
@@ -308,11 +220,8 @@ pub(super) fn norm_stop(value: &str) -> String {
         .collect()
 }
 
-fn early_stop_hint(stop: &str, read_only: bool) -> &'static str {
+fn early_stop_hint(stop: &str) -> &'static str {
     let key = norm_stop(stop);
-    if key == "cancelled" && read_only {
-        return " A tool call was blocked. --read-only cannot write or, when the read-only sandbox did not start, run a shell. Drop the mode flag for full autonomy.";
-    }
     if key == "cancelled" {
         return " A tool call was blocked.";
     }
@@ -403,120 +312,64 @@ mod tests {
     #[test]
     fn stop_reason_normalization_and_a_missing_field() {
         let hello = r#"{"text":"hello"}"#;
-        let report = assess_grok(false, false, false, false, 0, hello, "");
+        let report = assess_grok(false, false, 0, hello, "");
         assert_eq!(report.code, 0);
         assert_eq!(report.stdout, "hello\n");
         assert!(!report.after_stderr.contains("ended early"));
 
         for stop in ["end_turn", "EndTurn", "end-turn", "end turn"] {
             let out = format!(r#"{{"text":"hello","stopReason":"{stop}"}}"#);
-            assert_eq!(
-                assess_grok(false, false, false, false, 0, &out, "").code,
-                0,
-                "{stop}"
-            );
+            assert_eq!(assess_grok(false, false, 0, &out, "").code, 0, "{stop}");
         }
 
         let cancelled = r#"{"text":"hello","stopReason":"cancelled","sessionId":"s1"}"#;
-        let report = assess_grok(false, true, false, true, 0, cancelled, "");
+        let report = assess_grok(false, false, 0, cancelled, "");
         assert_eq!(report.code, 125);
         assert!(report.after_stderr.contains("SESSION_ID=s1"));
         assert!(report.after_stderr.contains("blocked"));
-        assert!(report.after_stderr.contains("shell"));
 
         let canceled = r#"{"text":"hello","stopReason":"canceled"}"#;
-        let report = assess_grok(false, false, false, true, 0, canceled, "");
+        let report = assess_grok(false, false, 0, canceled, "");
         assert_eq!(report.code, 125);
         assert!(!report.after_stderr.contains("blocked"));
 
         let capped = r#"{"text":"hello","stopReason":"max_turns"}"#;
-        let report = assess_grok(false, false, false, false, 0, capped, "");
+        let report = assess_grok(false, false, 0, capped, "");
         assert_eq!(report.code, 125);
         assert!(report.after_stderr.contains("--max-turns"));
 
         let error = r#"{"type":"error","message":"boom"}"#;
-        assert_eq!(assess_grok(false, true, false, false, 0, error, "").code, 1);
-        assert_eq!(assess_grok(false, true, false, false, 4, error, "").code, 4);
-        assert_eq!(assess_grok(false, false, false, false, 0, "", "").code, 0);
-        assert_eq!(
-            assess_grok(true, true, false, false, 0, cancelled, "").code,
-            0
-        );
-    }
-
-    #[test]
-    fn readonly_retries_once_on_sandbox_refusal() {
-        let refused = "Error: sandbox could not be applied: /var/run/docker.sock\n";
-        assert!(should_retry_readonly(true, false, 1, refused));
-        assert!(should_retry_readonly(
-            true,
-            false,
-            2,
-            "could not apply the read-only sandbox profile"
-        ));
-        assert!(!should_retry_readonly(true, false, 0, refused));
-        assert!(!should_retry_readonly(true, false, 124, refused));
-        assert!(!should_retry_readonly(true, true, 1, refused));
-        assert!(!should_retry_readonly(false, false, 1, refused));
-        assert_eq!(
-            sandbox_detail(refused),
-            "Error: sandbox could not be applied: /var/run/docker.sock"
-        );
-
-        let mut invocation = bare(Provider::Grok);
-        invocation.read_only = true;
-        let (first, _) = grok_argv(&invocation, Some("grok-4.7"), "medium", "hello", None, true);
-        assert_eq!(flag(&first, "--sandbox"), Some("read-only"));
-        assert!(!has(&first, "--tools"));
-        let (second, _) = grok_argv(
-            &invocation,
-            Some("grok-4.7"),
-            "medium",
-            "hello",
-            None,
-            false,
-        );
-        assert!(!has(&second, "--sandbox"));
-        assert_eq!(
-            flag(&second, "--tools"),
-            Some("read_file,grep,list_dir,web_search,web_fetch")
-        );
-        assert!(has(&second, "--no-subagents"));
-        assert_eq!(flag(&second, "--deny"), Some("MCPTool"));
-
-        invocation.no_web = true;
-        let (second, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None, false);
-        assert_eq!(flag(&second, "--tools"), Some("read_file,grep,list_dir"));
-        assert!(has(&second, "--disable-web-search"));
+        assert_eq!(assess_grok(false, false, 0, error, "").code, 1);
+        assert_eq!(assess_grok(false, false, 4, error, "").code, 4);
+        assert_eq!(assess_grok(false, false, 0, "", "").code, 0);
+        assert_eq!(assess_grok(true, false, 0, cancelled, "").code, 0);
     }
 
     #[test]
     fn argv_omits_model_and_prefers_resume() {
         let invocation = bare(Provider::Grok);
-        let (argv, note) = grok_argv(&invocation, None, "medium", "hello", None, true);
+        let (argv, note) = grok_argv(&invocation, None, "medium", "hello", None);
         assert!(note.is_none());
         assert!(!has(&argv, "-m"));
         assert_eq!(flag(&argv, "--effort"), Some("medium"));
         assert!(has(&argv, "--always-approve"));
         assert!(!has(&argv, "--sandbox"));
 
-        let (argv, note) = grok_argv(&invocation, None, "max", "hello", None, true);
+        let (argv, note) = grok_argv(&invocation, None, "max", "hello", None);
         assert_eq!(flag(&argv, "--effort"), Some("xhigh"));
         assert_eq!(note.as_deref(), Some("[crew] effort max -> xhigh"));
 
-        let (argv, note) = grok_argv(&invocation, Some("grok-4.5"), "max", "hello", None, true);
+        let (argv, note) = grok_argv(&invocation, Some("grok-4.5"), "max", "hello", None);
         assert_eq!(flag(&argv, "--effort"), Some("high"));
         assert_eq!(note.as_deref(), Some("[crew] effort max -> high"));
         assert_eq!(flag(&argv, "-m"), Some("grok-4.5"));
 
         let mut invocation = bare(Provider::Grok);
-        invocation.write = true;
         invocation.resume = Some("sid".to_string());
         invocation.continue_session = true;
         invocation.max_turns = Some(0);
         invocation.cwd = Some("/tmp/work".into());
-        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None, true);
-        assert_eq!(flag(&argv, "--sandbox"), Some("workspace"));
+        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None);
         assert_eq!(flag(&argv, "--effort"), Some("low"));
         assert!(has(&argv, "--resume"));
         assert!(!has(&argv, "--continue"));
@@ -525,7 +378,7 @@ mod tests {
 
         invocation.max_turns = Some(3);
         invocation.resume = None;
-        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None, true);
+        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None);
         assert_eq!(flag(&argv, "--max-turns"), Some("3"));
         assert!(has(&argv, "--continue"));
     }

@@ -649,23 +649,6 @@ fn restore_handler(signal: i32, previous: libc::sigaction) {
     }
 }
 
-/// Gemini and codex have no system channel for a read-only constraint, so the
-/// model tries a write tool and the denial fails the run. Claude and grok
-/// already send their own rule. Applied at argv build, so the stored job
-/// prompt stays the user's text and a resume does not stack a second copy.
-/// `--schema` skips it so the instruction is not wrapped around an answer
-/// that has to match the schema. `--raw` still gets it: raw only skips
-/// crew's success check.
-pub(super) const READ_ONLY_LINE: &str = "This is a read-only session. File edits and modifying shell commands are unavailable. Do not hunt for workarounds. If the task needs a modification or a shell command, say so and stop.";
-
-pub(super) fn read_only_prompt(invocation: &Invocation, prompt: &str) -> String {
-    if invocation.read_only && invocation.schema.is_none() {
-        format!("{prompt}\n\n{READ_ONLY_LINE}")
-    } else {
-        prompt.to_string()
-    }
-}
-
 #[cfg(test)]
 pub(super) fn bare(provider: Provider) -> Invocation {
     Invocation {
@@ -673,13 +656,10 @@ pub(super) fn bare(provider: Provider) -> Invocation {
         tier: None,
         model: None,
         effort: None,
-        read_only: false,
-        write: false,
         timeout_secs: 1800.0,
         cwd: None,
         resume: None,
         continue_session: false,
-        print_id: false,
         prompt: Some("hi".to_string()),
         add_dir: Vec::new(),
         schema: None,
@@ -770,24 +750,5 @@ mod tests {
         )
         .expect("sleep");
         assert!(captured.timed_out);
-    }
-
-    #[test]
-    fn read_only_line_skips_schema_and_stays_on_raw() {
-        let mut invocation = bare(Provider::Gemini);
-        invocation.read_only = true;
-        let lined = read_only_prompt(&invocation, "hello");
-        assert_eq!(lined, format!("hello\n\n{READ_ONLY_LINE}"));
-
-        invocation.schema = Some("{}".to_string());
-        assert_eq!(read_only_prompt(&invocation, "hello"), "hello");
-
-        invocation.schema = None;
-        invocation.raw = true;
-        assert_eq!(read_only_prompt(&invocation, "hello"), lined);
-
-        invocation.raw = false;
-        invocation.read_only = false;
-        assert_eq!(read_only_prompt(&invocation, "hello"), "hello");
     }
 }

@@ -427,7 +427,7 @@ mod tests {
 101 100 5.0 /Users/vladko/.cargo/bin/crew claude -m sonnet -\n\
 102 101 1.0 claude --output-format json\n\
 103 1 0.5 crew --supervise demo\n\
-104 103 0.5 /repo/target/debug/crew agy --print-id\n\
+104 103 0.5 /repo/target/debug/crew agy -\n\
 105 1 0.5 crew gpt -\n\
 200 1 10.0 crew load\n\
 ";
