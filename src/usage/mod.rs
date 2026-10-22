@@ -6,10 +6,11 @@ pub mod render;
 mod spend;
 
 use std::fs;
-use std::io::{IsTerminal, Read};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
@@ -706,282 +707,137 @@ fn period_window_secs(start: Option<&str>, end: Option<&str>, weekly: bool) -> O
     if weekly { Some(7 * 24 * 3600) } else { None }
 }
 
-fn strip_ansi(s: &str) -> String {
-    let mut res = String::new();
-    let mut in_escape = false;
-    for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else {
-            res.push(c);
-        }
-    }
-    res
-}
-
-fn run_claude_pty_probe() -> Result<Vec<Gauge>, Error> {
+/// Claude Code answers `get_usage` on its stream-json control channel with the
+/// exact utilization and an ISO `resets_at` per quota window, which the
+/// `/usage` screen only shows as prose. That timestamp is what makes the
+/// api-dollar window start exact.
+fn run_claude_usage_probe() -> Result<Vec<Gauge>, Error> {
     let probe_dir = state_dir().join("ClaudeProbe");
     let _ = fs::create_dir_all(&probe_dir);
 
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    let mut master: libc::c_int = 0;
-    let mut slave: libc::c_int = 0;
-
-    let ret = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ret != 0 {
-        return Err(Error::new(2, "failed to openpty for claude probe"));
-    }
-
-    unsafe {
-        let ws = libc::winsize {
-            ws_row: 200,
-            ws_col: 160,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        libc::ioctl(slave, libc::TIOCSWINSZ, &ws);
-    }
-
-    let slave_file = unsafe { fs::File::from_raw_fd(slave) };
-    let slave_file_err = slave_file
-        .try_clone()
-        .map_err(|e| Error::new(2, format!("clone slave failed: {}", e)))?;
-
-    let mut cmd = Command::new("claude");
-    cmd.arg("--allowed-tools")
-        .arg("")
-        .arg("--strict-mcp-config")
-        .arg("--settings")
-        .arg("{\"disableAllHooks\":true,\"remoteControlAtStartup\":false}")
+    let mut child = Command::new("claude")
+        .args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            r#"{"mcpServers":{}}"#,
+            "--setting-sources",
+            "",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+        ])
         .current_dir(&probe_dir)
-        .env("TERM", "xterm-256color")
         .env("DISABLE_AUTOUPDATER", "1")
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
         .env_remove("CLAUDE_CODE_SESSION_ACCESS_TOKEN")
-        .env_remove("CLAUDECODE");
-
-    cmd.stdin(Stdio::from(slave_file.try_clone().unwrap()));
-    cmd.stdout(Stdio::from(slave_file));
-    cmd.stderr(Stdio::from(slave_file_err));
-
-    let mut child = cmd
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| Error::new(2, format!("failed to spawn claude probe: {}", e)))?;
+        .map_err(|e| Error::new(2, format!("failed to spawn claude probe: {e}")))?;
 
-    let mut master_file = unsafe { fs::File::from_raw_fd(master) };
-    let master_fd = master_file.as_raw_fd();
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let requests = concat!(
+        r#"{"type":"control_request","request_id":"initialize","request":{"subtype":"initialize"}}"#,
+        "\n",
+        r#"{"type":"control_request","request_id":"usage","request":{"subtype":"get_usage","skip_behaviors":true}}"#,
+        "\n",
+    );
+    let sent = stdin
+        .write_all(requests.as_bytes())
+        .and_then(|_| stdin.flush());
 
-    unsafe {
-        let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
-        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-
-    let start = Instant::now();
-    let timeout = Duration::from_secs(12);
-    let mut output = Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut sent_usage = false;
-
-    while start.elapsed() < timeout {
-        if !sent_usage && start.elapsed() > Duration::from_millis(1500) {
-            sent_usage = true;
-            let _ = unsafe { libc::write(master_fd, b"/usage\r".as_ptr() as *const _, 7) };
-        }
-
-        let mut fds: libc::fd_set = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::FD_SET(master_fd, &mut fds);
-        }
-        let mut tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: 100_000,
-        };
-        let ready = unsafe {
-            libc::select(
-                master_fd + 1,
-                &mut fds,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut tv,
-            )
-        };
-        if ready > 0 {
-            match master_file.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => output.extend_from_slice(&buf[..n]),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break,
-            }
-        }
-
-        let text = String::from_utf8_lossy(&output);
-        if text.contains("Current session") || text.contains("Current week") {
-            std::thread::sleep(Duration::from_millis(500));
-            while let Ok(n) = master_file.read(&mut buf) {
-                if n == 0 {
-                    break;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                if val["type"] == "control_response" && val["response"]["request_id"] == "usage" {
+                    let _ = tx.send(val);
+                    return;
                 }
-                output.extend_from_slice(&buf[..n]);
             }
-            break;
         }
-
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
-        }
-    }
-
+    });
+    let reply = sent
+        .map_err(|e| Error::new(2, format!("claude probe stdin: {e}")))
+        .and_then(|_| {
+            rx.recv_timeout(Duration::from_secs(20))
+                .map_err(|_| Error::new(2, "claude probe timed out"))
+        });
     let _ = child.kill();
     let _ = child.wait();
 
-    let text = strip_ansi(&String::from_utf8_lossy(&output));
-    let mut gauges = Vec::new();
-
-    // Parse session
-    if let Some(pos) = text.find("Current session") {
-        let snippet = &text[pos..pos + 200.min(text.len() - pos)];
-        let wide = &text[pos..pos + 4000.min(text.len() - pos)];
-        if let Some(pct) = extract_percent_from_text(snippet) {
-            gauges.push(Gauge {
-                id: "claude:session".to_string(),
-                label: "5h".to_string(),
-                percent: pct,
-                reset: extract_reset_phrase(wide),
-                window_secs: Some(5 * 3600),
-                stale: false,
-            });
-        }
-    }
-
-    // Parse week
-    if let Some(pos) = text.find("Current week") {
-        let snippet = &text[pos..pos + 200.min(text.len() - pos)];
-        let wide = &text[pos..pos + 4000.min(text.len() - pos)];
-        if let Some(pct) = extract_percent_from_text(snippet) {
-            gauges.push(Gauge {
-                id: "claude:weekly".to_string(),
-                label: "week".to_string(),
-                percent: pct,
-                reset: extract_reset_phrase(wide),
-                window_secs: Some(7 * 24 * 3600),
-                stale: false,
-            });
-        }
-    }
-
+    let gauges = parse_claude_usage(&reply?["response"]["response"]);
     if gauges.is_empty() {
-        Err(Error::new(2, "failed to parse claude probe output"))
+        Err(Error::new(2, "claude probe returned no rate limits"))
     } else {
         Ok(gauges)
     }
 }
 
-/// Display-only. A "Resets …" phrase is not used as the API-dollar window start.
-fn extract_reset_phrase(snippet: &str) -> Option<String> {
-    // Keep a reset that shares the header line, and stop before the next section.
-    let body = snippet
-        .find(|c: char| c.is_whitespace())
-        .map(|idx| &snippet[idx..])
-        .unwrap_or(snippet);
-    // The reset sits in this section, before the next quota block or the
-    // "what's contributing" breakdown. Extra usage is not a boundary.
-    let lower = body.to_ascii_lowercase();
-    let next = [
-        "current session",
-        "current week",
-        "current month",
-        "what's contributing",
-        "what’s contributing",
-    ]
-    .iter()
-    .filter_map(|marker| lower.find(marker))
-    .min()
-    .unwrap_or(body.len());
-    let body = &body[..next];
-    let start = body.to_ascii_lowercase().find("resets")?;
-    let region = &body[start..];
-    let line = region.lines().next().unwrap_or(region);
-    let phrase = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    let chars = phrase.chars().count();
-    if !(6..64).contains(&chars) {
-        return None;
-    }
-    let mut run = 0;
-    for c in phrase.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-            run += 1;
-            if run >= 24 {
-                return None;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    Some(phrase)
-}
-
-fn extract_percent_from_text(s: &str) -> Option<u32> {
-    for word in s.split_whitespace() {
-        if let Some(idx) = word.find('%') {
-            let num_part = &word[..idx];
-            if let Ok(pct) = num_part.parse::<f64>() {
-                if s.contains("left") || s.contains("remaining") {
-                    return Some((100.0 - pct).round().clamp(0.0, 100.0) as u32);
-                } else {
-                    return Some(pct.round().clamp(0.0, 100.0) as u32);
-                }
-            }
-        }
-    }
-    None
+/// Windows Claude reports, with the model-specific weekly ones only when the
+/// plan has them.
+fn parse_claude_usage(usage: &Value) -> Vec<Gauge> {
+    const WINDOWS: [(&str, &str, &str, u64); 4] = [
+        ("five_hour", "claude:session", "5h", 5 * 3600),
+        ("seven_day", "claude:weekly", "week", 7 * 24 * 3600),
+        (
+            "seven_day_opus",
+            "claude:weekly_opus",
+            "opus week",
+            7 * 24 * 3600,
+        ),
+        (
+            "seven_day_sonnet",
+            "claude:weekly_sonnet",
+            "sonnet week",
+            7 * 24 * 3600,
+        ),
+    ];
+    WINDOWS
+        .iter()
+        .filter_map(|(key, id, label, secs)| {
+            let window = &usage["rate_limits"][key];
+            Some(Gauge {
+                id: id.to_string(),
+                label: label.to_string(),
+                percent: window["utilization"].as_f64()?.round().clamp(0.0, 100.0) as u32,
+                reset: window["resets_at"].as_str().map(str::to_string),
+                window_secs: Some(*secs),
+                stale: false,
+            })
+        })
+        .collect()
 }
 
 fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
-    let mut windows = Vec::new();
     let mut error = None;
-
-    // Check last_ok age
-    let mut is_fresh = false;
-    if let Some(saved) = last_ok.and_then(|v| v.get("claude")) {
-        if let Some(arr) = saved.as_array() {
-            if let Some(first) = arr.first() {
-                if let Some(fetched_at) = first.get("fetched_at").and_then(|f| f.as_str()) {
-                    if let Some(t) = crate::job::parse_iso_time(fetched_at) {
-                        if let Ok(elapsed) = SystemTime::now().duration_since(t) {
-                            if elapsed <= Duration::from_secs(180) {
-                                is_fresh = true;
-                            }
-                        }
-                    }
+    let windows = match run_claude_usage_probe() {
+        Ok(fresh) => fresh,
+        Err(_) => match last_ok.and_then(|v| v.get("claude")) {
+            Some(saved) => {
+                let mut stale = parse_gauges_from_json(Some(saved));
+                for w in &mut stale {
+                    w.stale = true;
                 }
+                stale
             }
-        }
-        windows = parse_gauges_from_json(Some(saved));
-    }
-
-    if !is_fresh || windows.is_empty() {
-        if let Ok(fresh) = run_claude_pty_probe() {
-            windows = fresh;
-        } else if !windows.is_empty() {
-            for w in &mut windows {
-                w.stale = true;
-            }
-        } else {
-            error = Some("no recent claude session".to_string());
-        }
+            None => Vec::new(),
+        },
+    };
+    if windows.is_empty() {
+        error = Some("failed to load usage".to_string());
     }
 
     ProviderView {
@@ -997,7 +853,6 @@ fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
 
 /// Plan, quota bars, and API-equivalent cost. Never log credential values.
 pub fn print_usage() -> Result<i32, Error> {
-    let plans = plan::load()?;
     let last_ok = load_last_ok();
 
     let mut views = vec![
@@ -1014,7 +869,7 @@ pub fn print_usage() -> Result<i32, Error> {
             "codex" => plan::detect_codex(),
             _ => plan::PlanSignal::Unknown,
         };
-        let shown = plan::show(&view.key, signal, &plans);
+        let shown = plan::show(&view.key, signal);
         view.plan = shown.header;
         view.spend = spend::line(&view.key, &view.windows, shown.monthly_usd, &book);
     }
@@ -1076,5 +931,25 @@ mod tests {
         assert_eq!(gauges[0].percent, 100);
         assert_eq!(gauges[0].window_secs, Some(604800));
         assert!(!gauges[0].stale);
+    }
+
+    #[test]
+    fn claude_usage_gives_exact_windows_and_skips_absent_ones() {
+        let usage = serde_json::json!({
+            "rate_limits": {
+                "five_hour": { "utilization": 18, "resets_at": "2026-10-22T23:49:59.918732+00:00" },
+                "seven_day": { "utilization": 53.6, "resets_at": "2026-10-27T11:59:59.918755+00:00" },
+                "seven_day_opus": null
+            }
+        });
+        let gauges = super::parse_claude_usage(&usage);
+        assert_eq!(gauges.len(), 2);
+        assert_eq!((gauges[1].label.as_str(), gauges[1].percent), ("week", 54));
+        let reset = gauges[1]
+            .reset
+            .as_deref()
+            .and_then(super::render::reset_instant);
+        assert!(reset.is_some());
+        assert_eq!(gauges[1].window_secs, Some(7 * 24 * 3600));
     }
 }

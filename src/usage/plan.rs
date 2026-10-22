@@ -1,19 +1,18 @@
 //! Plan name and monthly price shown by `crew usage`.
 //!
-//! A name read from the CLI wins. The dollar figure is the public monthly
-//! list price only when that exact plan has one; otherwise it comes from
-//! ~/.config/crew/plans.toml. An API-key login is not presented as a subscription.
+//! Only what the local CLI state determines is shown: the name it reports, and
+//! the public monthly list price when that exact plan has one. Nothing is read
+//! from user config, so an undeterminable tier stays unpriced. An API-key login
+//! is not presented as a subscription.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::Error;
-
 pub(crate) enum PlanSignal {
     Named(String),
-    /// Signed in with an API key. A config row must not invent a subscription.
+    /// Signed in with an API key, which is not a subscription.
     Api,
     Unknown,
 }
@@ -23,138 +22,16 @@ pub(crate) struct ShownPlan {
     pub monthly_usd: Option<f64>,
 }
 
-struct PlanConfig {
-    name: Option<String>,
-    usd_per_month: Option<f64>,
-}
-
-pub(crate) struct Plans {
-    claude: Option<PlanConfig>,
-    codex: Option<PlanConfig>,
-    grok: Option<PlanConfig>,
-    gemini: Option<PlanConfig>,
-}
-
-impl Plans {
-    fn get(&self, provider: &str) -> Option<&PlanConfig> {
-        match provider {
-            "claude" => self.claude.as_ref(),
-            "codex" => self.codex.as_ref(),
-            "grok" => self.grok.as_ref(),
-            "gemini" => self.gemini.as_ref(),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlansFile {
-    #[serde(default)]
-    claude: Option<PlanRow>,
-    #[serde(default)]
-    codex: Option<PlanRow>,
-    #[serde(default)]
-    grok: Option<PlanRow>,
-    #[serde(default)]
-    gemini: Option<PlanRow>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlanRow {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    usd_per_month: Option<f64>,
-}
-
-pub(crate) fn load() -> Result<Plans, Error> {
-    let Some(path) = plans_path() else {
-        return Ok(Plans {
-            claude: None,
-            codex: None,
-            grok: None,
-            gemini: None,
-        });
-    };
-    let text = fs::read_to_string(&path).map_err(|err| {
-        Error::new(
-            2,
-            format!("cannot read plans config {}: {err}", path.display()),
-        )
-    })?;
-    parse_plans(&text, &path.display().to_string())
-}
-
-fn plans_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CREW_PLANS") {
-        return Some(PathBuf::from(path));
-    }
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".config/crew/plans.toml");
-    path.is_file().then_some(path)
-}
-
-fn parse_plans(text: &str, origin: &str) -> Result<Plans, Error> {
-    let file: PlansFile = toml::from_str(text)
-        .map_err(|err| Error::new(2, format!("plans config {origin} is invalid: {err}")))?;
-    Ok(Plans {
-        claude: checked_row(file.claude, "claude", origin)?,
-        codex: checked_row(file.codex, "codex", origin)?,
-        grok: checked_row(file.grok, "grok", origin)?,
-        gemini: checked_row(file.gemini, "gemini", origin)?,
-    })
-}
-
-fn checked_row(
-    row: Option<PlanRow>,
-    provider: &str,
-    origin: &str,
-) -> Result<Option<PlanConfig>, Error> {
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let name = match row.name {
-        Some(raw) => {
-            let name = raw.trim();
-            if name.is_empty() {
-                return Err(Error::new(
-                    2,
-                    format!("plans config {origin}: {provider} name is empty"),
-                ));
-            }
-            if name.chars().count() > 80 {
-                return Err(Error::new(
-                    2,
-                    format!("plans config {origin}: {provider} name is too long"),
-                ));
-            }
-            Some(name.to_string())
-        }
-        None => None,
-    };
-    if let Some(usd) = row.usd_per_month {
-        if !usd.is_finite() || usd < 0.0 || usd >= 100_000.0 {
-            return Err(Error::new(
-                2,
-                format!("plans config {origin}: {provider} usd_per_month is not a monthly price"),
-            ));
-        }
-    }
-    Ok(Some(PlanConfig {
-        name,
-        usd_per_month: row.usd_per_month,
-    }))
-}
-
 /// Public monthly USD for a plan that has one list price.
 ///
-/// Checked 2026-10-21. Codex "Pro" is several prices, Claude Max is 5x or 20x,
-/// and SuperGrok / Google AI tiers are not a single number, so they are absent.
+/// Checked 2026-10-22. Codex "Pro" is several prices ($100, $200, $500) that
+/// the login does not tell apart, and SuperGrok / Google AI tiers are not
+/// detectable or not a single number, so they are absent.
 fn list_price(provider: &str, name: &str) -> Option<f64> {
     match (provider, name.to_ascii_lowercase().as_str()) {
         ("claude", "pro") => Some(20.0),
+        ("claude", "max 5x") => Some(100.0),
+        ("claude", "max 20x") => Some(200.0),
         ("claude", "free") => Some(0.0),
         ("codex", "plus") => Some(20.0),
         ("codex", "go") => Some(8.0),
@@ -163,51 +40,25 @@ fn list_price(provider: &str, name: &str) -> Option<f64> {
     }
 }
 
-pub(crate) fn show(provider: &str, signal: PlanSignal, plans: &Plans) -> ShownPlan {
-    if matches!(signal, PlanSignal::Api) {
+pub(crate) fn show(provider: &str, signal: PlanSignal) -> ShownPlan {
+    let PlanSignal::Named(raw) = signal else {
+        return ShownPlan {
+            header: None,
+            monthly_usd: None,
+        };
+    };
+    let name = raw.trim();
+    if name.is_empty() {
         return ShownPlan {
             header: None,
             monthly_usd: None,
         };
     }
-    let config = plans.get(provider);
-    let (name, name_from_config) = match signal {
-        PlanSignal::Named(raw) if !raw.trim().is_empty() => (Some(raw.trim().to_string()), false),
-        _ => match config.and_then(|row| row.name.clone()) {
-            Some(name) => (Some(name), true),
-            None => (None, false),
-        },
+    let price = list_price(provider, name);
+    let header = match price {
+        Some(usd) => format!("{name} {}/mo", format_usd(usd)),
+        None => name.to_string(),
     };
-    let list = name.as_deref().and_then(|n| list_price(provider, n));
-    let (price, price_from_config) = if let Some(usd) = list {
-        (Some(usd), false)
-    } else if let Some(usd) = config.and_then(|row| row.usd_per_month) {
-        (Some(usd), true)
-    } else {
-        (None, false)
-    };
-    if name.is_none() && price.is_none() {
-        return ShownPlan {
-            header: None,
-            monthly_usd: None,
-        };
-    }
-    let mut header = String::new();
-    if let Some(ref n) = name {
-        header.push_str(n);
-    }
-    if let Some(usd) = price {
-        if !header.is_empty() {
-            header.push(' ');
-        }
-        header.push_str(&format_usd(usd));
-        header.push_str("/mo");
-    }
-    if name_from_config || (name.is_none() && price_from_config) {
-        header.push_str(" (from config)");
-    } else if price_from_config {
-        header.push_str(" (price from config)");
-    }
     ShownPlan {
         header: Some(header),
         monthly_usd: price,
@@ -240,7 +91,8 @@ pub(crate) fn detect_claude() -> PlanSignal {
                         .as_deref()
                         .and_then(claude_plan_name)
                     {
-                        return PlanSignal::Named(name);
+                        let tier = (name == "Max").then(|| max_tier(&account)).flatten();
+                        return PlanSignal::Named(tier.map_or(name, str::to_string));
                     }
                     if account.organization_type.is_none()
                         && billing_is_api(account.billing_type.as_deref())
@@ -339,6 +191,26 @@ fn claude_plan_name(organization_type: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Max is sold as 5x and 20x of Pro; only the rate-limit tier tells them apart.
+fn max_tier(account: &ClaudeAccount) -> Option<&'static str> {
+    [
+        account.organization_rate_limit_tier.as_deref(),
+        account.user_rate_limit_tier.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|tier| {
+        let tier = tier.to_ascii_lowercase();
+        if tier.contains("max_20x") {
+            Some("Max 20x")
+        } else if tier.contains("max_5x") {
+            Some("Max 5x")
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Deserialize)]
 struct ClaudeConfig {
     #[serde(default, rename = "oauthAccount")]
@@ -351,6 +223,10 @@ struct ClaudeAccount {
     organization_type: Option<String>,
     #[serde(default, rename = "billingType")]
     billing_type: Option<String>,
+    #[serde(default, rename = "organizationRateLimitTier")]
+    organization_rate_limit_tier: Option<String>,
+    #[serde(default, rename = "userRateLimitTier")]
+    user_rate_limit_tier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -552,71 +428,41 @@ fn simple_base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn shown(provider: &str, name: &str) -> (Option<String>, Option<f64>) {
+        let plan = show(provider, PlanSignal::Named(name.to_string()));
+        (plan.header, plan.monthly_usd)
+    }
+
     #[test]
-    fn plan_resolution_prefers_detection_and_list_price() {
-        let plans = parse_plans(
-            r#"
-            [claude]
-            name = "Free"
+    fn plan_shows_detected_name_and_only_a_list_price() {
+        assert_eq!(
+            shown("claude", "Pro"),
+            (Some("Pro $20/mo".into()), Some(20.0))
+        );
+        assert_eq!(
+            shown("claude", "Max 20x"),
+            (Some("Max 20x $200/mo".into()), Some(200.0))
+        );
+        assert_eq!(shown("claude", "Max"), (Some("Max".into()), None));
+        assert_eq!(shown("codex", "Pro"), (Some("Pro".into()), None));
+        assert_eq!(
+            shown("grok", "SuperGrok Heavy"),
+            (Some("SuperGrok Heavy".into()), None)
+        );
+        assert_eq!(show("gemini", PlanSignal::Unknown).header, None);
+        assert_eq!(show("codex", PlanSignal::Api).header, None);
 
-            [codex]
-            name = "Plus"
-            usd_per_month = 200
-
-            [gemini]
-            name = "Google AI Pro"
-            usd_per_month = 20
-            "#,
-            "test",
+        let account: ClaudeAccount = serde_json::from_str(
+            r#"{"organizationType":"claude_max","organizationRateLimitTier":"default_claude_max_5x"}"#,
         )
-        .expect("plans");
-
-        let claude = show("claude", PlanSignal::Named("Pro".to_string()), &plans);
-        assert_eq!(claude.header.as_deref(), Some("Pro $20/mo"));
-        assert_eq!(claude.monthly_usd, Some(20.0));
-
-        let priced = parse_plans("[claude]\nusd_per_month = 999\n", "test").expect("priced");
-        let kept = show("claude", PlanSignal::Named("Pro".to_string()), &priced);
-        assert_eq!(kept.header.as_deref(), Some("Pro $20/mo"));
-        assert_eq!(kept.monthly_usd, Some(20.0));
-
-        let max = show("claude", PlanSignal::Named("Max".to_string()), &plans);
-        assert_eq!(max.header.as_deref(), Some("Max"));
-        assert_eq!(max.monthly_usd, None);
-
-        let codex = show("codex", PlanSignal::Named("Pro".to_string()), &plans);
-        assert_eq!(
-            codex.header.as_deref(),
-            Some("Pro $200/mo (price from config)")
-        );
-        assert_eq!(codex.monthly_usd, Some(200.0));
-
-        let gemini = show("gemini", PlanSignal::Unknown, &plans);
-        assert_eq!(
-            gemini.header.as_deref(),
-            Some("Google AI Pro $20/mo (from config)")
-        );
-
-        let api = show("codex", PlanSignal::Api, &plans);
-        assert_eq!(api.header, None);
-        assert_eq!(api.monthly_usd, None);
-
+        .expect("account");
+        assert_eq!(max_tier(&account), Some("Max 5x"));
         assert_eq!(claude_plan_name("claude_pro").as_deref(), Some("Pro"));
-        assert_eq!(claude_plan_name("claude_max").as_deref(), Some("Max"));
         assert_eq!(claude_plan_name("default_claude_ai"), None);
 
         let grok = grok_tier_from_settings(
             r#"{"payload":"{\"settings\":{\"subscription_tier_display\":\"SuperGrok Heavy\"}}"}"#,
         );
         assert_eq!(grok.as_deref(), Some("SuperGrok Heavy"));
-        assert_eq!(
-            grok_tier_from_settings(
-                r#"{"payload":"{\"settings\":{\"subscription_tier_display\":\"\"}}"}"#
-            ),
-            None
-        );
-
-        assert!(parse_plans("[codex]\nusd_per_month = -1\n", "test").is_err());
-        assert!(parse_plans("[nope]\nname = \"x\"\n", "test").is_err());
     }
 }
