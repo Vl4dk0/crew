@@ -1,7 +1,7 @@
 //! What this machine's local CLI sessions would have cost at API prices.
 //!
-//! Claude and Codex write per-response token counts. Grok and Antigravity do
-//! not, so they get no figure. The sum is every local session in the quota
+//! Claude, Codex and Antigravity write per-response token counts. Grok does
+//! not, so it gets no figure. The sum is every local session in the quota
 //! window, not only crew runs.
 
 use std::collections::HashMap;
@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
+use super::antigravity;
 use super::plan::format_usd;
 use super::prices::{self, Book};
 use super::render::{Gauge, reset_instant};
@@ -51,6 +52,58 @@ enum CodexEvent {
         cache_write: u64,
         output: u64,
     },
+    /// Running totals after a response, from an `event_msg` `token_count`.
+    Count {
+        at: Option<SystemTime>,
+        total: CodexUsage,
+        last: CodexUsage,
+    },
+}
+
+/// Codex writes a `token_usage_record` per response and then a `token_count`
+/// with the same numbers; logs without records have only the count. A count
+/// that follows a record is that record again, so it is skipped. Any other is
+/// priced by how far the running total grew, which also drops a repeated count.
+#[derive(Default)]
+struct CodexFolder {
+    model: Option<String>,
+    prev_total: Option<CodexUsage>,
+    record_pending: bool,
+}
+
+/// When a response happened and its fresh, cache-read, cache-write, output tokens.
+type CodexBilled = (Option<SystemTime>, (u64, u64, u64, u64));
+
+impl CodexFolder {
+    fn feed(&mut self, event: CodexEvent) -> Option<CodexBilled> {
+        match event {
+            CodexEvent::Model(name) => {
+                self.model = Some(name);
+                None
+            }
+            CodexEvent::Usage {
+                at,
+                fresh,
+                cache_read,
+                cache_write,
+                output,
+            } => {
+                self.record_pending = true;
+                Some((at, (fresh, cache_read, cache_write, output)))
+            }
+            CodexEvent::Count { at, total, last } => {
+                let grown = self.prev_total.replace(total.clone());
+                let delta = match grown {
+                    Some(prev) if total.total_tokens >= prev.total_tokens => total.minus(&prev),
+                    _ => last,
+                };
+                if std::mem::take(&mut self.record_pending) {
+                    return None;
+                }
+                Some((at, codex_parts(&delta)?))
+            }
+        }
+    }
 }
 
 pub(crate) fn line(
@@ -59,14 +112,15 @@ pub(crate) fn line(
     monthly_usd: Option<f64>,
     book: &Book,
 ) -> Option<String> {
-    if provider != "claude" && provider != "codex" {
+    if !matches!(provider, "claude" | "codex" | "gemini") {
         return None;
     }
     let now = SystemTime::now();
     let (start, end, label) = choose_window(windows, now);
     let tally = match provider {
         "claude" => scan_claude(start, end, book),
-        _ => scan_codex(start, end, book),
+        "codex" => scan_codex(start, end, book),
+        _ => scan_antigravity(start, end, book),
     };
     render_tally(&tally, label, monthly_usd, book.is_empty())
 }
@@ -209,42 +263,63 @@ fn scan_codex(start: SystemTime, end: SystemTime, book: &Book) -> Tally {
         return tally;
     };
     for path in session_files(&root, start) {
-        let mut model = None;
+        let mut folder = CodexFolder::default();
         let _ = for_each_line(&path, |line| {
-            if !contains(line, b"token_usage_record") && !contains(line, b"turn_context") {
+            if !contains(line, b"token_usage_record")
+                && !contains(line, b"turn_context")
+                && !contains(line, b"\"token_count\"")
+            {
                 return;
             }
             let Ok(text) = std::str::from_utf8(line) else {
                 return;
             };
-            match parse_codex_line(text) {
-                Some(CodexEvent::Model(name)) => model = Some(name),
-                Some(CodexEvent::Usage {
-                    at,
-                    fresh,
-                    cache_read,
-                    cache_write,
-                    output,
-                }) => {
-                    let Some(at) = at else {
-                        return;
-                    };
-                    if at < start || at >= end {
-                        return;
-                    }
-                    add_parts(
-                        &mut tally,
-                        book,
-                        model.as_deref(),
-                        fresh,
-                        cache_read,
-                        cache_write,
-                        output,
-                    );
-                }
-                None => {}
+            let Some(event) = parse_codex_line(text) else {
+                return;
+            };
+            let Some((Some(at), (fresh, cache_read, cache_write, output))) = folder.feed(event)
+            else {
+                return;
+            };
+            if at < start || at >= end {
+                return;
             }
+            add_parts(
+                &mut tally,
+                book,
+                folder.model.as_deref(),
+                fresh,
+                cache_read,
+                cache_write,
+                output,
+            );
         });
+    }
+    tally
+}
+
+/// Antigravity tags its Flash variant `-n` (`gemini-3.8-flash-n`). It is priced
+/// as the model without the tag when only that one is listed; other names such
+/// as `gemini-4-argon-trial` are not guessed.
+fn scan_antigravity(start: SystemTime, end: SystemTime, book: &Book) -> Tally {
+    let mut tally = Tally::empty();
+    for response in antigravity::responses(start, end) {
+        let model = response
+            .model
+            .as_deref()
+            .map(|model| match model.strip_suffix("-n") {
+                Some(base) if book.rate_for(model).is_none() => base,
+                _ => model,
+            });
+        add_parts(
+            &mut tally,
+            book,
+            model,
+            response.fresh,
+            response.cache_read,
+            0,
+            response.output,
+        );
     }
     tally
 }
@@ -454,6 +529,18 @@ fn parse_codex_line(text: &str) -> Option<CodexEvent> {
                 output,
             })
         }
+        Some("event_msg") => {
+            let payload = line.payload?;
+            if payload.kind.as_deref() != Some("token_count") {
+                return None;
+            }
+            let info = payload.info?;
+            Some(CodexEvent::Count {
+                at: line.timestamp.as_deref().and_then(reset_instant),
+                total: info.total_token_usage?,
+                last: info.last_token_usage?,
+            })
+        }
         _ => None,
     }
 }
@@ -496,13 +583,25 @@ struct CodexLine {
 
 #[derive(Deserialize)]
 struct CodexPayload {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     usage: Option<CodexUsage>,
+    #[serde(default)]
+    info: Option<CodexInfo>,
 }
 
 #[derive(Deserialize)]
+struct CodexInfo {
+    #[serde(default)]
+    total_token_usage: Option<CodexUsage>,
+    #[serde(default)]
+    last_token_usage: Option<CodexUsage>,
+}
+
+#[derive(Clone, Deserialize)]
 struct CodexUsage {
     #[serde(default)]
     input_tokens: Option<u64>,
@@ -514,6 +613,24 @@ struct CodexUsage {
     output_tokens: Option<u64>,
     #[serde(default)]
     total_tokens: Option<u64>,
+}
+
+impl CodexUsage {
+    fn minus(&self, prev: &CodexUsage) -> CodexUsage {
+        let diff = |now: Option<u64>, before: Option<u64>| {
+            Some(now.unwrap_or(0).saturating_sub(before.unwrap_or(0)))
+        };
+        CodexUsage {
+            input_tokens: diff(self.input_tokens, prev.input_tokens),
+            cached_input_tokens: diff(self.cached_input_tokens, prev.cached_input_tokens),
+            cache_write_input_tokens: diff(
+                self.cache_write_input_tokens,
+                prev.cache_write_input_tokens,
+            ),
+            output_tokens: diff(self.output_tokens, prev.output_tokens),
+            total_tokens: diff(self.total_tokens, prev.total_tokens),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -529,25 +646,20 @@ mod tests {
     }
 
     fn fold_codex_lines(lines: &[&str]) -> Vec<Folded> {
-        let mut model = None;
+        let mut folder = CodexFolder::default();
         let mut folded = Vec::new();
         for line in lines {
-            match parse_codex_line(line) {
-                Some(CodexEvent::Model(name)) => model = Some(name),
-                Some(CodexEvent::Usage {
+            let Some(event) = parse_codex_line(line) else {
+                continue;
+            };
+            if let Some((_, (fresh, cache_read, cache_write, output))) = folder.feed(event) {
+                folded.push(Folded {
+                    model: folder.model.clone(),
                     fresh,
                     cache_read,
                     cache_write,
                     output,
-                    ..
-                }) => folded.push(Folded {
-                    model: model.clone(),
-                    fresh,
-                    cache_read,
-                    cache_write,
-                    output,
-                }),
-                None => {}
+                });
             }
         }
         folded
@@ -566,5 +678,18 @@ mod tests {
         assert_eq!(folded[0].cache_read, 400);
         assert_eq!(folded[0].cache_write, 0);
         assert_eq!(folded[0].output, 10);
+    }
+    #[test]
+    fn codex_token_count_is_not_a_second_charge_for_a_record() {
+        let count = |total_in: u64, last_in: u64| {
+            format!(
+                r#"{{"timestamp":"2026-10-21T00:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{total_in},"cached_input_tokens":0,"output_tokens":0,"total_tokens":{total_in}}},"last_token_usage":{{"input_tokens":{last_in},"cached_input_tokens":0,"output_tokens":0,"total_tokens":{last_in}}}}}}}}}"#
+            )
+        };
+        let record = r#"{"timestamp":"2026-10-21T00:00:01Z","type":"token_usage_record","payload":{"usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":0,"total_tokens":100}}}"#;
+        let (first, second, repeat) = (count(100, 100), count(160, 60), count(160, 60));
+        let folded = fold_codex_lines(&[record, &first, &second, &repeat]);
+        let billed: Vec<u64> = folded.iter().map(|f| f.fresh).collect();
+        assert_eq!(billed, [100, 60]);
     }
 }
