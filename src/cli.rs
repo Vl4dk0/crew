@@ -135,26 +135,34 @@ enum Command {
     Load,
     #[command(
         about = "Show plan, quota bars, and API-equivalent cost",
-        long_about = "Bars come from a Claude /usage probe, agy /usage, the Grok \
-            billing API, and the Codex usage API. A reset is printed only when \
-            that payload includes one. Bars are sorted by the least-used window.\n\
+        long_about = "Bars are sorted by the least-used window. A figure is shown \
+            only when its source states it; anything a provider does not report \
+            is left out, not estimated or read from config.\n\
             \n\
-            The plan name is organizationType in ~/.claude.json (the same value \
-            as `claude auth status`), chatgpt_plan_type in the local Codex login, \
-            and subscription_tier_display in ~/.grok/settings_cache.json. \
-            Antigravity reports no plan. ~/.config/crew/plans.toml, or CREW_PLANS, \
-            fills a gap and the line says \"(from config)\". The antigravity row \
-            is [gemini]. A price with no such note is the public monthly list \
-            price of that exact plan, not the invoice.\n\
+            Claude: exact utilization and reset of the 5h, weekly, and opus/sonnet \
+            weekly windows from Claude Code's `get_usage` control request. \
+            Codex: the ChatGPT usage API. Antigravity: `agy /usage`. Grok: the \
+            billing API.\n\
             \n\
-            The api figure prices this machine's Claude Code and Codex session \
-            logs over the quota window, or the last 7 days when that window's \
-            start is unknown. Prices are LiteLLM's \
-            model_prices_and_context_window.json, cached under \
-            ~/.local/share/crew and reused offline. Tokens whose model is missing \
-            from that table are left out. Grok and Antigravity write no \
-            input/output ledger, so they have no api line. The figure is every \
-            local session of that CLI, not only crew runs.",
+            The plan name is organizationType in ~/.claude.json (Max 5x or 20x \
+            from its rate-limit tier), chatgpt_plan_type in the local Codex login, \
+            and subscription_tier_display in ~/.grok/settings_cache.json. A price \
+            is shown only for a plan with one public monthly list price: Claude \
+            Pro, Max 5x, Max 20x, and Codex Plus and Go. Codex Pro and Grok show \
+            the name alone, since the login does not say which price tier it is. \
+            Antigravity reports no plan, so it has none.\n\
+            \n\
+            The api line prices this machine's local sessions over the quota \
+            window, starting at the reset minus the window length: Claude Code \
+            (~/.claude/projects), Codex (~/.codex/sessions, from each response \
+            record or, where a log has none, its running token_count), and \
+            Antigravity (~/.gemini/antigravity-cli/conversations/*.db, read with \
+            sqlite3). The last 7 days are used when no window reset is known. \
+            Prices are LiteLLM's model_prices_and_context_window.json, cached \
+            under ~/.local/share/crew and reused offline. Tokens whose model is \
+            missing from that table are left out and noted. Grok writes no \
+            token ledger, so it has no api line. The figure is every local \
+            session of that CLI, not only crew runs.",
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,

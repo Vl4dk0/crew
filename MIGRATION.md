@@ -13,7 +13,7 @@ This repository does not replace `claude-run`, `codex-run`, `agy-run`, `grok-run
 | `baton run` | `crew job run` | Store is `$CREW_HOME` or `~/.local/share/crew`, never `BATON_HOME`. |
 | `baton ls/show/result/log/wait/resume/stop` | `crew job …` | Status is derived, not stored. `wait` returns 130 when the run was stopped. |
 | `subagentcounter` | `crew load` | Same lines, plus a `crew:` line. |
-| `usagebar` | `crew usage` | Same sources. Gemini's `/usage` runs on a PTY. |
+| `usagebar` | `crew usage` | Claude bars come from Claude Code's `get_usage` control request, not a `/usage` screen scrape. Gemini's `/usage` runs on a PTY. |
 | `reviewsubagent --write/--query/--read` | `crew review write/query/pick` | Same log: `~/.local/share/reviewsubagent/reviews.jsonl`. |
 
 ## Proposed shims
