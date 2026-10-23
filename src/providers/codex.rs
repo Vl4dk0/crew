@@ -5,7 +5,6 @@
 //! `turn.completed`. The deadline SIGKILLs the process group immediately.
 
 use std::path::Path;
-use std::time::Instant;
 
 use serde_json::Value;
 
@@ -38,20 +37,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let prompt = take_prompt(invocation)?;
     let (argv, note) = codex_argv(invocation, &model, &resolved.effort, prompt.as_deref());
     proc::write_effort_note(&note);
-    let started = Instant::now();
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let captured = match proc::launch_or_note(
-        proc::capture(
-            &argv,
-            invocation.cwd.as_deref(),
-            timeout,
-            StdioKind::Piped,
-            KillStyle::ImmediateKill,
-            true,
-        ),
-        started,
-        &model,
-    ) {
+    let captured = match proc::launch_or_note(proc::capture(
+        &argv,
+        invocation.cwd.as_deref(),
+        timeout,
+        StdioKind::Piped,
+        KillStyle::ImmediateKill,
+        true,
+    )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
@@ -96,7 +90,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         stdout,
         after_stderr: after,
     });
-    proc::note_long_run(started, &model);
     Ok(code)
 }
 

@@ -1,6 +1,6 @@
 # Migration
 
-This repository does not replace `claude-run`, `codex-run`, `agy-run`, `grok-run`, `baton`, `subagentcounter`, `usagebar`, or `reviewsubagent`. No skill, dotfile, or `PATH` entry was changed. The shims below are a proposal. Do not install them until you want the cutover.
+This repository does not replace `claude-run`, `codex-run`, `agy-run`, `grok-run`, `baton`, `subagentcounter`, or `usagebar`. No skill, dotfile, or `PATH` entry was changed. The shims below are a proposal. Do not install them until you want the cutover.
 
 ## Commands
 
@@ -14,7 +14,6 @@ This repository does not replace `claude-run`, `codex-run`, `agy-run`, `grok-run
 | `baton ls/show/result/log/wait/resume/stop` | `crew job …` | Status is derived, not stored. `wait` returns 130 when the run was stopped. |
 | `subagentcounter` | `crew load` | Same lines, plus a `crew:` line. |
 | `usagebar` | `crew usage` | Claude bars come from Claude Code's `get_usage` control request, not a `/usage` screen scrape. Gemini's `/usage` runs on a PTY. |
-| `reviewsubagent --write/--query/--read` | `crew review write/query/pick` | Same log: `~/.local/share/reviewsubagent/reviews.jsonl`. |
 
 ## Proposed shims
 
@@ -27,10 +26,10 @@ exec crew claude "$@"
 
 The same shape covers `codex-run`, `agy-run` (`crew gemini`), and `grok-run`. `baton` is not a drop-in: the subcommand is `job`, the store moved, and `run` takes the provider as an argument (`crew job run <name> <provider> …`). Keep calling `baton` until a job has been recreated under crew.
 
-`usagebar` and `subagentcounter` can become `exec crew usage` and `exec crew load`. `reviewsubagent --write` becomes `crew review write`. The positional form does not match, so that shim has to translate arguments. Leave it for a later cutover.
+`usagebar` and `subagentcounter` can become `exec crew usage` and `exec crew load`.
 
 ## What stays different on purpose
 
 - `-m` still wins over `--tier`.
 - A flag the underlying CLI does not have is exit 2. grok has no `--add-dir`. gemini has no `--schema` and no `--no-web`.
-- Codex at a full weekly quota is not special-cased. `crew review pick` tries the next judge when one fails to launch.
+- Codex at a full weekly quota is not special-cased.

@@ -3,8 +3,6 @@
 //! A denied tool still makes Claude exit 0. That becomes 125, because a caller
 //! checking the status would otherwise treat the denial as a finished answer.
 
-use std::time::Instant;
-
 use serde_json::{Map, Value};
 
 use crate::cli::Invocation;
@@ -45,20 +43,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         schema.as_deref(),
     );
     proc::write_effort_note(&note);
-    let started = Instant::now();
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let captured = match proc::launch_or_note(
-        proc::capture(
-            &argv,
-            invocation.cwd.as_deref(),
-            timeout,
-            StdioKind::Piped,
-            KillStyle::TermThenKill,
-            true,
-        ),
-        started,
-        &model,
-    ) {
+    let captured = match proc::launch_or_note(proc::capture(
+        &argv,
+        invocation.cwd.as_deref(),
+        timeout,
+        StdioKind::Piped,
+        KillStyle::TermThenKill,
+        true,
+    )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
@@ -67,7 +60,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "[crew] timed out after {}s",
             format_secs(invocation.timeout_secs)
         ));
-        proc::note_long_run(started, &model);
         return Ok(124);
     }
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
@@ -79,7 +71,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured.stderr,
     );
     proc::emit_report(&report);
-    proc::note_long_run(started, &model);
     Ok(report.code)
 }
 

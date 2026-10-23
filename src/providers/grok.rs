@@ -2,8 +2,6 @@
 //!
 //! A missing `stopReason` is a finished turn.
 
-use std::time::Instant;
-
 use serde_json::Value;
 
 use crate::cli::Invocation;
@@ -33,10 +31,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         Some(schema) => Some(proc::load_schema_literal(schema)?),
         None => None,
     };
-    let label = resolved
-        .model
-        .clone()
-        .unwrap_or_else(|| "grok-4.7".to_string());
     let (argv, note) = grok_argv(
         invocation,
         resolved.model.as_deref(),
@@ -45,20 +39,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         schema.as_deref(),
     );
     proc::write_effort_note(&note);
-    let started = Instant::now();
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let captured = match proc::launch_or_note(
-        proc::capture(
-            &argv,
-            None,
-            timeout,
-            StdioKind::Piped,
-            KillStyle::TermThenKill,
-            true,
-        ),
-        started,
-        &label,
-    ) {
+    let captured = match proc::launch_or_note(proc::capture(
+        &argv,
+        None,
+        timeout,
+        StdioKind::Piped,
+        KillStyle::TermThenKill,
+        true,
+    )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
@@ -67,7 +56,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "[crew] timed out after {}s",
             format_secs(invocation.timeout_secs)
         ));
-        proc::note_long_run(started, &label);
         return Ok(124);
     }
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
@@ -79,7 +67,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured.stderr,
     );
     proc::emit_report(&report);
-    proc::note_long_run(started, &label);
     Ok(report.code)
 }
 

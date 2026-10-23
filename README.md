@@ -131,20 +131,6 @@ Where each number comes from:
 
 A probe that fails shows its error; nothing is cached or estimated in its place.
 
-### 6. Autonomous Model Reviews (`crew review`)
-Records, queries, and autonomously selects benchmark review models from historical scores (`~/.local/share/reviewsubagent/reviews.jsonl`, capped at 30 entries):
-
-```console
-# Record a review entry
-$ crew review write --model opus --task "refactor" --what "Clean async loop" --duration 120 --cost 0.04 --score 5 --reviewer claude
-
-# Query reviews by harness
-$ crew review query claude
-
-# Autonomously pick best judge model based on scores and available usage
-$ crew review pick "code review"
-```
-
 ---
 
 ## Architectural Highlights & Wrapper Quirks Preserved

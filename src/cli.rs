@@ -21,9 +21,6 @@ use crate::tier::{self, Tier};
         Run exit codes: 0 ok, 75 usage/quota/rate/credit limit, 124 timeout, \
         125 denied tool or incomplete run, 127 CLI missing.\n\
         \n\
-        A run longer than 20 minutes prints one stderr line. Rate it later \
-        with `crew review write`. crew does not file the review itself.\n\
-        \n\
         `crew help <command>` and `<command> --help` print the same text.\n\
         \n\
         Agents\n  \
@@ -40,7 +37,6 @@ use crate::tier::{self, Tier};
         usage     plans, quota bars, resets\n\
         \n\
         Config\n  \
-        review    rating log and model picker\n  \
         models    the tier table",
     after_long_help = "Examples:\n  \
         crew models\n  \
@@ -155,17 +151,6 @@ enum Command {
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,
-    #[command(
-        about = "Record and query ratings of finished runs",
-        long_about = "The log is ~/.local/share/reviewsubagent/reviews.jsonl, \
-            capped at 30. crew does not write a row when a run finishes. \
-            The orchestrator does that later with `crew review write`.",
-        after_long_help = "Examples:\n  \
-            crew review query all\n  \
-            crew review pick \"fix the date parser\"\n  \
-            crew review write grok-4.7-medium \"pong\" \"replied pong\" 12s - 80 grok"
-    )]
-    Review(ReviewArgs),
     #[command(
         about = "Print the tier table",
         long_about = "Print provider, tier, model, effort, and whether the \
@@ -356,8 +341,7 @@ enum JobCommand {
     #[command(
         about = "Print a finished job's stdout",
         long_about = "Exit 2 while the job is running, 3 if the supervisor is gone \
-            without a recorded exit. Refuses a symlink. A run longer than 20 minutes \
-            also prints the review reminder on stderr.",
+            without a recorded exit. Refuses a symlink.",
         after_long_help = "Examples:\n  crew job result demo"
     )]
     Result {
@@ -381,8 +365,7 @@ enum JobCommand {
     #[command(
         about = "Block until the named jobs finish",
         long_about = "Exit with the job's code. A stopped job returns 130. \
-            An unknown name is exit 2. --timeout expiring is exit 4. \
-            A run longer than 20 minutes prints the review reminder.",
+            An unknown name is exit 2. --timeout expiring is exit 4.",
         after_long_help = "Examples:\n  \
             crew job wait demo\n  \
             crew job wait one two --any\n  \
@@ -446,71 +429,6 @@ struct JobRunArgs {
     trailing: Vec<String>,
 }
 
-#[derive(Debug, Args)]
-struct ReviewArgs {
-    #[command(subcommand)]
-    command: ReviewCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum ReviewCommand {
-    #[command(
-        about = "Append one rating",
-        long_about = "Append a row and keep the newest 30. The model is \
-            <id>-<effort>, for example grok-4.7-medium. Duration is seconds \
-            or 1h30m15s. Cost is a number, nan, or '-'. Score is an integer 0 through 100.",
-        after_long_help = "Examples:\n  \
-            crew review write grok-4.7-medium \"pong\" \"replied pong\" 12s - 80 grok\n  \
-            crew review write claude-haiku-5-5-medium \"audit\" \"listed three risks\" 1h30m15s 0.05 70 claude"
-    )]
-    Write {
-        /// Model id and effort, joined by a hyphen: grok-4.7-medium.
-        #[arg(value_name = "MODEL")]
-        model: String,
-        /// What the run was asked to do.
-        #[arg(value_name = "TASK")]
-        task: String,
-        /// What it actually did.
-        #[arg(value_name = "WHAT")]
-        what: String,
-        /// Seconds, or a clock like 1h30m15s.
-        #[arg(value_name = "DURATION")]
-        duration: String,
-        /// A number, nan, or '-'.
-        #[arg(value_name = "COST")]
-        cost: String,
-        /// Integer 0 through 100.
-        #[arg(value_name = "SCORE")]
-        score: String,
-        /// Who is writing the rating.
-        #[arg(value_name = "REVIEWER")]
-        reviewer: String,
-    },
-    #[command(
-        about = "Print the rating table",
-        long_about = "Harness is all, codex, claude, agy, or grok. An empty log still prints the header.",
-        after_long_help = "Examples:\n  crew review query all\n  crew review query grok"
-    )]
-    Query {
-        /// all, codex, claude, agy, or grok.
-        #[arg(value_name = "HARNESS")]
-        harness: String,
-    },
-    #[command(
-        about = "Ask a judge which logged model should take a task",
-        long_about = "Candidates are models already in the log. The judge is a \
-            random one of claude/haiku, gemini/gemini-3.8-flash, or codex/gpt-6-luna, \
-            effort high, 300 seconds. If that judge fails to launch, \
-            the other two are tried. An empty log is exit 2.",
-        after_long_help = "Examples:\n  crew review pick \"fix the date parser\""
-    )]
-    Pick {
-        /// The task the chosen model would do.
-        #[arg(value_name = "TASK")]
-        task: String,
-    },
-}
-
 pub fn run_from_env() -> Result<i32, Error> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -535,36 +453,11 @@ fn dispatch(cli: Cli) -> Result<i32, Error> {
         Some(Command::Load) => crate::load::print_load(),
         Some(Command::Usage) => crate::usage::print_usage(),
         Some(Command::Models) => tier::print(),
-        Some(Command::Review(args)) => dispatch_review(args),
         Some(Command::Job(args)) => dispatch_job(args),
         Some(Command::Claude(args)) => crate::providers::execute(&invocation_from_claude(args)?),
         Some(Command::Gemini(args)) => crate::providers::execute(&invocation_from_gemini(args)?),
         Some(Command::Grok(args)) => crate::providers::execute(&invocation_from_grok(args)?),
         Some(Command::Codex(args)) => crate::providers::execute(&invocation_from_codex(args)?),
-    }
-}
-
-fn dispatch_review(args: ReviewArgs) -> Result<i32, Error> {
-    match args.command {
-        ReviewCommand::Write {
-            model,
-            task,
-            what,
-            duration,
-            cost,
-            score,
-            reviewer,
-        } => crate::review::write(crate::review::NewReview {
-            model,
-            task,
-            what,
-            duration,
-            cost,
-            score,
-            reviewer,
-        }),
-        ReviewCommand::Query { harness } => crate::review::query(&harness),
-        ReviewCommand::Pick { task } => crate::review::pick(&task),
     }
 }
 

@@ -308,12 +308,6 @@ pub(super) fn emit_report(report: &Report) {
     write_raw_stderr(&report.after_stderr);
 }
 
-pub(super) fn note_long_run(started: Instant, model: &str) {
-    if let Some(note) = crate::review::long_run_note(started.elapsed(), model) {
-        write_stderr_line(&note);
-    }
-}
-
 fn write_raw_stdout(text: &str) {
     if text.is_empty() {
         return;
@@ -389,16 +383,11 @@ pub(super) fn capture(
     })
 }
 
-pub(super) fn launch_or_note(
-    result: io::Result<Captured>,
-    started: Instant,
-    model: &str,
-) -> Result<Captured, i32> {
+pub(super) fn launch_or_note(result: io::Result<Captured>) -> Result<Captured, i32> {
     match result {
         Ok(captured) => Ok(captured),
         Err(err) => {
             write_stderr_line(&format!("[crew] {err}"));
-            note_long_run(started, model);
             Err(LAUNCH_EXIT)
         }
     }

@@ -4,6 +4,5 @@ pub mod id;
 pub mod job;
 pub mod load;
 pub mod providers;
-pub mod review;
 pub mod tier;
 pub mod usage;

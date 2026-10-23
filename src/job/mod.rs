@@ -441,24 +441,6 @@ fn review_scope(invocation: &crate::cli::Invocation) -> bool {
         && (invocation.uncommitted || invocation.base.is_some() || invocation.commit.is_some())
 }
 
-fn run_duration(rec: &RunRecord) -> Option<Duration> {
-    let start = parse_iso_time(rec.started_at.as_deref()?)?;
-    let end = if let Some(ref f) = rec.finished_at {
-        parse_iso_time(f)?
-    } else {
-        SystemTime::now()
-    };
-    end.duration_since(start).ok()
-}
-
-fn extract_model(rec: &RunRecord) -> &str {
-    rec.args
-        .windows(2)
-        .find(|w| w[0] == "-m" || w[0] == "--model")
-        .map(|w| w[1].as_str())
-        .unwrap_or(&rec.provider)
-}
-
 pub fn result(name: &str) -> Result<i32, Error> {
     let rec = load_record(name)?;
     let alive = is_process_alive(
@@ -481,12 +463,6 @@ pub fn result(name: &str) -> Result<i32, Error> {
         file.read_to_end(&mut out)
             .map_err(|e| Error::new(2, format!("failed to read stdout: {}", e)))?;
         let _ = std::io::stdout().write_all(&out);
-    }
-
-    if let Some(dur) = run_duration(&rec) {
-        if let Some(note) = crate::review::long_run_note(dur, extract_model(&rec)) {
-            eprintln!("{}", note);
-        }
     }
 
     if status == Status::Stopped {
@@ -558,12 +534,6 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
                     } else {
                         rec.exit_code.unwrap_or(0)
                     };
-
-                    if let Some(dur) = run_duration(&rec) {
-                        if let Some(note) = crate::review::long_run_note(dur, extract_model(&rec)) {
-                            eprintln!("{}", note);
-                        }
-                    }
 
                     if any {
                         println!("{}", name);

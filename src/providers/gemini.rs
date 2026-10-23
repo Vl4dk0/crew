@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -34,17 +34,13 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "empty prompt (pass a prompt argument or pipe one via stdin)",
         )
     })?;
-    let (argv, note, sent_model) = gemini_argv(
+    let (argv, note) = gemini_argv(
         invocation,
         resolved.model.as_deref(),
         &resolved.effort,
         &prompt,
     );
     proc::write_effort_note(&note);
-    let label = sent_model
-        .clone()
-        .or_else(|| invocation.agent.clone())
-        .unwrap_or_else(|| "gemini".to_string());
     let home = cli_home();
     let track_files = invocation
         .resume
@@ -56,20 +52,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     } else {
         HashMap::new()
     };
-    let started = Instant::now();
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let captured = match proc::launch_or_note(
-        proc::capture(
-            &argv,
-            invocation.cwd.as_deref(),
-            timeout,
-            StdioKind::Pty,
-            KillStyle::TermThenKill,
-            false,
-        ),
-        started,
-        &label,
-    ) {
+    let captured = match proc::launch_or_note(proc::capture(
+        &argv,
+        invocation.cwd.as_deref(),
+        timeout,
+        StdioKind::Pty,
+        KillStyle::TermThenKill,
+        false,
+    )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
@@ -109,7 +100,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         presented.after_stderr = format!("SESSION_ID={id}\n");
     }
     proc::emit_report(&presented);
-    proc::note_long_run(started, &label);
     Ok(presented.code)
 }
 
@@ -118,7 +108,7 @@ pub(super) fn gemini_argv(
     resolved_model: Option<&str>,
     resolved_effort: &str,
     prompt: &str,
-) -> (Vec<String>, Option<String>, Option<String>) {
+) -> (Vec<String>, Option<String>) {
     let (model, effort_flag, note) = gemini_model(
         invocation.model.as_deref(),
         invocation.effort.is_some(),
@@ -156,7 +146,7 @@ pub(super) fn gemini_argv(
         let directory = directory.to_string_lossy();
         proc::push_pair(&mut argv, "--add-dir", &directory);
     }
-    (argv, note, model)
+    (argv, note)
 }
 
 fn gemini_model(
@@ -375,7 +365,7 @@ mod tests {
     #[test]
     fn argv_bakes_effort_into_the_slug() {
         let invocation = bare(Provider::Gemini);
-        let (argv, note, _) = gemini_argv(
+        let (argv, note) = gemini_argv(
             &invocation,
             Some("gemini-3.8-flash-medium"),
             "medium",
@@ -400,7 +390,7 @@ mod tests {
         invocation.timeout_secs = 15.0;
         invocation.model = Some("flash".to_string());
         invocation.effort = Some("max".to_string());
-        let (argv, note, _) = gemini_argv(&invocation, Some("flash"), "max", "hello");
+        let (argv, note) = gemini_argv(&invocation, Some("flash"), "max", "hello");
         assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
         assert_eq!(flag(&argv, "--print-timeout"), Some("10s"));
         assert!(!has(&argv, "--effort"));
@@ -408,37 +398,35 @@ mod tests {
 
         invocation.model = Some("argon".to_string());
         invocation.effort = None;
-        let (argv, note, _) = gemini_argv(&invocation, Some("argon"), "medium", "hello");
+        let (argv, note) = gemini_argv(&invocation, Some("argon"), "medium", "hello");
         assert_eq!(flag(&argv, "--model"), Some("gemini-4-argon-medium"));
         assert!(note.is_none());
         assert!(!has(&argv, "--effort"));
 
         invocation.model = Some("gemini-3.8-flash-high".to_string());
         invocation.effort = Some("max".to_string());
-        let (argv, note, _) =
-            gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "max", "hello");
+        let (argv, note) = gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "max", "hello");
         assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
         assert!(!has(&argv, "--effort"));
         assert!(note.is_none());
 
         invocation.model = None;
         invocation.effort = Some("high".to_string());
-        let (argv, note, _) =
-            gemini_argv(&invocation, Some("gemini-3.8-flash-low"), "high", "hello");
+        let (argv, note) = gemini_argv(&invocation, Some("gemini-3.8-flash-low"), "high", "hello");
         assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
         assert!(!has(&argv, "--effort"));
         assert!(note.is_none());
 
         invocation.model = Some("gemini-3.8-flash".to_string());
         invocation.effort = Some("high".to_string());
-        let (argv, _, _) = gemini_argv(&invocation, Some("gemini-3.8-flash"), "high", "hello");
+        let (argv, _) = gemini_argv(&invocation, Some("gemini-3.8-flash"), "high", "hello");
         assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash"));
         assert_eq!(flag(&argv, "--effort"), Some("high"));
 
         invocation.model = None;
         invocation.effort = None;
         invocation.agent = Some("reviewer".to_string());
-        let (argv, _, _) = gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "high", "hello");
+        let (argv, _) = gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "high", "hello");
         assert!(!has(&argv, "--model"));
         assert!(!has(&argv, "--effort"));
         assert_eq!(flag(&argv, "--agent"), Some("reviewer"));
@@ -446,7 +434,7 @@ mod tests {
         invocation.agent = None;
         invocation.sandbox = true;
         invocation.add_dir = vec!["~/notes".into()];
-        let (argv, _, _) = gemini_argv(
+        let (argv, _) = gemini_argv(
             &invocation,
             Some("gemini-3.8-flash-medium"),
             "medium",

@@ -121,7 +121,6 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     // Put wrapper in its own process group
     child_cmd.process_group(0);
 
-    let start_instant = Instant::now();
     record.started_at = Some(current_iso_time());
 
     let mut child = match child_cmd.spawn() {
@@ -206,7 +205,6 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
         }
     }
 
-    let elapsed = start_instant.elapsed();
     record.finished_at = Some(current_iso_time());
     record.exit_code = exit_code;
 
@@ -218,20 +216,6 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
                 if !id.is_empty() {
                     record.session_id = Some(id);
                 }
-            }
-        }
-
-        // Long run review reminder note
-        let model = record
-            .args
-            .windows(2)
-            .find(|w| w[0] == "-m" || w[0] == "--model")
-            .map(|w| w[1].as_str())
-            .unwrap_or(&record.provider);
-
-        if let Some(note) = crate::review::long_run_note(elapsed, model) {
-            if let Ok(mut sf) = fs::OpenOptions::new().append(true).open(dir.join("stderr")) {
-                let _ = writeln!(sf, "{}", note);
             }
         }
     }
