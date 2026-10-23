@@ -37,7 +37,7 @@ use crate::tier::{self, Tier};
         \n\
         Machine\n  \
         load      CPU, memory, GPU, and running agents per provider\n  \
-        usage     plans, bars, API cost\n\
+        usage     plans, quota bars, resets\n\
         \n\
         Config\n  \
         review    rating log and model picker\n  \

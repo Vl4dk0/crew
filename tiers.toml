@@ -22,16 +22,16 @@ model = "gpt-6-luna"
 effort = "low"
 
 [codex.balanced]
-model = "gpt-6.1-sol"
-effort = "low"
-
-[codex.smart]
-model = "gpt-6.1-sol"
+model = "gpt-6-luna"
 effort = "medium"
 
-[codex.max]
-model = "gpt-6.1-sol"
+[codex.smart]
+model = "gpt-6-luna"
 effort = "high"
+
+[codex.max]
+model = "gpt-6-luna"
+effort = "max"
 
 [gemini.fast]
 model = "gemini-3.8-flash-low"

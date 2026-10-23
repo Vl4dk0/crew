@@ -44,11 +44,11 @@ provider  tier      model                      effort  source
 claude    fast      haiku                      medium  builtin
 claude    balanced  sonnet                     medium  builtin
 claude    smart     opus                       high    builtin
-claude    max       fable                      max     builtin
+claude    max       opus                       max     builtin
 codex     fast      gpt-6-luna                 low     builtin
-codex     balanced  gpt-6.1-sol                low     builtin
-codex     smart     gpt-6-astra                high    builtin
-codex     max       gpt-6-astra                max     builtin
+codex     balanced  gpt-6-luna                 medium  builtin
+codex     smart     gpt-6-luna                 high    builtin
+codex     max       gpt-6-luna                 max     builtin
 gemini    fast      gemini-3.8-flash-low       low     builtin
 gemini    balanced  gemini-3.8-flash-medium    medium  builtin
 gemini    smart     gemini-3.8-flash-high      high    builtin

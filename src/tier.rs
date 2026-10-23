@@ -234,7 +234,7 @@ fn resolve_with(
 fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
     let (model, default_effort) = match provider {
         Provider::Claude => (Some("sonnet".to_string()), "medium"),
-        Provider::Codex => (Some("gpt-6.1-sol".to_string()), "medium"),
+        Provider::Codex => (Some("gpt-6-luna".to_string()), "medium"),
         Provider::Gemini => (Some("gemini-3.8-flash-medium".to_string()), "medium"),
         // The wrapper omits -m and lets the account default stand.
         Provider::Grok => (None, "medium"),
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(grok.model, None);
         assert_eq!(grok.effort, "medium");
         let codex = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
-        assert_eq!(codex.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(codex.model.as_deref(), Some("gpt-6-luna"));
         // No tier and no -e is medium, including codex, whose own wrapper
         // defaults to low. Vladko asked for one default.
         assert_eq!(codex.effort, "medium");
