@@ -166,6 +166,4 @@ $ crew review pick "code review"
 
 ## Documentation Links
 
-- [PLAN.md](PLAN.md): Specification, CLI surface agreement, and architecture layout.
 - [MIGRATION.md](MIGRATION.md): Proposed shims for replacing legacy shell wrappers.
-- [docs/demo.md](docs/demo.md): Recorded execution transcripts from live test runs.
