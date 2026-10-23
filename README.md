@@ -98,7 +98,7 @@ grok: 2 | 75237; 79803
 ```
 
 ### 5. Subscription Quota Meters (`crew usage`)
-Quota bars (20-column eighth-block meters, least-used window first), the plan, and what this machine's local sessions would have cost at API prices. A figure appears only when its source states it; what a provider does not report is left out, never estimated or read from config. No credential is printed or logged.
+Quota bars (20-column eighth-block meters, least-used window first), and the plan. A figure appears only when its source states it; what a provider does not report is left out, never estimated or read from config. No credential is printed or logged.
 
 ```console
 $ crew usage
@@ -108,7 +108,6 @@ $ crew usage
 ✳ claude  Pro $20/mo
   5h                    23%  ████▌░░░░░░░░░░░░░░░  resets Oct 23 01:49
   week                  55%  ███████████░░░░░░░░░  resets Oct 27 12:59
-  api $152.50 this week · plan $20/mo
 
 ✦ antigravity
   gemini week           59%  ███████████▊░░░░░░░░  resets Oct 24 12:45
@@ -116,7 +115,6 @@ $ crew usage
   other models week      0%  ░░░░░░░░░░░░░░░░░░░░  resets Oct 29 22:21
   other models 5h        0%  ░░░░░░░░░░░░░░░░░░░░  resets Oct 23 04:21
   Gemini 4 Argon week   99%  ███████████████████▊  resets Oct 26 17:50
-  api $44.58 this week, unpriced tokens left out
 
 ✕ grok  SuperGrok Heavy
   week                 100%  ████████████████████  resets Oct 23 08:26
@@ -124,14 +122,14 @@ $ crew usage
 
 Where each number comes from:
 
-| | Quota bars and resets | Plan | `api` line |
-| :-- | :-- | :-- | :-- |
-| claude | Claude Code's stream-json `get_usage` control request: exact utilization and ISO reset for 5h, week, and opus/sonnet week when the plan has them | `organizationType` in `~/.claude.json`; Max is `Max 5x` ($100) or `Max 20x` ($200) by its rate-limit tier, Pro is $20 | `~/.claude/projects` sessions from the weekly reset minus 7 days |
-| codex | ChatGPT usage API (`/backend-api/wham/usage`) | `chatgpt_plan_type` in the local login; Plus $20, Go $8. `Pro` has no price: the login does not say if it is the $100, $200, or $500 tier | `~/.codex/sessions`: each `token_usage_record`, plus `token_count` growth for turns that have no record |
-| antigravity | `agy -p /usage` | none: `agy` does not report a plan | `~/.gemini/antigravity-cli/conversations/*.db`, read with `sqlite3` (read-only; immutable when the conversation is closed) |
-| grok | xAI billing API | `subscription_tier_display` in `~/.grok/settings_cache.json`, name only | none: Grok keeps no token ledger |
+| | Quota bars and resets | Plan |
+| :-- | :-- | :-- |
+| claude | Claude Code's stream-json `get_usage` control request: exact utilization and ISO reset for 5h, week, and opus/sonnet week when the plan has them | `organizationType` in `~/.claude.json`; Max is `Max 5x` ($100) or `Max 20x` ($200) by its rate-limit tier, Pro is $20 |
+| codex | ChatGPT usage API (`/backend-api/wham/usage`) | `chatgpt_plan_type` in the local login; Plus $20, Go $8. `Pro` has no price: the login does not say if it is the $100, $200, or $500 tier |
+| antigravity | `agy -p /usage` | none: `agy` does not report a plan |
+| grok | xAI billing API | `subscription_tier_display` in `~/.grok/settings_cache.json`, name only |
 
-Prices are LiteLLM's `model_prices_and_context_window.json`, cached under `~/.local/share/crew` and reused offline. Tokens whose model is not in that table are left out and the line says so. Antigravity's `gemini-3.8-flash-n` is priced as `gemini-3.8-flash`; `gemini-4-argon-trial` has no list price, which is why the antigravity line above has unpriced tokens. The `plan $N/mo` note on an `api` line is the list price, not the invoice.
+A probe that fails shows its error; nothing is cached or estimated in its place.
 
 ### 6. Autonomous Model Reviews (`crew review`)
 Records, queries, and autonomously selects benchmark review models from historical scores (`~/.local/share/reviewsubagent/reviews.jsonl`, capped at 30 entries):
@@ -152,7 +150,7 @@ $ crew review pick "code review"
 ## Architectural Highlights & Wrapper Quirks Preserved
 
 - **PTY Execution for Gemini/Antigravity**: Runs `agy` within a pseudo-terminal (`libc::openpty`), bypassing the bug where `agy -p` drops output under non-PTY pipes.
-- **Control-protocol Probe for Claude Code**: Asks `get_usage` over Claude Code's stream-json stdin/stdout with isolated settings (no tools, MCP, hooks, or session file), falling back to the last cached bars, marked stale, when it fails.
+- **Control-protocol Probe for Claude Code**: Asks `get_usage` over Claude Code's stream-json stdin/stdout with isolated settings (no tools, MCP, hooks, or session file). If it fails, `crew usage` shows the error.
 - **Process Group Isolation**: Each runner and supervisor child lives in its own process group (`setpgid(0, 0)`), ensuring timeouts and cancellations clean up all descendants.
 - **Denial & Failure Detection**: Matches wrapper exit codes:
   - Exit 75: Usage, quota, rate, or credit limit hit

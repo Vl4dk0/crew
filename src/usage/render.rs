@@ -1,22 +1,16 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
-
 pub const BAR_WIDTH: usize = 20;
 const EIGHTH: [&str; 7] = ["▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Gauge {
     pub id: String,
     pub label: String,
     pub percent: u32,
-    #[serde(default)]
     pub reset: Option<String>,
     /// Length of the quota window. Absent when the payload does not say.
-    #[serde(default)]
     pub window_secs: Option<u64>,
-    #[serde(default)]
-    pub stale: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +20,6 @@ pub struct ProviderView {
     pub mark: String,
     pub plan: Option<String>,
     pub windows: Vec<Gauge>,
-    pub spend: Option<String>,
     pub error: Option<String>,
 }
 
@@ -108,9 +101,8 @@ fn sort_key(view: &ProviderView) -> (u8, u32, String) {
     if view.windows.is_empty() {
         return (2, 0, view.name.clone());
     }
-    let all_stale = view.windows.iter().all(|g| g.stale);
     let max_used = view.windows.iter().map(|g| g.percent).max().unwrap_or(0);
-    (if all_stale { 1 } else { 0 }, max_used, view.name.clone())
+    (0, max_used, view.name.clone())
 }
 
 pub fn render_blocks(views: &[ProviderView], tty: bool) -> String {
@@ -165,27 +157,17 @@ pub fn render_blocks(views: &[ProviderView], tty: bool) -> String {
                     &format!("{:>3}%  {}", g.percent, bar),
                     tty,
                 );
-                let stale_text = if g.stale {
-                    paint("2", "  stale", tty)
-                } else {
-                    String::new()
-                };
                 let reset_text = g
                     .reset
                     .as_deref()
                     .and_then(reset_label)
                     .map(|label| paint("2", &format!("  resets {label}"), tty))
                     .unwrap_or_default();
-                lines.push(format!(
-                    "  {name_padded}  {colored_meter}{reset_text}{stale_text}"
-                ));
+                lines.push(format!("  {name_padded}  {colored_meter}{reset_text}"));
             }
             if let Some(ref err) = v.error {
                 lines.push(format!("  {err}"));
             }
-        }
-        if let Some(ref spend) = v.spend {
-            lines.push(format!("  {spend}"));
         }
 
         block_strings.push(lines.join("\n"));
@@ -337,14 +319,12 @@ mod tests {
             name: "grok".to_string(),
             mark: "✕".to_string(),
             plan: None,
-            spend: None,
             windows: vec![Gauge {
                 id: "grok:weekly".to_string(),
                 label: "Grok · week".to_string(),
                 percent: 12,
                 reset: None,
                 window_secs: None,
-                stale: false,
             }],
             error: None,
         };
@@ -353,14 +333,12 @@ mod tests {
             name: "codex".to_string(),
             mark: "⚛".to_string(),
             plan: Some("Pro".to_string()),
-            spend: None,
             windows: vec![Gauge {
                 id: "codex:week".to_string(),
                 label: "Codex · week".to_string(),
                 percent: 100,
                 reset: None,
                 window_secs: None,
-                stale: false,
             }],
             error: None,
         };
@@ -383,7 +361,6 @@ mod tests {
             percent: 90,
             reset: None,
             window_secs: None,
-            stale: false,
         };
         assert_eq!(window_name(&g1), "5h");
 
@@ -393,7 +370,6 @@ mod tests {
             percent: 20,
             reset: None,
             window_secs: None,
-            stale: false,
         };
         assert_eq!(window_name(&g2), "week");
 
@@ -403,7 +379,6 @@ mod tests {
             percent: 100,
             reset: None,
             window_secs: None,
-            stale: false,
         };
         assert_eq!(window_name(&g3), "week");
 
@@ -413,7 +388,6 @@ mod tests {
             percent: 40,
             reset: None,
             window_secs: None,
-            stale: false,
         };
         assert_eq!(window_name(&g4), "gemini 5h");
 
@@ -423,7 +397,6 @@ mod tests {
             percent: 70,
             reset: None,
             window_secs: None,
-            stale: false,
         };
         assert_eq!(window_name(&g5), "Gemini 4 Argon week");
     }

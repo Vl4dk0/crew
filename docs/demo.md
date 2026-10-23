@@ -56,7 +56,7 @@ $ ./target/debug/crew usage
   week                  19%  ███▊░░░░░░░░░░░░░░░░
 
 ⚛ codex  Pro
-  týždeň               100%  ████████████████████  stale
+  týždeň               100%  ████████████████████
 ```
 
 ## Direct Agent Runs

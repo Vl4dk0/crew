@@ -134,7 +134,7 @@ enum Command {
     )]
     Load,
     #[command(
-        about = "Show plan, quota bars, and API-equivalent cost",
+        about = "Show plan and quota bars",
         long_about = "Bars are sorted by the least-used window. A figure is shown \
             only when its source states it; anything a provider does not report \
             is left out, not estimated or read from config.\n\
@@ -150,19 +150,8 @@ enum Command {
             is shown only for a plan with one public monthly list price: Claude \
             Pro, Max 5x, Max 20x, and Codex Plus and Go. Codex Pro and Grok show \
             the name alone, since the login does not say which price tier it is. \
-            Antigravity reports no plan, so it has none.\n\
-            \n\
-            The api line prices this machine's local sessions over the quota \
-            window, starting at the reset minus the window length: Claude Code \
-            (~/.claude/projects), Codex (~/.codex/sessions, from each response \
-            record or, where a log has none, its running token_count), and \
-            Antigravity (~/.gemini/antigravity-cli/conversations/*.db, read with \
-            sqlite3). The last 7 days are used when no window reset is known. \
-            Prices are LiteLLM's model_prices_and_context_window.json, cached \
-            under ~/.local/share/crew and reused offline. Tokens whose model is \
-            missing from that table are left out and noted. Grok writes no \
-            token ledger, so it has no api line. The figure is every local \
-            session of that CLI, not only crew runs.",
+            Antigravity reports no plan, so it has none. A probe that fails shows \
+            its error; there is no cached fallback.",
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,

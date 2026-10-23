@@ -17,11 +17,6 @@ pub(crate) enum PlanSignal {
     Unknown,
 }
 
-pub(crate) struct ShownPlan {
-    pub header: Option<String>,
-    pub monthly_usd: Option<f64>,
-}
-
 /// Public monthly USD for a plan that has one list price.
 ///
 /// Checked 2026-10-22. Codex "Pro" is several prices ($100, $200, $500) that
@@ -40,29 +35,19 @@ fn list_price(provider: &str, name: &str) -> Option<f64> {
     }
 }
 
-pub(crate) fn show(provider: &str, signal: PlanSignal) -> ShownPlan {
+/// Detected plan name, with its list price when there is exactly one.
+pub(crate) fn show(provider: &str, signal: PlanSignal) -> Option<String> {
     let PlanSignal::Named(raw) = signal else {
-        return ShownPlan {
-            header: None,
-            monthly_usd: None,
-        };
+        return None;
     };
     let name = raw.trim();
     if name.is_empty() {
-        return ShownPlan {
-            header: None,
-            monthly_usd: None,
-        };
+        return None;
     }
-    let price = list_price(provider, name);
-    let header = match price {
+    Some(match list_price(provider, name) {
         Some(usd) => format!("{name} {}/mo", format_usd(usd)),
         None => name.to_string(),
-    };
-    ShownPlan {
-        header: Some(header),
-        monthly_usd: price,
-    }
+    })
 }
 
 pub(crate) fn format_usd(amount: f64) -> String {
@@ -428,29 +413,25 @@ fn simple_base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn shown(provider: &str, name: &str) -> (Option<String>, Option<f64>) {
-        let plan = show(provider, PlanSignal::Named(name.to_string()));
-        (plan.header, plan.monthly_usd)
+    fn shown(provider: &str, name: &str) -> Option<String> {
+        show(provider, PlanSignal::Named(name.to_string()))
     }
 
     #[test]
     fn plan_shows_detected_name_and_only_a_list_price() {
+        assert_eq!(shown("claude", "Pro").as_deref(), Some("Pro $20/mo"));
         assert_eq!(
-            shown("claude", "Pro"),
-            (Some("Pro $20/mo".into()), Some(20.0))
+            shown("claude", "Max 20x").as_deref(),
+            Some("Max 20x $200/mo")
         );
+        assert_eq!(shown("claude", "Max").as_deref(), Some("Max"));
+        assert_eq!(shown("codex", "Pro").as_deref(), Some("Pro"));
         assert_eq!(
-            shown("claude", "Max 20x"),
-            (Some("Max 20x $200/mo".into()), Some(200.0))
+            shown("grok", "SuperGrok Heavy").as_deref(),
+            Some("SuperGrok Heavy")
         );
-        assert_eq!(shown("claude", "Max"), (Some("Max".into()), None));
-        assert_eq!(shown("codex", "Pro"), (Some("Pro".into()), None));
-        assert_eq!(
-            shown("grok", "SuperGrok Heavy"),
-            (Some("SuperGrok Heavy".into()), None)
-        );
-        assert_eq!(show("gemini", PlanSignal::Unknown).header, None);
-        assert_eq!(show("codex", PlanSignal::Api).header, None);
+        assert_eq!(show("gemini", PlanSignal::Unknown), None);
+        assert_eq!(show("codex", PlanSignal::Api), None);
 
         let account: ClaudeAccount = serde_json::from_str(
             r#"{"organizationType":"claude_max","organizationRateLimitTier":"default_claude_max_5x"}"#,

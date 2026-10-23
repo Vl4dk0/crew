@@ -1,10 +1,7 @@
 #![allow(clippy::collapsible_if)]
 
-mod antigravity;
 mod plan;
-mod prices;
 pub mod render;
-mod spend;
 
 use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
@@ -27,45 +24,6 @@ fn state_dir() -> PathBuf {
     } else {
         PathBuf::from(".")
     }
-}
-
-fn last_ok_path() -> PathBuf {
-    state_dir().join("last_ok.json")
-}
-
-fn load_last_ok() -> Option<Value> {
-    let path = last_ok_path();
-    if path.is_file() {
-        if let Ok(content) = fs::read_to_string(&path) {
-            return serde_json::from_str(&content).ok();
-        }
-    }
-    None
-}
-
-fn parse_gauges_from_json(val: Option<&Value>) -> Vec<Gauge> {
-    let mut gauges = Vec::new();
-    if let Some(Value::Array(arr)) = val {
-        for item in arr {
-            let id = item["id"].as_str().unwrap_or("").to_string();
-            let label = item["label"].as_str().unwrap_or("").to_string();
-            let percent = item["percent"].as_u64().unwrap_or(0) as u32;
-            let reset = item["reset"].as_str().map(|s| s.to_string());
-            let window_secs = item["window_secs"].as_u64();
-            let stale = item["stale"].as_bool().unwrap_or(false);
-            if !label.is_empty() {
-                gauges.push(Gauge {
-                    id,
-                    label,
-                    percent,
-                    reset,
-                    window_secs,
-                    stale,
-                });
-            }
-        }
-    }
-    gauges
 }
 
 fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
@@ -187,7 +145,6 @@ pub(crate) fn parse_codex_rate_limit(resp: &Value) -> Vec<Gauge> {
                         percent: pct.round().clamp(0.0, 100.0) as u32,
                         reset,
                         window_secs,
-                        stale: false,
                     });
                 }
             }
@@ -196,7 +153,7 @@ pub(crate) fn parse_codex_rate_limit(resp: &Value) -> Vec<Gauge> {
     windows
 }
 
-fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
+fn fetch_codex() -> ProviderView {
     let home = std::env::var("HOME").unwrap_or_default();
     let auth_path = Path::new(&home).join(".codex/auth.json");
 
@@ -245,14 +202,7 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
     }
 
     if windows.is_empty() {
-        if let Some(saved) = last_ok.and_then(|v| v.get("codex")) {
-            windows = parse_gauges_from_json(Some(saved));
-            for w in &mut windows {
-                w.stale = true;
-            }
-        } else {
-            error = Some("failed to load usage".to_string());
-        }
+        error = Some("failed to load usage".to_string());
     }
 
     ProviderView {
@@ -261,12 +211,11 @@ fn fetch_codex(last_ok: Option<&Value>) -> ProviderView {
         mark: "⚛".to_string(),
         plan: None,
         windows,
-        spend: None,
         error,
     }
 }
 
-fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
+fn fetch_gemini() -> ProviderView {
     let cache_file = state_dir().join("antigravity_cache.json");
     let mut raw_json: Option<Value> = None;
 
@@ -383,7 +332,6 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
                             percent,
                             reset,
                             window_secs,
-                            stale: false,
                         });
                     }
                 }
@@ -392,14 +340,7 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
     }
 
     if windows.is_empty() {
-        if let Some(saved) = last_ok.and_then(|v| v.get("gemini")) {
-            windows = parse_gauges_from_json(Some(saved));
-            for w in &mut windows {
-                w.stale = true;
-            }
-        } else {
-            error = Some("failed to load usage".to_string());
-        }
+        error = Some("failed to load usage".to_string());
     }
 
     ProviderView {
@@ -408,12 +349,11 @@ fn fetch_gemini(last_ok: Option<&Value>) -> ProviderView {
         mark: "✦".to_string(),
         plan: None,
         windows,
-        spend: None,
         error,
     }
 }
 
-fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
+fn fetch_grok() -> ProviderView {
     let home = std::env::var("HOME").unwrap_or_default();
     let auth_path = Path::new(&home).join(".grok/auth.json");
 
@@ -573,7 +513,6 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     percent: pct.round().clamp(0.0, 100.0) as u32,
                     reset,
                     window_secs,
-                    stale: false,
                 });
             }
 
@@ -605,7 +544,6 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                             percent: pct,
                             reset,
                             window_secs,
-                            stale: false,
                         });
                     }
                 }
@@ -664,21 +602,13 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
                     percent: pct,
                     reset: ondemand_reset,
                     window_secs: None,
-                    stale: false,
                 });
             }
         }
     }
 
     if windows.is_empty() {
-        if let Some(saved) = last_ok.and_then(|v| v.get("grok")) {
-            windows = parse_gauges_from_json(Some(saved));
-            for w in &mut windows {
-                w.stale = true;
-            }
-        } else {
-            error = Some("failed to load usage".to_string());
-        }
+        error = Some("failed to load usage".to_string());
     }
 
     ProviderView {
@@ -687,7 +617,6 @@ fn fetch_grok(last_ok: Option<&Value>) -> ProviderView {
         mark: "✕".to_string(),
         plan: None,
         windows,
-        spend: None,
         error,
     }
 }
@@ -816,30 +745,16 @@ fn parse_claude_usage(usage: &Value) -> Vec<Gauge> {
                 percent: window["utilization"].as_f64()?.round().clamp(0.0, 100.0) as u32,
                 reset: window["resets_at"].as_str().map(str::to_string),
                 window_secs: Some(*secs),
-                stale: false,
             })
         })
         .collect()
 }
 
-fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
-    let mut error = None;
-    let windows = match run_claude_usage_probe() {
-        Ok(fresh) => fresh,
-        Err(_) => match last_ok.and_then(|v| v.get("claude")) {
-            Some(saved) => {
-                let mut stale = parse_gauges_from_json(Some(saved));
-                for w in &mut stale {
-                    w.stale = true;
-                }
-                stale
-            }
-            None => Vec::new(),
-        },
+fn fetch_claude() -> ProviderView {
+    let (windows, error) = match run_claude_usage_probe() {
+        Ok(windows) => (windows, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
     };
-    if windows.is_empty() {
-        error = Some("failed to load usage".to_string());
-    }
 
     ProviderView {
         key: "claude".to_string(),
@@ -847,22 +762,13 @@ fn fetch_claude(last_ok: Option<&Value>) -> ProviderView {
         mark: "✳".to_string(),
         plan: None,
         windows,
-        spend: None,
         error,
     }
 }
 
-/// Plan, quota bars, and API-equivalent cost. Never log credential values.
+/// Plan and quota bars. Never log credential values.
 pub fn print_usage() -> Result<i32, Error> {
-    let last_ok = load_last_ok();
-
-    let mut views = vec![
-        fetch_claude(last_ok.as_ref()),
-        fetch_gemini(last_ok.as_ref()),
-        fetch_codex(last_ok.as_ref()),
-        fetch_grok(last_ok.as_ref()),
-    ];
-    let book = prices::book();
+    let mut views = vec![fetch_claude(), fetch_gemini(), fetch_codex(), fetch_grok()];
     for view in &mut views {
         let signal = match view.key.as_str() {
             "claude" => plan::detect_claude(),
@@ -870,9 +776,7 @@ pub fn print_usage() -> Result<i32, Error> {
             "codex" => plan::detect_codex(),
             _ => plan::PlanSignal::Unknown,
         };
-        let shown = plan::show(&view.key, signal);
-        view.plan = shown.header;
-        view.spend = spend::line(&view.key, &view.windows, shown.monthly_usd, &book);
+        view.plan = plan::show(&view.key, signal);
     }
 
     let tty = std::io::stdout().is_terminal();
@@ -931,7 +835,6 @@ mod tests {
         assert_eq!(gauges[0].label, "Codex · week");
         assert_eq!(gauges[0].percent, 100);
         assert_eq!(gauges[0].window_secs, Some(604800));
-        assert!(!gauges[0].stale);
     }
 
     #[test]
