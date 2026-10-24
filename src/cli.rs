@@ -71,10 +71,10 @@ enum Command {
     Claude(ProviderArgs),
     #[command(
         about = "Run the Gemini CLI (agy)",
-        long_about = "Run agy. Aliases: antigravity, agy. Effort is baked into \
-            the model slug (gemini-3.8-flash-low, and so on). crew does not also \
-            pass --effort. A deadline kills the process group and drops the \
-            partial transcript.",
+        long_about = "Run agy. Aliases: antigravity, agy. Built-in tier models \
+            bake effort into the model slug (gemini-3.8-flash-low, etc.). A \
+            custom model or --agent with -e forwards --effort. A deadline kills \
+            the process group and drops the partial transcript.",
         after_long_help = "Examples:\n  \
             crew gemini --tier fast \"Reply with the single word pong\"\n  \
             crew agy \"Summarize src/cli.rs\"\n  \
@@ -131,23 +131,25 @@ enum Command {
     Load,
     #[command(
         about = "Show plan and quota bars",
-        long_about = "Bars are sorted by the least-used window. A figure is shown \
+        long_about = "Providers are sorted by least-used maximum window. A figure is shown \
             only when its source states it; anything a provider does not report \
             is left out, not estimated or read from config.\n\
             \n\
             Claude: exact utilization and reset of the 5h, weekly, and opus/sonnet \
             weekly windows from Claude Code's `get_usage` control request. \
-            Codex: the ChatGPT usage API. Antigravity: `agy /usage`. Grok: the \
+            Codex: the ChatGPT usage API. Antigravity: `agy -p /usage`. Grok: the \
             billing API.\n\
             \n\
             The plan name is organizationType in ~/.claude.json (Max 5x or 20x \
             from its rate-limit tier), chatgpt_plan_type in the local Codex login, \
             and subscription_tier_display in ~/.grok/settings_cache.json. A price \
             is shown only for a plan with one public monthly list price: Claude \
-            Pro, Max 5x, Max 20x, and Codex Plus and Go. Codex Pro and Grok show \
-            the name alone, since the login does not say which price tier it is. \
+            Free ($0), Pro ($20), Max 5x ($100), Max 20x ($200), and Codex Free \
+            ($0), Plus ($20), and Go ($8). Codex Pro and Grok show the name \
+            alone, since the login does not say which price tier it is. \
             Antigravity reports no plan, so it has none. A probe that fails shows \
-            its error; there is no cached fallback.",
+            its error (Antigravity caches probe output for 120s; no stale fallback \
+            is used on error).",
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,
@@ -171,7 +173,7 @@ struct ProviderArgs {
     /// JSON schema. `{...}` is the schema text. Anything else is a file path, with `~` expanded.
     #[arg(long)]
     schema: Option<String>,
-    /// Print the CLI's own output and skip crew's success check.
+    /// Print the CLI's own raw output instead of extracting the result. Does not skip crew's success checks.
     #[arg(long)]
     raw: bool,
     /// Drop web search and web fetch from the tool list.
@@ -200,7 +202,7 @@ struct GrokArgs {
     /// JSON schema. `{...}` is the schema text. Anything else is a file path, with `~` expanded.
     #[arg(long)]
     schema: Option<String>,
-    /// Print grok's own output and skip the stopReason check.
+    /// Print grok's own raw output and skip crew's success check.
     #[arg(long)]
     raw: bool,
     /// Pass --disable-web-search.
@@ -217,10 +219,10 @@ struct CodexArgs {
     shared: SharedArgs,
     #[command(flatten)]
     dirs: AddDirArgs,
-    /// JSON schema passed through to codex. Not read as a file.
+    /// Path to a JSON schema file passed through to codex's --output-schema.
     #[arg(long)]
     schema: Option<String>,
-    /// Print codex's own output and skip the turn.failed check.
+    /// Print codex's own raw output instead of extracting the final message. Does not skip crew's success checks.
     #[arg(long)]
     raw: bool,
     /// Run `codex review` instead of a normal turn.
@@ -316,7 +318,7 @@ enum JobCommand {
     Run(JobRunArgs),
     #[command(
         about = "List jobs, oldest first",
-        long_about = "Print name, derived status, provider, model, and age. \
+        long_about = "Print name, derived status, wrapper (provider), model, and age. \
             Status is running, lost, stopped, ok, timeout, unclean, or failed.",
         after_long_help = "Examples:\n  crew job ls\n  crew job ls --json"
     )]
@@ -389,7 +391,7 @@ enum JobCommand {
             and -r of the parent's session id. Pass a new prompt, or omit it to read stdin.",
         after_long_help = "Examples:\n  \
             crew job resume demo \"Look at the tests you skipped\"\n  \
-            crew job resume demo"
+            cat prompt.txt | crew job resume demo"
     )]
     Resume {
         /// Parent job name.
