@@ -308,6 +308,38 @@ pub(super) fn emit_report(report: &Report) {
     write_raw_stderr(&report.after_stderr);
 }
 
+/// The deadline still owns the exit code. Text and `SESSION_ID` already
+/// parsed stay, so the killed run can be resumed and its answer is not
+/// thrown away.
+pub(super) fn keep_timeout(mut report: Report, timed_out: bool, secs: f64) -> Report {
+    if !timed_out {
+        return report;
+    }
+    report.code = 124;
+    if !report.before_stderr.contains("timed out after")
+        && !report.after_stderr.contains("timed out after")
+    {
+        report
+            .after_stderr
+            .push_str(&format!("[crew] timed out after {}s\n", format_secs(secs)));
+    }
+    report
+}
+
+/// Session id on one provider event line. Capture prints it as soon as the
+/// line arrives, not after the process exits.
+pub(super) fn session_from_line(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    for key in ["session_id", "sessionId", "thread_id"] {
+        if let Some(id) = value.get(key).and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
 fn write_raw_stdout(text: &str) {
     if text.is_empty() {
         return;
@@ -333,6 +365,7 @@ pub(super) fn capture(
     kind: StdioKind,
     kill: KillStyle,
     catch_signals: bool,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
 ) -> io::Result<Captured> {
     let _lock = CAPTURE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     INTERRUPTED.store(0, Ordering::SeqCst);
@@ -345,8 +378,17 @@ pub(super) fn capture(
         None
     };
 
+    let mut announced = None;
+    let mut scanned = 0usize;
     let mut timed_out = false;
-    let status = if let Some(status) = reap_with_timeout(&mut child, timeout)? {
+    let status = if let Some(status) = reap_watching(
+        &mut child,
+        timeout,
+        &readers.stdout,
+        &mut scanned,
+        &mut announced,
+        watch,
+    )? {
         status
     } else {
         timed_out = true;
@@ -357,7 +399,14 @@ pub(super) fn capture(
             }
             KillStyle::TermThenKill => {
                 kill_group(pid, libc::SIGTERM);
-                if let Some(status) = reap_with_timeout(&mut child, Duration::from_secs(5))? {
+                if let Some(status) = reap_watching(
+                    &mut child,
+                    Duration::from_secs(5),
+                    &readers.stdout,
+                    &mut scanned,
+                    &mut announced,
+                    watch,
+                )? {
                     status
                 } else {
                     kill_group(pid, libc::SIGKILL);
@@ -367,6 +416,8 @@ pub(super) fn capture(
         }
     };
     let (stdout, stderr) = finish_readers(readers);
+    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
+    publish_session(&stdout_text, &mut announced, watch);
     let mut code = public_code(python_status(status));
     let interrupted = INTERRUPTED.swap(0, Ordering::SeqCst);
     if interrupted != 0 {
@@ -377,10 +428,85 @@ pub(super) fn capture(
     }
     Ok(Captured {
         code,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
     })
+}
+
+/// Note a new session id on stderr the moment `watch` can see it.
+fn publish_session(
+    text: &str,
+    announced: &mut Option<String>,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+) {
+    for line in text.lines() {
+        note_session_line(line, announced, watch);
+    }
+    note_session_line("", announced, watch);
+}
+
+fn note_session_line(
+    line: &str,
+    announced: &mut Option<String>,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+) {
+    let Some(id) = watch(line) else {
+        return;
+    };
+    if announced.as_deref() == Some(id.as_str()) {
+        return;
+    }
+    write_stderr_line(&format!("SESSION_ID={id}"));
+    *announced = Some(id);
+}
+
+fn reap_watching(
+    child: &mut Child,
+    timeout: Duration,
+    stdout: &Mutex<Vec<u8>>,
+    scanned: &mut usize,
+    announced: &mut Option<String>,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+) -> io::Result<Option<ExitStatus>> {
+    let start = Instant::now();
+    loop {
+        drain_new_lines(stdout, scanned, announced, watch);
+        if let Some(status) = child.try_wait()? {
+            drain_new_lines(stdout, scanned, announced, watch);
+            return Ok(Some(status));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn drain_new_lines(
+    stdout: &Mutex<Vec<u8>>,
+    scanned: &mut usize,
+    announced: &mut Option<String>,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+) {
+    let fresh = {
+        let buf = stdout.lock().unwrap_or_else(|err| err.into_inner());
+        if buf.len() <= *scanned {
+            Vec::new()
+        } else {
+            buf[*scanned..].to_vec()
+        }
+    };
+    if let Some(end) = fresh.iter().rposition(|byte| *byte == b'\n') {
+        let complete = String::from_utf8_lossy(&fresh[..=end]);
+        *scanned += end + 1;
+        for line in complete.lines() {
+            note_session_line(line, announced, watch);
+        }
+    }
+    // Providers that learn the id from outside the stream (agy's conversation
+    // file) get a look even when the child is quiet.
+    note_session_line("", announced, watch);
 }
 
 pub(super) fn launch_or_note(result: io::Result<Captured>) -> Result<Captured, i32> {
@@ -391,6 +517,23 @@ pub(super) fn launch_or_note(result: io::Result<Captured>) -> Result<Captured, i
             Err(LAUNCH_EXIT)
         }
     }
+}
+
+struct Readers {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    handles: ReaderHandles,
+}
+
+enum ReaderHandles {
+    Pipes {
+        out: thread::JoinHandle<()>,
+        err: thread::JoinHandle<()>,
+    },
+    Pty {
+        out: thread::JoinHandle<()>,
+        stop: Arc<AtomicBool>,
+    },
 }
 
 fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Child, Readers)> {
@@ -425,9 +568,24 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
                     return Err(io::Error::other("missing stderr pipe"));
                 }
             };
-            let out = thread::spawn(move || read_pipe(stdout));
-            let err = thread::spawn(move || read_pipe(stderr));
-            Ok((child, Readers::Pipes { out, err }))
+            let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+            let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+            let out = thread::spawn({
+                let stdout_buf = Arc::clone(&stdout_buf);
+                move || read_pipe_into(stdout, &stdout_buf)
+            });
+            let err = thread::spawn({
+                let stderr_buf = Arc::clone(&stderr_buf);
+                move || read_pipe_into(stderr, &stderr_buf)
+            });
+            Ok((
+                child,
+                Readers {
+                    stdout: stdout_buf,
+                    stderr: stderr_buf,
+                    handles: ReaderHandles::Pipes { out, err },
+                },
+            ))
         }
         StdioKind::Pty => {
             let pty::PtyPair { master, slave } = pty::open_pty()?;
@@ -441,63 +599,78 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr));
             let child = cmd.spawn()?;
+            let stdout_buf = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let stop_reader = Arc::clone(&stop);
-            let out = thread::spawn(move || read_pty(master, stop_reader));
-            Ok((child, Readers::Pty { out, stop }))
+            let out = thread::spawn({
+                let stdout_buf = Arc::clone(&stdout_buf);
+                move || read_pty_into(master, stop_reader, &stdout_buf)
+            });
+            Ok((
+                child,
+                Readers {
+                    stdout: stdout_buf,
+                    stderr: Arc::new(Mutex::new(Vec::new())),
+                    handles: ReaderHandles::Pty { out, stop },
+                },
+            ))
         }
     }
-}
-
-enum Readers {
-    Pipes {
-        out: thread::JoinHandle<Vec<u8>>,
-        err: thread::JoinHandle<Vec<u8>>,
-    },
-    Pty {
-        out: thread::JoinHandle<Vec<u8>>,
-        stop: Arc<AtomicBool>,
-    },
 }
 
 fn finish_readers(readers: Readers) -> (Vec<u8>, Vec<u8>) {
-    match readers {
-        Readers::Pipes { out, err } => (
-            out.join().unwrap_or_default(),
-            err.join().unwrap_or_default(),
-        ),
-        Readers::Pty { out, stop } => {
+    match readers.handles {
+        ReaderHandles::Pipes { out, err } => {
+            let _ = out.join();
+            let _ = err.join();
+        }
+        ReaderHandles::Pty { out, stop } => {
             stop.store(true, Ordering::SeqCst);
-            (out.join().unwrap_or_default(), Vec::new())
+            let _ = out.join();
         }
     }
+    let stdout = readers
+        .stdout
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let stderr = readers
+        .stderr
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    (stdout, stderr)
 }
 
-fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
-    let mut buf = Vec::new();
+fn read_pipe_into(mut pipe: impl Read, dest: &Mutex<Vec<u8>>) {
     let mut tmp = [0u8; 8192];
     loop {
         match pipe.read(&mut tmp) {
             Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => dest
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .extend_from_slice(&tmp[..n]),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
-    buf
 }
 
-fn read_pty(master: OwnedFd, stop: Arc<AtomicBool>) -> Vec<u8> {
+fn read_pty_into(master: OwnedFd, stop: Arc<AtomicBool>, dest: &Mutex<Vec<u8>>) {
     if set_nonblock(&master).is_err() {
-        return read_pipe(File::from(master));
+        read_pipe_into(File::from(master), dest);
+        return;
     }
     let mut file = File::from(master);
-    let mut buf = Vec::new();
     let mut tmp = [0u8; 65536];
     loop {
         match file.read(&mut tmp) {
             Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Ok(n) => dest
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .extend_from_slice(&tmp[..n]),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 if stop.load(Ordering::Relaxed) {
@@ -508,20 +681,6 @@ fn read_pty(master: OwnedFd, stop: Arc<AtomicBool>) -> Vec<u8> {
             Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
             Err(_) => break,
         }
-    }
-    buf
-}
-
-fn reap_with_timeout(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if start.elapsed() >= timeout {
-            return Ok(None);
-        }
-        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -793,6 +952,7 @@ mod tests {
             StdioKind::Pty,
             KillStyle::TermThenKill,
             false,
+            &mut |_| None,
         )
         .expect("pty echo");
         assert!(!captured.timed_out);
@@ -813,6 +973,7 @@ mod tests {
             StdioKind::Piped,
             KillStyle::TermThenKill,
             false,
+            &mut |_| None,
         )
         .expect("sleep");
         assert!(captured.timed_out);

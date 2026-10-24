@@ -1,13 +1,16 @@
 //! Antigravity (`agy`) headless runner.
 //!
 //! `agy -p` drops stdout off a terminal, so the child is attached to a PTY.
-//! The parent never writes the prompt there. A headless tool denial exits 0;
+//! The parent never writes the prompt there. The conversation id is not in
+//! that transcript. It is the conversation file agy creates, and crew records
+//! it as soon as the file appears, including when the deadline kills the
+//! child. The partial transcript is kept. A headless tool denial exits 0;
 //! the em-dash sentence is what turns that into 125.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -42,6 +45,25 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         HashMap::new()
     };
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
+    let watch_home = home.clone();
+    let watch_before = before.clone();
+    let mut known = invocation.resume.clone().filter(|id| !id.is_empty());
+    let mut last_check = Instant::now() - Duration::from_secs(1);
+    let mut watch = move |_line: &str| -> Option<String> {
+        if known.is_some() {
+            return known.clone();
+        }
+        if last_check.elapsed() < Duration::from_millis(400) {
+            return None;
+        }
+        last_check = Instant::now();
+        let newest = newest_changed(
+            &watch_before,
+            &conv_snapshot(&watch_home.join("conversations")),
+        );
+        known = newest;
+        known.clone()
+    };
     let captured = match proc::launch_or_note(proc::capture(
         &argv,
         invocation.cwd.as_deref(),
@@ -49,32 +71,32 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         StdioKind::Pty,
         KillStyle::TermThenKill,
         false,
+        &mut watch,
     )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    // Our own deadline kills the group and drops the partial PTY transcript.
     // A child that exits by itself with "timeout waiting for response" still
-    // goes through present_gemini, which keeps that message.
-    let mut presented = if captured.timed_out {
-        let (_, before) = judge_gemini("", 124);
-        let before = if before.is_empty() {
-            format!(
-                "[crew] timed out after {}s\n",
-                proc::format_secs(invocation.timeout_secs)
-            )
+    // goes through present_gemini, which keeps that message. Our deadline
+    // does too: the transcript is the work the agent already did.
+    let mut presented = present_gemini(
+        &captured.stdout,
+        if captured.timed_out {
+            124
         } else {
-            before
-        };
-        proc::Report {
-            code: 124,
-            before_stderr: before,
-            stdout: String::new(),
-            after_stderr: String::new(),
+            captured.code
+        },
+    );
+    if captured.timed_out {
+        presented.code = 124;
+        let line = format!(
+            "[crew] timed out after {}s\n",
+            proc::format_secs(invocation.timeout_secs)
+        );
+        if !presented.before_stderr.contains("timed out after") {
+            presented.before_stderr.insert_str(0, &line);
         }
-    } else {
-        present_gemini(&captured.stdout, captured.code)
-    };
+    }
     let resume = invocation.resume.as_deref().filter(|id| !id.is_empty());
     let id = if resume.is_some() {
         pick_session(resume, None, None)

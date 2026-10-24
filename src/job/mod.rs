@@ -502,6 +502,13 @@ pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
 
     let output = tail_lines(&stderr_path, lines)?;
     print!("{}", output);
+    let stdout_path = run_dir(name).join("stdout");
+    if stdout_path.is_file()
+        && let Ok(kept) = tail_lines(&stdout_path, lines)
+        && !kept.trim().is_empty()
+    {
+        print!("{kept}");
+    }
     Ok(0)
 }
 

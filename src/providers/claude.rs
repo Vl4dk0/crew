@@ -1,7 +1,9 @@
 //! Claude Code headless runner.
 //!
-//! A denied tool still makes Claude exit 0. That becomes 125, because a caller
-//! checking the status would otherwise treat the denial as a finished answer.
+//! stream-json prints the session id on the init event, before the turn
+//! finishes, so a killed run can still be resumed. A denied tool still makes
+//! Claude exit 0. That becomes 125, because a caller checking the status
+//! would otherwise treat the denial as a finished answer.
 
 use serde_json::{Map, Value};
 
@@ -11,8 +13,8 @@ use crate::id::Provider;
 use crate::tier;
 
 use super::proc::{
-    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, format_secs,
-    looks_like_usage_limit, map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
+    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, looks_like_usage_limit,
+    map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -29,6 +31,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let (argv, note) = plan(invocation, &prompt, schema.as_deref())?;
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
+    let mut watch = |line: &str| proc::session_from_line(line);
     let captured = match proc::launch_or_note(proc::capture(
         &argv,
         invocation.cwd.as_deref(),
@@ -36,17 +39,11 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         StdioKind::Piped,
         KillStyle::TermThenKill,
         true,
+        &mut watch,
     )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    if captured.timed_out {
-        proc::write_stderr_line(&format!(
-            "[crew] timed out after {}s",
-            format_secs(invocation.timeout_secs)
-        ));
-        return Ok(124);
-    }
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
     let report = assess_claude(
         invocation.raw,
@@ -55,6 +52,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured.stdout,
         &captured.stderr,
     );
+    let report = proc::keep_timeout(report, captured.timed_out, invocation.timeout_secs);
     proc::emit_report(&report);
     Ok(report.code)
 }
@@ -96,10 +94,14 @@ pub(super) fn claude_argv(
     schema: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
     let (wire, note) = map_effort(Provider::Claude, Some(model), effort);
+    // stream-json refuses to start without --verbose, so the init event
+    // (and its session id) would never be printed.
     let mut argv = vec![
         "claude".to_string(),
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        "--include-partial-messages".to_string(),
+        "--verbose".to_string(),
         "--permission-prompts".to_string(),
         "none".to_string(),
     ];
@@ -126,6 +128,179 @@ pub(super) fn claude_argv(
 }
 
 pub(super) fn assess_claude(raw: bool, schema: bool, child: i32, out: &str, err: &str) -> Report {
+    if let Some(events) = claude_events(out) {
+        return assess_claude_events(raw, schema, child, out, err, &events);
+    }
+    assess_claude_object(raw, schema, child, out, err)
+}
+
+/// Lines the model has already streamed, when the buffer is not the final
+/// single JSON object. The init line's session id is enough to resume.
+fn claude_events(out: &str) -> Option<Vec<Value>> {
+    if let Ok(value) = serde_json::from_str::<Value>(out.trim())
+        && value.is_object()
+        && !is_live_claude_event(&value)
+    {
+        return None;
+    }
+    let mut events = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(out.trim())
+        && value.is_object()
+    {
+        events.push(value);
+        return Some(events);
+    }
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(line)
+            && value.is_object()
+        {
+            events.push(value);
+        }
+    }
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn is_live_claude_event(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+            "system"
+                | "assistant"
+                | "user"
+                | "stream_event"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_start"
+                | "message_delta"
+                | "message_stop"
+        )
+    )
+}
+
+fn assess_claude_events(
+    raw: bool,
+    schema: bool,
+    child: i32,
+    out: &str,
+    err: &str,
+    events: &[Value],
+) -> Report {
+    let mut session_id = None;
+    let mut result = None;
+    let mut deltas = String::new();
+    let mut assistant = String::new();
+    let mut saw_delta = false;
+    for event in events {
+        if session_id.is_none() {
+            session_id = proc::session_from_line(&event.to_string());
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("result") => result = Some(event),
+            Some("assistant") if !saw_delta => append_content_text(event, &mut assistant),
+            Some("stream_event" | "content_block_delta" | "message_delta")
+                if append_delta_text(event, &mut deltas) =>
+            {
+                saw_delta = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(result) = result {
+        let mut owned = result.clone();
+        if owned
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+            && let Some(id) = &session_id
+            && let Some(object) = owned.as_object_mut()
+        {
+            object.insert("session_id".to_string(), Value::String(id.clone()));
+        }
+        let rendered = serde_json::to_string(&owned).unwrap_or_default();
+        let mut report = assess_claude_object(raw, schema, child, &rendered, err);
+        if raw {
+            report.stdout = out.to_string();
+        }
+        return report;
+    }
+    let text = if saw_delta { deltas } else { assistant };
+    let mut before = String::new();
+    if !err.trim().is_empty() {
+        before.push_str(err);
+        if !err.ends_with('\n') {
+            before.push('\n');
+        }
+    }
+    let mut stdout = String::new();
+    if raw {
+        stdout.push_str(out);
+    } else if !text.trim().is_empty() {
+        stdout.push_str(text.trim_end());
+        stdout.push('\n');
+    }
+    let mut after = String::new();
+    if let Some(id) = session_id.filter(|id| !id.is_empty()) {
+        after.push_str(&format!("SESSION_ID={id}\n"));
+    }
+    report(child, before, stdout, after)
+}
+
+fn append_content_text(event: &Value, buf: &mut String) {
+    let Some(blocks) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str);
+        if matches!(kind, Some("text" | "thinking"))
+            && let Some(text) = block
+                .get("text")
+                .or_else(|| block.get("thinking"))
+                .and_then(Value::as_str)
+        {
+            buf.push_str(text);
+        }
+    }
+}
+
+fn append_delta_text(event: &Value, buf: &mut String) -> bool {
+    let delta = event
+        .get("delta")
+        .or_else(|| event.get("event").and_then(|inner| inner.get("delta")));
+    let Some(delta) = delta else {
+        return false;
+    };
+    let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(kind, "signature_delta" | "input_json_delta") {
+        return false;
+    }
+    // Thinking is the only text a run may have produced when the deadline
+    // hits before the answer. A later result event still replaces it.
+    let text = delta
+        .get("text")
+        .or_else(|| delta.get("thinking"))
+        .and_then(Value::as_str);
+    let Some(text) = text else {
+        return false;
+    };
+    buf.push_str(text);
+    true
+}
+
+fn assess_claude_object(raw: bool, schema: bool, child: i32, out: &str, err: &str) -> Report {
     let mut before = String::new();
     let mut stdout = String::new();
     if !err.trim().is_empty() {
@@ -347,7 +522,9 @@ mod tests {
             vec![
                 "claude",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--include-partial-messages",
+                "--verbose",
                 "--permission-prompts",
                 "none",
                 "--dangerously-skip-permissions",
@@ -415,6 +592,24 @@ mod tests {
             assess_claude(false, false, 1, plain, "").code,
             USAGE_LIMIT_EXIT
         );
+    }
+
+    #[test]
+    fn stream_keeps_the_session_and_partial_text() {
+        let out = "\
+{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-1\"}\n\
+{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"one\\n\"}},\"session_id\":\"sess-1\"}\n";
+        assert_eq!(
+            proc::session_from_line(out.lines().next().unwrap()).as_deref(),
+            Some("sess-1")
+        );
+        let report = assess_claude(false, false, 143, out, "");
+        assert!(report.after_stderr.contains("SESSION_ID=sess-1"));
+        assert!(report.stdout.contains("one"));
+        let report = proc::keep_timeout(report, true, 20.0);
+        assert_eq!(report.code, 124);
+        assert!(report.after_stderr.contains("timed out after 20s"));
+        assert!(report.stdout.contains("one"));
     }
 
     #[test]

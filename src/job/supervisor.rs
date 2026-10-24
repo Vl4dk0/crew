@@ -189,6 +189,8 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
             break;
         }
 
+        note_session(name, &mut record, &dir);
+
         match child.try_wait() {
             Ok(Some(status)) => {
                 let code = status
@@ -208,18 +210,34 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     record.finished_at = Some(current_iso_time());
     record.exit_code = exit_code;
 
-    // Scan stderr for SESSION_ID=<id>
-    if let Ok(stderr_content) = fs::read_to_string(dir.join("stderr")) {
-        for line in stderr_content.lines() {
-            if let Some(pos) = line.find("SESSION_ID=") {
-                let id = line[pos + 11..].trim().to_string();
-                if !id.is_empty() {
-                    record.session_id = Some(id);
-                }
-            }
-        }
-    }
+    // The id may have arrived while the child was being killed.
+    note_session(name, &mut record, &dir);
 
     save_record(name, &record)?;
     Ok(exit_code.unwrap_or(0))
+}
+
+/// Persist the session id as soon as the wrapper prints it. A supervisor
+/// that dies after that still leaves a resumable record.
+fn note_session(name: &str, record: &mut crate::job::models::RunRecord, dir: &Path) {
+    let Ok(stderr_content) = fs::read_to_string(dir.join("stderr")) else {
+        return;
+    };
+    let mut found = None;
+    for line in stderr_content.lines() {
+        if let Some(pos) = line.find("SESSION_ID=") {
+            let id = line[pos + "SESSION_ID=".len()..].trim();
+            if !id.is_empty() {
+                found = Some(id.to_string());
+            }
+        }
+    }
+    let Some(id) = found else {
+        return;
+    };
+    if record.session_id.as_deref() == Some(id.as_str()) {
+        return;
+    }
+    record.session_id = Some(id);
+    let _ = save_record(name, record);
 }

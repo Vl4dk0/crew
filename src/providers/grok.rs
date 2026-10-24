@@ -1,6 +1,8 @@
 //! Grok headless runner.
 //!
-//! A missing `stopReason` is a finished turn.
+//! streaming-messages-json prints the session id on the init line, before the
+//! turn finishes, so a killed run can still be resumed. A missing `stopReason`
+//! is a finished turn.
 
 use serde_json::Value;
 
@@ -10,8 +12,8 @@ use crate::id::Provider;
 use crate::tier;
 
 use super::proc::{
-    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, format_secs,
-    looks_like_usage_limit, map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
+    self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, looks_like_usage_limit,
+    map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -28,6 +30,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     let (argv, note) = plan(invocation, &prompt, schema.as_deref())?;
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
+    let mut watch = |line: &str| proc::session_from_line(line);
     let captured = match proc::launch_or_note(proc::capture(
         &argv,
         None,
@@ -35,17 +38,11 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         StdioKind::Piped,
         KillStyle::TermThenKill,
         true,
+        &mut watch,
     )) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    if captured.timed_out {
-        proc::write_stderr_line(&format!(
-            "[crew] timed out after {}s",
-            format_secs(invocation.timeout_secs)
-        ));
-        return Ok(124);
-    }
     let schema_set = schema.as_ref().is_some_and(|text| !text.is_empty());
     let report = assess_grok(
         invocation.raw,
@@ -54,6 +51,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured.stdout,
         &captured.stderr,
     );
+    let report = proc::keep_timeout(report, captured.timed_out, invocation.timeout_secs);
     proc::emit_report(&report);
     Ok(report.code)
 }
@@ -97,7 +95,8 @@ pub(super) fn grok_argv(
         prompt.to_string(),
         "--no-auto-update".to_string(),
         "--output-format".to_string(),
-        "json".to_string(),
+        "streaming-messages-json".to_string(),
+        "--include-partial-messages".to_string(),
         "--always-approve".to_string(),
     ];
     if let Some(model) = model {
@@ -131,8 +130,18 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
         if !err.trim().is_empty() {
             after.push_str(err);
         }
+        if let Some(id) = first_session(out) {
+            after.push_str(&format!("SESSION_ID={id}\n"));
+        }
         return report(child, String::new(), out.to_string(), after);
     }
+    let folded;
+    let out = if let Some(object) = fold_grok_stream(out) {
+        folded = object;
+        folded.as_str()
+    } else {
+        out
+    };
     let data = if out.trim().is_empty() {
         Value::Object(serde_json::Map::new())
     } else {
@@ -218,6 +227,178 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
         after.push_str(err);
     }
     report(child, String::new(), stdout, after)
+}
+
+/// NDJSON from streaming-messages-json, reduced to the single object
+/// `assess_grok` already understands. A finished `--output-format json`
+/// document is left alone.
+fn first_session(out: &str) -> Option<String> {
+    proc::session_from_line(out).or_else(|| out.lines().find_map(proc::session_from_line))
+}
+
+fn fold_grok_stream(out: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(out.trim())
+        && value.is_object()
+        && !is_live_grok_event(&value)
+    {
+        return None;
+    }
+    let mut events = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(out.trim())
+        && value.is_object()
+    {
+        events.push(value);
+    } else {
+        for line in out.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(line)
+                && value.is_object()
+            {
+                events.push(value);
+            }
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    let mut session_id = None;
+    let mut result = None;
+    let mut error = None;
+    let mut deltas = String::new();
+    let mut assistant = String::new();
+    let mut saw_delta = false;
+    for event in &events {
+        if session_id.is_none() {
+            session_id = proc::session_from_line(&event.to_string());
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("result") => result = Some(event),
+            Some("error") => error = Some(event),
+            Some("assistant") if !saw_delta => append_grok_text(event, &mut assistant),
+            Some("text" | "thought") => {
+                if let Some(text) = event.get("data").and_then(Value::as_str) {
+                    deltas.push_str(text);
+                    saw_delta = true;
+                }
+            }
+            Some("stream_event" | "content_block_delta" | "message_delta")
+                if append_grok_delta(event, &mut deltas) =>
+            {
+                saw_delta = true;
+            }
+            _ => {}
+        }
+    }
+    let mut object = serde_json::Map::new();
+    if let Some(id) = session_id {
+        object.insert("sessionId".to_string(), Value::String(id));
+    }
+    if let Some(result) = result {
+        if let Some(text) = result.get("result").and_then(Value::as_str) {
+            object.insert("text".to_string(), Value::String(text.to_string()));
+        }
+        if let Some(stop) = result.get("stop_reason").and_then(Value::as_str) {
+            object.insert("stopReason".to_string(), Value::String(stop.to_string()));
+        }
+        if let Some(usage) = result.get("usage") {
+            object.insert("usage".to_string(), usage.clone());
+        }
+        if let Some(turns) = result.get("num_turns") {
+            object.insert("num_turns".to_string(), turns.clone());
+        }
+        if let Some(cost) = result.get("total_cost_usd") {
+            object.insert("total_cost_usd".to_string(), cost.clone());
+        }
+        if let Some(structured) = result.get("structured_output") {
+            object.insert("structuredOutput".to_string(), structured.clone());
+        }
+        if result.get("subtype").and_then(Value::as_str) == Some("error_max_turns") {
+            object.insert(
+                "stopReason".to_string(),
+                Value::String("max_turns".to_string()),
+            );
+        }
+    } else if let Some(error) = error {
+        object.insert("type".to_string(), Value::String("error".to_string()));
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        object.insert("message".to_string(), Value::String(message));
+    } else {
+        let text = if saw_delta { deltas } else { assistant };
+        object.insert("text".to_string(), Value::String(text));
+    }
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
+fn is_live_grok_event(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+            "system"
+                | "assistant"
+                | "user"
+                | "stream_event"
+                | "text"
+                | "thought"
+                | "content_block_start"
+                | "content_block_delta"
+                | "content_block_stop"
+                | "message_start"
+                | "message_delta"
+                | "message_stop"
+        )
+    )
+}
+
+fn append_grok_text(event: &Value, buf: &mut String) {
+    let Some(blocks) = event
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for block in blocks {
+        let kind = block.get("type").and_then(Value::as_str);
+        if matches!(kind, Some("text" | "thinking"))
+            && let Some(text) = block
+                .get("text")
+                .or_else(|| block.get("thinking"))
+                .and_then(Value::as_str)
+        {
+            buf.push_str(text);
+        }
+    }
+}
+
+fn append_grok_delta(event: &Value, buf: &mut String) -> bool {
+    let delta = event
+        .get("delta")
+        .or_else(|| event.get("event").and_then(|inner| inner.get("delta")));
+    let Some(delta) = delta else {
+        return false;
+    };
+    let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(kind, "signature_delta" | "input_json_delta") {
+        return false;
+    }
+    // Thinking is the only text a run may have produced when the deadline
+    // hits before the answer. A later result event still replaces it.
+    let text = delta
+        .get("text")
+        .or_else(|| delta.get("thinking"))
+        .and_then(Value::as_str);
+    let Some(text) = text else {
+        return false;
+    };
+    buf.push_str(text);
+    true
 }
 
 fn stop_reason(data: &Value) -> Option<String> {
@@ -359,6 +540,21 @@ mod tests {
         assert_eq!(assess_grok(false, false, 4, error, "").code, 4);
         assert_eq!(assess_grok(false, false, 0, "", "").code, 0);
         assert_eq!(assess_grok(true, false, 0, cancelled, "").code, 0);
+    }
+
+    #[test]
+    fn stream_keeps_the_session_and_partial_text() {
+        let out = "\
+{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n\
+{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm \"}}}\n\
+{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}}\n";
+        let report = assess_grok(false, false, 143, out, "");
+        assert!(report.after_stderr.contains("SESSION_ID=s1"));
+        assert_eq!(report.stdout, "hmm hello\n");
+        let report = proc::keep_timeout(report, true, 20.0);
+        assert_eq!(report.code, 124);
+        assert!(report.after_stderr.contains("timed out after 20s"));
+        assert_eq!(report.stdout, "hmm hello\n");
     }
 
     #[test]

@@ -248,7 +248,7 @@ struct SharedArgs {
     /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5).
     #[arg(short = 'e', long)]
     effort: Option<String>,
-    /// Seconds before the process group is killed. Default 1800. Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds, and the partial output is dropped.
+    /// Seconds before the process group is killed. Default 1800. Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds. Output already produced is kept. The exit code is 124.
     #[arg(short = 't', long, default_value_t = 1800.0)]
     timeout: f64,
     /// Working directory for the child. Maps to the CLI's own cwd flag where it has one.
@@ -351,7 +351,7 @@ enum JobCommand {
     },
     #[command(
         about = "Print the tail of a job's stderr",
-        long_about = "Stderr holds the session id line and crew's own notes. Default is 20 lines.",
+        long_about = "Stderr holds the session id line and crew's own notes. Stdout already produced follows, including after a timeout. Default is 20 lines of each.",
         after_long_help = "Examples:\n  crew job log demo\n  crew job log demo -n 50"
     )]
     Log {
