@@ -176,55 +176,135 @@ pub(crate) fn parse_codex_rate_limit(resp: &Value) -> Vec<Gauge> {
     windows
 }
 
-fn fetch_codex() -> ProviderView {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = Path::new(&home).join(".codex/auth.json");
+/// Resolve local Codex credentials from auth.json in the user's home directory.
+/// Missing credential file or empty access token proves the user is not logged in.
+fn codex_token(home: &Path) -> Result<(String, Option<String>), &'static str> {
+    let auth_path = home.join(".codex/auth.json");
+    if !auth_path.is_file() {
+        return Err("not logged in");
+    }
+    let content = fs::read_to_string(&auth_path).map_err(|_| "not logged in")?;
+    let val: Value = serde_json::from_str(&content).map_err(|_| "not logged in")?;
+    let token = val["tokens"]["access_token"]
+        .as_str()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or("not logged in")?
+        .to_string();
+    let account_id = val["tokens"]["account_id"]
+        .as_str()
+        .filter(|a| !a.trim().is_empty())
+        .map(str::to_string);
+    Ok((token, account_id))
+}
 
-    let mut token: Option<String> = None;
-    let mut account_id: Option<String> = None;
-
-    if auth_path.is_file() {
-        if let Ok(content) = fs::read_to_string(&auth_path) {
-            if let Ok(val) = serde_json::from_str::<Value>(&content) {
-                if let Some(t) = val["tokens"]["access_token"].as_str() {
-                    token = Some(t.to_string());
-                }
-                if let Some(acc) = val["tokens"]["account_id"].as_str() {
-                    account_id = Some(acc.to_string());
-                }
+/// Identify authentication rejections from API response bodies so an expired
+/// or revoked session is reported as unauthenticated rather than a generic load failure.
+pub(crate) fn is_http_auth_error(resp: &Value) -> bool {
+    if let Some(err) = resp.get("error") {
+        if let Some(code) = err.get("code").and_then(Value::as_str) {
+            let c = code.to_ascii_lowercase();
+            if c == "invalid_api_key" || c == "token_expired" || c == "unauthorized" {
+                return true;
+            }
+        }
+        if let Some(msg) = err.get("message").and_then(Value::as_str) {
+            let m = msg.to_ascii_lowercase();
+            if m.contains("unauthorized")
+                || m.contains("unauthenticated")
+                || m.contains("not logged in")
+                || m.contains("token")
+                || m.contains("auth")
+            {
+                return true;
+            }
+        }
+        if let Some(msg) = err.as_str() {
+            let m = msg.to_ascii_lowercase();
+            if m.contains("unauthorized") || m.contains("unauthenticated") || m.contains("auth") {
+                return true;
             }
         }
     }
+    if let Some(detail) = resp.get("detail").and_then(Value::as_str) {
+        let d = detail.to_ascii_lowercase();
+        if d.contains("unauthorized")
+            || d.contains("unauthenticated")
+            || d.contains("credentials")
+            || d.contains("auth")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn fetch_codex() -> ProviderView {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (tok, account_id) = match codex_token(&home) {
+        Ok(creds) => creds,
+        Err(err) => {
+            return ProviderView {
+                key: "codex".to_string(),
+                name: "codex".to_string(),
+                mark: "⚛".to_string(),
+                plan: None,
+                windows: Vec::new(),
+                error: Some(err.to_string()),
+            };
+        }
+    };
+
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s")
+        .arg("-m")
+        .arg("10")
+        .arg("-w")
+        .arg("\n%{http_code}")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {}", tok))
+        .arg("-H")
+        .arg("User-Agent: UsageBar")
+        .arg("-H")
+        .arg("Content-Type: application/json");
+    if let Some(ref acc) = account_id {
+        cmd.arg("-H").arg(format!("ChatGPT-Account-Id: {}", acc));
+    }
+    cmd.arg("https://chatgpt.com/backend-api/wham/usage");
 
     let mut windows = Vec::new();
     let mut error = None;
 
-    if let Some(ref tok) = token {
-        let mut cmd = Command::new("curl");
-        cmd.arg("-s")
-            .arg("-m")
-            .arg("10")
-            .arg("-H")
-            .arg(format!("Authorization: Bearer {}", tok))
-            .arg("-H")
-            .arg("User-Agent: UsageBar")
-            .arg("-H")
-            .arg("Content-Type: application/json");
-        if let Some(ref acc) = account_id {
-            cmd.arg("-H").arg(format!("ChatGPT-Account-Id: {}", acc));
-        }
-        cmd.arg("https://chatgpt.com/backend-api/wham/usage");
+    if let Ok(out) = cmd.output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.trim().lines().collect();
+        let (body, code) = if lines.len() >= 2 {
+            let code: u16 = lines.last().unwrap().parse().unwrap_or(0);
+            let body = lines[..lines.len() - 1].join("\n");
+            (body, code)
+        } else {
+            (
+                text.into_owned(),
+                if out.status.success() { 200 } else { 0 },
+            )
+        };
 
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                if let Ok(resp) = serde_json::from_slice::<Value>(&out.stdout) {
-                    windows = parse_codex_rate_limit(&resp);
+        if code == 401 || code == 403 {
+            error = Some("not logged in".to_string());
+        } else if let Ok(resp) = serde_json::from_str::<Value>(&body) {
+            if is_http_auth_error(&resp) {
+                error = Some("not logged in".to_string());
+            } else {
+                windows = parse_codex_rate_limit(&resp);
+                if windows.is_empty() {
+                    error = Some("failed to load usage".to_string());
                 }
             }
+        } else {
+            error = Some("failed to load usage".to_string());
         }
-    }
-
-    if windows.is_empty() {
+    } else {
         error = Some("failed to load usage".to_string());
     }
 
@@ -238,7 +318,66 @@ fn fetch_codex() -> ProviderView {
     }
 }
 
+/// Check if antigravity OAuth credentials exist locally before invoking `agy`.
+/// Invoking `agy` without credentials initiates an interactive browser login.
+fn gemini_has_credentials(home: &Path) -> bool {
+    let auth_path = home.join(".gemini/oauth_creds.json");
+    if !auth_path.is_file() {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(&auth_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let access = val.get("access_token").and_then(Value::as_str);
+    let refresh = val.get("refresh_token").and_then(Value::as_str);
+    access.is_some_and(|s| !s.trim().is_empty()) || refresh.is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Detect if antigravity reports an authentication error or unauthenticated status.
+pub(crate) fn is_gemini_unauthenticated(resp: &Value) -> bool {
+    if let Some(err) = resp.get("error") {
+        if let Some(code) = err.get("code").and_then(Value::as_i64) {
+            if code == 401 || code == 403 {
+                return true;
+            }
+        }
+        if let Some(msg) = err.get("message").and_then(Value::as_str) {
+            let m = msg.to_ascii_lowercase();
+            if m.contains("unauthenticated")
+                || m.contains("unauthorized")
+                || m.contains("not logged in")
+                || m.contains("login")
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(status) = resp.get("status").and_then(Value::as_str) {
+        if status == "UNAUTHENTICATED" || status == "PERMISSION_DENIED" {
+            return true;
+        }
+    }
+    false
+}
+
 fn fetch_gemini() -> ProviderView {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if !gemini_has_credentials(&home) {
+        return ProviderView {
+            key: "gemini".to_string(),
+            name: "antigravity".to_string(),
+            mark: "✦".to_string(),
+            plan: None,
+            windows: Vec::new(),
+            error: Some("not logged in".to_string()),
+        };
+    }
+
     let cache_file = state_dir().join("antigravity_cache.json");
     let mut raw_json: Option<Value> = None;
 
@@ -282,6 +421,16 @@ fn fetch_gemini() -> ProviderView {
 
             if let Ok(output) = run_on_pty(cmd, Duration::from_secs(25)) {
                 if let Ok(parsed) = serde_json::from_slice::<Value>(&output) {
+                    if is_gemini_unauthenticated(&parsed) {
+                        return ProviderView {
+                            key: "gemini".to_string(),
+                            name: "antigravity".to_string(),
+                            mark: "✦".to_string(),
+                            plan: None,
+                            windows: Vec::new(),
+                            error: Some("not logged in".to_string()),
+                        };
+                    }
                     let _ = fs::write(&cache_file, &output);
                     raw_json = Some(parsed);
                 }
@@ -376,19 +525,22 @@ fn fetch_gemini() -> ProviderView {
     }
 }
 
-fn fetch_grok() -> ProviderView {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let auth_path = Path::new(&home).join(".grok/auth.json");
+/// Extract valid Grok OIDC credentials from auth.json in the user's home directory.
+/// Missing credential file or absent OIDC token means the CLI is not authenticated.
+fn grok_token(home: &Path) -> Result<(String, Option<String>), &'static str> {
+    let auth_path = home.join(".grok/auth.json");
+    if !auth_path.is_file() {
+        return Err("not logged in");
+    }
+    let content = fs::read_to_string(&auth_path).map_err(|_| "not logged in")?;
+    let data: Value = serde_json::from_str(&content).map_err(|_| "not logged in")?;
+    let obj = data.as_object().ok_or("not logged in")?;
 
-    let extract_token = || -> Option<(String, Option<String>)> {
-        let content = fs::read_to_string(&auth_path).ok()?;
-        let data: Value = serde_json::from_str(&content).ok()?;
-        let obj = data.as_object()?;
-
-        let mut best: Option<(String, String)> = None;
-        for entry in obj.values() {
-            if entry.get("auth_mode").and_then(|m| m.as_str()) == Some("oidc") {
-                if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
+    let mut best: Option<(String, String)> = None;
+    for entry in obj.values() {
+        if entry.get("auth_mode").and_then(|m| m.as_str()) == Some("oidc") {
+            if let Some(key) = entry.get("key").and_then(|k| k.as_str()) {
+                if !key.trim().is_empty() {
                     let exp = entry
                         .get("expires_at")
                         .and_then(|e| e.as_str())
@@ -400,11 +552,29 @@ fn fetch_grok() -> ProviderView {
                 }
             }
         }
+    }
 
-        best.map(|(k, e)| {
-            let exp_opt = if e.is_empty() { None } else { Some(e) };
-            (k, exp_opt)
-        })
+    let (k, e) = best.ok_or("not logged in")?;
+    let exp_opt = if e.is_empty() { None } else { Some(e) };
+    Ok((k, exp_opt))
+}
+
+fn fetch_grok() -> ProviderView {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut token_info = match grok_token(&home) {
+        Ok(creds) => Some(creds),
+        Err(err) => {
+            return ProviderView {
+                key: "grok".to_string(),
+                name: "grok".to_string(),
+                mark: "✕".to_string(),
+                plan: None,
+                windows: Vec::new(),
+                error: Some(err.to_string()),
+            };
+        }
     };
 
     let refresh_grok = || {
@@ -416,77 +586,97 @@ fn fetch_grok() -> ProviderView {
             .output();
     };
 
-    let mut token_info = extract_token();
-
     // Check expiry (< 120s)
     if let Some((_, Some(ref exp_str))) = token_info {
         if let Some(exp_time) = crate::job::parse_iso_time(exp_str) {
             if let Ok(remaining) = exp_time.duration_since(SystemTime::now()) {
                 if remaining < Duration::from_secs(120) {
                     refresh_grok();
-                    token_info = extract_token();
+                    token_info = grok_token(&home).ok();
                 }
             } else {
                 // Already expired
                 refresh_grok();
-                token_info = extract_token();
+                token_info = grok_token(&home).ok();
             }
         }
     }
 
+    let Some((tok, _)) = token_info else {
+        return ProviderView {
+            key: "grok".to_string(),
+            name: "grok".to_string(),
+            mark: "✕".to_string(),
+            plan: None,
+            windows: Vec::new(),
+            error: Some("not logged in".to_string()),
+        };
+    };
+
+    let query_api = |token: &str, query: &str| -> Result<(Value, u16), ()> {
+        let url = format!("https://cli-chat-proxy.grok.com/v1/billing{}", query);
+        let out = Command::new("curl")
+            .arg("-s")
+            .arg("-m")
+            .arg("10")
+            .arg("-w")
+            .arg("\n%{http_code}")
+            .arg("-H")
+            .arg(format!("Authorization: Bearer {}", token))
+            .arg("-H")
+            .arg("X-XAI-Token-Auth: xai-grok-cli")
+            .arg(&url)
+            .output();
+
+        if let Ok(res) = out {
+            let text = String::from_utf8_lossy(&res.stdout);
+            let lines: Vec<&str> = text.trim().lines().collect();
+            if lines.len() >= 2 {
+                let code: u16 = lines.last().unwrap().parse().unwrap_or(0);
+                let body = lines[..lines.len() - 1].join("\n");
+                if let Ok(val) = serde_json::from_str::<Value>(&body) {
+                    return Ok((val, code));
+                }
+            }
+        }
+        Err(())
+    };
+
+    let mut weekly_res = query_api(&tok, "?format=credits");
+    let effective_tok = if let Ok((_, code)) = weekly_res {
+        if code == 401 || code == 403 {
+            refresh_grok();
+            grok_token(&home)
+                .map(|(t, _)| t)
+                .unwrap_or_else(|_| tok.clone())
+        } else {
+            tok.clone()
+        }
+    } else {
+        tok.clone()
+    };
+
+    if effective_tok != tok {
+        weekly_res = query_api(&effective_tok, "?format=credits");
+    }
+
+    let monthly_res = query_api(&effective_tok, "");
+
     let mut windows = Vec::new();
     let mut error = None;
 
-    if let Some((tok, _)) = token_info {
-        let query_api = |token: &str, query: &str| -> Result<(Value, u16), ()> {
-            let url = format!("https://cli-chat-proxy.grok.com/v1/billing{}", query);
-            let out = Command::new("curl")
-                .arg("-s")
-                .arg("-m")
-                .arg("10")
-                .arg("-w")
-                .arg("\n%{http_code}")
-                .arg("-H")
-                .arg(format!("Authorization: Bearer {}", token))
-                .arg("-H")
-                .arg("X-XAI-Token-Auth: xai-grok-cli")
-                .arg(&url)
-                .output();
+    let unauthenticated = matches!(weekly_res, Ok((_, 401 | 403)))
+        || matches!(monthly_res, Ok((_, 401 | 403)))
+        || weekly_res
+            .as_ref()
+            .is_ok_and(|(v, _)| is_http_auth_error(v))
+        || monthly_res
+            .as_ref()
+            .is_ok_and(|(v, _)| is_http_auth_error(v));
 
-            if let Ok(res) = out {
-                let text = String::from_utf8_lossy(&res.stdout);
-                let lines: Vec<&str> = text.trim().lines().collect();
-                if lines.len() >= 2 {
-                    let code: u16 = lines.last().unwrap().parse().unwrap_or(0);
-                    let body = lines[..lines.len() - 1].join("\n");
-                    if let Ok(val) = serde_json::from_str::<Value>(&body) {
-                        return Ok((val, code));
-                    }
-                }
-            }
-            Err(())
-        };
-
-        let mut weekly_res = query_api(&tok, "?format=credits");
-        let effective_tok = if let Ok((_, code)) = weekly_res {
-            if code == 401 || code == 403 {
-                refresh_grok();
-                extract_token()
-                    .map(|(t, _)| t)
-                    .unwrap_or_else(|| tok.clone())
-            } else {
-                tok.clone()
-            }
-        } else {
-            tok.clone()
-        };
-
-        if effective_tok != tok {
-            weekly_res = query_api(&effective_tok, "?format=credits");
-        }
-
-        let monthly_res = query_api(&effective_tok, "");
-
+    if unauthenticated {
+        error = Some("not logged in".to_string());
+    } else {
         let mut weekly_cfg: Option<Value> = None;
         if let Ok((weekly_val, _)) = weekly_res {
             let cfg = weekly_val.get("config").unwrap_or(&weekly_val).clone();
@@ -660,6 +850,62 @@ fn period_window_secs(start: Option<&str>, end: Option<&str>, weekly: bool) -> O
     if weekly { Some(7 * 24 * 3600) } else { None }
 }
 
+/// Check if local Claude configuration exists in the user's home directory.
+fn claude_has_credentials(home: &Path) -> bool {
+    let auth_path = home.join(".claude.json");
+    if !auth_path.is_file() {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(&auth_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    val.get("oauthAccount").is_some_and(|v| v.is_object())
+}
+
+/// Detect if the Claude probe stream-json response indicates an unauthenticated session.
+pub(crate) fn claude_probe_says_no_auth(val: &Value) -> bool {
+    if val["type"] == "control_response" {
+        let resp = &val["response"];
+        if resp["subtype"] == "error" {
+            let msg = resp["error"].as_str().unwrap_or("");
+            let m = msg.to_ascii_lowercase();
+            if m.is_empty()
+                || m.contains("auth")
+                || m.contains("login")
+                || m.contains("logged in")
+                || m.contains("unauthorized")
+                || m.contains("token")
+                || m.contains("credential")
+            {
+                return true;
+            }
+        }
+    }
+    if val["type"] == "error" {
+        let msg = val["error"]["message"]
+            .as_str()
+            .or_else(|| val["error"].as_str())
+            .unwrap_or("");
+        let m = msg.to_ascii_lowercase();
+        if m.contains("auth")
+            || m.contains("login")
+            || m.contains("logged in")
+            || m.contains("unauthorized")
+            || m.contains("token")
+            || m.contains("credential")
+        {
+            return true;
+        }
+    }
+    if val.get("loggedIn") == Some(&Value::Bool(false)) {
+        return true;
+    }
+    false
+}
+
 /// Claude Code answers `get_usage` on its stream-json control channel with the
 /// exact utilization and an ISO `resets_at` per quota window, which the
 /// `/usage` screen only shows as prose. That timestamp is what makes the
@@ -719,6 +965,10 @@ fn run_claude_usage_probe() -> Result<Vec<Gauge>, Error> {
                     let _ = tx.send(val);
                     return;
                 }
+                if claude_probe_says_no_auth(&val) {
+                    let _ = tx.send(val);
+                    return;
+                }
             }
         }
     });
@@ -731,7 +981,12 @@ fn run_claude_usage_probe() -> Result<Vec<Gauge>, Error> {
     let _ = child.kill();
     let _ = child.wait();
 
-    let gauges = parse_claude_usage(&reply?["response"]["response"]);
+    let reply = reply?;
+    if claude_probe_says_no_auth(&reply) {
+        return Err(Error::new(2, "not logged in"));
+    }
+
+    let gauges = parse_claude_usage(&reply["response"]["response"]);
     if gauges.is_empty() {
         Err(Error::new(2, "claude probe returned no rate limits"))
     } else {
@@ -774,9 +1029,30 @@ fn parse_claude_usage(usage: &Value) -> Vec<Gauge> {
 }
 
 fn fetch_claude() -> ProviderView {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    if !claude_has_credentials(&home) {
+        return ProviderView {
+            key: "claude".to_string(),
+            name: "claude".to_string(),
+            mark: "✳".to_string(),
+            plan: None,
+            windows: Vec::new(),
+            error: Some("not logged in".to_string()),
+        };
+    }
+
     let (windows, error) = match run_claude_usage_probe() {
         Ok(windows) => (windows, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
+        Err(e) => {
+            let msg = if e.message == "not logged in" {
+                "not logged in".to_string()
+            } else {
+                e.to_string()
+            };
+            (Vec::new(), Some(msg))
+        }
     };
 
     ProviderView {
@@ -791,8 +1067,24 @@ fn fetch_claude() -> ProviderView {
 
 /// Plan and quota bars. Never log credential values.
 pub fn print_usage() -> Result<i32, Error> {
-    let mut views = vec![fetch_claude(), fetch_gemini(), fetch_codex(), fetch_grok()];
+    let mut views = Vec::new();
+    if crate::providers::binary_on_path("claude") {
+        views.push(fetch_claude());
+    }
+    if crate::providers::binary_on_path("agy") {
+        views.push(fetch_gemini());
+    }
+    if crate::providers::binary_on_path("codex") {
+        views.push(fetch_codex());
+    }
+    if crate::providers::binary_on_path("grok") {
+        views.push(fetch_grok());
+    }
+
     for view in &mut views {
+        if view.error.as_deref() == Some("not logged in") {
+            continue;
+        }
         let signal = match view.key.as_str() {
             "claude" => plan::detect_claude(),
             "grok" => plan::detect_grok(),
@@ -933,5 +1225,89 @@ else:
             || state.starts_with('U')
             || state.starts_with('I');
         assert!(!running, "grandchild {pid} still running (state {state:?})");
+    }
+
+    #[test]
+    fn test_not_logged_in_fixtures() {
+        // Missing credential files and missing tokens must evaluate to not logged in
+        let temp = std::env::temp_dir().join(format!("crew-auth-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        assert_eq!(super::codex_token(&temp), Err("not logged in"));
+        assert_eq!(super::grok_token(&temp), Err("not logged in"));
+        assert!(!super::gemini_has_credentials(&temp));
+        assert!(!super::claude_has_credentials(&temp));
+
+        // Empty token files must also report not logged in
+        let codex_dir = temp.join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("auth.json"),
+            r#"{"tokens":{"access_token":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::codex_token(&temp), Err("not logged in"));
+
+        let grok_dir = temp.join(".grok");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+        std::fs::write(
+            grok_dir.join("auth.json"),
+            r#"{"default":{"auth_mode":"api_key"}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::grok_token(&temp), Err("not logged in"));
+
+        let gemini_dir = temp.join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(
+            gemini_dir.join("oauth_creds.json"),
+            r#"{"access_token":""}"#,
+        )
+        .unwrap();
+        assert!(!super::gemini_has_credentials(&temp));
+
+        std::fs::write(temp.join(".claude.json"), r#"{"numStartups":1}"#).unwrap();
+        assert!(!super::claude_has_credentials(&temp));
+
+        let _ = std::fs::remove_dir_all(&temp);
+
+        // HTTP 401/403 and auth error bodies must be recognized as unauthenticated
+        let auth_error = serde_json::json!({
+            "error": { "code": "invalid_api_key", "message": "Invalid API key provided" }
+        });
+        assert!(super::is_http_auth_error(&auth_error));
+        let detail_error = serde_json::json!({
+            "detail": "Authentication credentials were not provided."
+        });
+        assert!(super::is_http_auth_error(&detail_error));
+        let normal_response = serde_json::json!({ "rate_limit": {} });
+        assert!(!super::is_http_auth_error(&normal_response));
+
+        // Claude probe stream-json output indicating unauthenticated
+        let claude_auth_err = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "request_id": "usage",
+                "subtype": "error",
+                "error": "User is not authenticated. Please run claude login."
+            }
+        });
+        assert!(super::claude_probe_says_no_auth(&claude_auth_err));
+        let claude_logged_in_false = serde_json::json!({ "loggedIn": false });
+        assert!(super::claude_probe_says_no_auth(&claude_logged_in_false));
+        let claude_ok = serde_json::json!({
+            "type": "control_response",
+            "response": { "request_id": "usage", "subtype": "success" }
+        });
+        assert!(!super::claude_probe_says_no_auth(&claude_ok));
+
+        // Gemini unauthenticated responses
+        let gemini_auth_err = serde_json::json!({
+            "error": { "code": 401, "message": "Request had invalid authentication credentials" }
+        });
+        assert!(super::is_gemini_unauthenticated(&gemini_auth_err));
+        let gemini_ok = serde_json::json!({ "groups": [] });
+        assert!(!super::is_gemini_unauthenticated(&gemini_ok));
     }
 }

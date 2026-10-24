@@ -64,15 +64,18 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         known = newest;
         known.clone()
     };
-    let captured = match proc::launch_or_note(proc::capture(
-        &argv,
-        invocation.cwd.as_deref(),
-        timeout,
-        StdioKind::Pty,
-        KillStyle::TermThenKill,
-        false,
-        &mut watch,
-    )) {
+    let captured = match proc::launch_or_note(
+        "agy",
+        proc::capture(
+            &argv,
+            invocation.cwd.as_deref(),
+            timeout,
+            StdioKind::Pty,
+            KillStyle::TermThenKill,
+            false,
+            &mut watch,
+        ),
+    ) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
