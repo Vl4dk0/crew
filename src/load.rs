@@ -43,6 +43,20 @@ fn run_cmd(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// The `ps` view `crew load` counts from. Update uses the same snapshot so
+/// "running" means the same processes the load line would list.
+fn process_snapshot() -> (HashMap<u32, ProcessRecord>, f64) {
+    let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
+    parse_ps_snapshot(&ps_output)
+}
+
+/// Agents `crew load` would list. Replacing a binary under one of these
+/// processes can break that run, so update refuses the provider.
+pub fn running_agents() -> HashMap<&'static str, Vec<u32>> {
+    let (processes, _) = process_snapshot();
+    find_agent_pids(&processes)
+}
+
 /// Parse process snapshot from `ps -axww -o pid=,ppid=,%cpu=,command=`.
 pub fn parse_ps_snapshot(output: &str) -> (HashMap<u32, ProcessRecord>, f64) {
     let mut processes = HashMap::new();
@@ -364,8 +378,7 @@ pub fn format_provider_lines(agent_pids: &HashMap<&'static str, Vec<u32>>) -> Ve
 
 /// Print the machine line, then the provider lines for agents that are running.
 pub fn print_load() -> Result<i32, Error> {
-    let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
-    let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
+    let (processes, cpu_sum) = process_snapshot();
     let metrics = collect_metrics(cpu_sum, !processes.is_empty());
 
     println!("{}", format_load_line(&metrics));

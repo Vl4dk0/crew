@@ -34,7 +34,8 @@ use crate::tier::{self, Tier};
         \n\
         Machine\n  \
         load      CPU, memory, GPU, and running agents per provider\n  \
-        usage     plans, quota bars, resets\n\
+        usage     plans, quota bars, resets\n  \
+        update    each CLI's own updater; skips a provider with running agents\n\
         \n\
         Config\n  \
         models    the tier table",
@@ -44,7 +45,8 @@ use crate::tier::{self, Tier};
         crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
         crew job wait demo\n  \
         crew load\n  \
-        crew usage",
+        crew usage\n  \
+        crew update",
     arg_required_else_help = true,
     disable_help_subcommand = false
 )]
@@ -153,6 +155,15 @@ enum Command {
         after_long_help = "Examples:\n  crew usage"
     )]
     Usage,
+    #[command(
+        about = "Update each harness CLI, skipping providers with running agents",
+        long_about = "Run each CLI's own updater: `claude update`, `codex update`, \
+            `grok update`, and `agy update`. A missing binary is reported and \
+            skipped. A provider with running crew agents is skipped, because \
+            replacing that binary can break the run. crew itself is not updated.",
+        after_long_help = "Examples:\n  crew update"
+    )]
+    Update,
     #[command(
         about = "Print the tier table",
         long_about = "Print provider, tier, model, effort, and whether the \
@@ -458,6 +469,7 @@ fn dispatch(cli: Cli) -> Result<i32, Error> {
         None => Err(Error::new(2, "missing command")),
         Some(Command::Load) => crate::load::print_load(),
         Some(Command::Usage) => crate::usage::print_usage(),
+        Some(Command::Update) => crate::update::run(),
         Some(Command::Models) => tier::print(),
         Some(Command::Job(args)) => dispatch_job(args),
         Some(Command::Claude(args)) => crate::providers::execute(&invocation_from_claude(args)?),

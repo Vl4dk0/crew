@@ -44,7 +44,7 @@ pub(super) enum KillStyle {
     ImmediateKill,
 }
 
-pub(super) struct Captured {
+pub(crate) struct Captured {
     pub code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -548,6 +548,23 @@ fn drain_new_lines(
     // Providers that learn the id from outside the stream (agy's conversation
     // file) get a look even when the child is quiet.
     note_session_line("", announced, watch);
+}
+
+/// Bound a version check or an updater the same way a provider run is bounded.
+///
+/// Stdin is `/dev/null` so a confirmation prompt cannot block, and the
+/// deadline kills the process group. A self-update that is still prompting
+/// or downloading must not hold `crew update` open.
+pub(crate) fn run_bounded(argv: &[String], timeout: Duration) -> io::Result<Captured> {
+    capture(
+        argv,
+        None,
+        timeout,
+        StdioKind::Piped,
+        KillStyle::TermThenKill,
+        false,
+        &mut |_| None,
+    )
 }
 
 pub(super) fn launch_or_note(result: io::Result<Captured>) -> Result<Captured, i32> {

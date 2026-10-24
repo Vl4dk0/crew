@@ -24,6 +24,9 @@ crew load
 
 # Check subscription plan quota meters and reset times
 crew usage
+
+# Update each installed CLI (skips a provider with running agents)
+crew update
 ```
 
 Run `crew help <cmd>` or `<cmd> --help` for details.
