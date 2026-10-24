@@ -145,7 +145,7 @@ pub fn render_blocks(views: &[ProviderView], tty: bool) -> String {
         lines.push(header);
 
         if v.windows.is_empty() {
-            let err = v.error.as_deref().unwrap_or("not signed in");
+            let err = v.error.as_deref().unwrap_or("not logged in");
             lines.push(format!("  {}", err));
         } else {
             for g in &v.windows {

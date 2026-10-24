@@ -44,6 +44,7 @@ pub(super) enum KillStyle {
     ImmediateKill,
 }
 
+#[derive(Debug)]
 pub(crate) struct Captured {
     pub code: i32,
     pub stdout: String,
@@ -567,11 +568,33 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration) -> io::Result<Capt
     )
 }
 
-pub(super) fn launch_or_note(result: io::Result<Captured>) -> Result<Captured, i32> {
+/// Check if an executable binary is present on PATH.
+pub fn binary_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate).is_ok_and(|meta| {
+            use std::os::unix::fs::PermissionsExt;
+            meta.is_file() && (meta.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Report a launch failure to stderr and map to the exit code.
+///
+/// Missing binaries on PATH are distinguished from other OS errors so
+/// the user is told directly which CLI needs to be installed.
+pub(super) fn launch_or_note(bin: &str, result: io::Result<Captured>) -> Result<Captured, i32> {
     match result {
         Ok(captured) => Ok(captured),
         Err(err) => {
-            write_stderr_line(&format!("[crew] {err}"));
+            if err.kind() == io::ErrorKind::NotFound || !binary_on_path(bin) {
+                write_stderr_line(&format!("[crew] {bin} CLI not found on PATH"));
+            } else {
+                write_stderr_line(&format!("[crew] {err}"));
+            }
             Err(LAUNCH_EXIT)
         }
     }
@@ -1050,5 +1073,19 @@ mod tests {
             without_session_line("SESSION_ID=abc\n", Some("abc")).as_ref(),
             ""
         );
+    }
+
+    #[test]
+    fn missing_cli_on_path_returns_launch_exit() {
+        // Missing binary on PATH must map to exit code 127
+        let res = launch_or_note(
+            "missing_binary_xyz",
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No such file or directory",
+            )),
+        );
+        assert_eq!(res.unwrap_err(), LAUNCH_EXIT);
+        assert!(!binary_on_path("missing_binary_xyz"));
     }
 }

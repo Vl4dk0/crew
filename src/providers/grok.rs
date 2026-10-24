@@ -31,15 +31,18 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
     let mut watch = |line: &str| proc::session_from_line(line);
-    let captured = match proc::launch_or_note(proc::capture(
-        &argv,
-        None,
-        timeout,
-        StdioKind::Piped,
-        KillStyle::TermThenKill,
-        true,
-        &mut watch,
-    )) {
+    let captured = match proc::launch_or_note(
+        "grok",
+        proc::capture(
+            &argv,
+            None,
+            timeout,
+            StdioKind::Piped,
+            KillStyle::TermThenKill,
+            true,
+            &mut watch,
+        ),
+    ) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };

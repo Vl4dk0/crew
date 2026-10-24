@@ -5,6 +5,7 @@ mod grok;
 mod proc;
 mod pty;
 
+pub use proc::binary_on_path;
 pub(crate) use proc::{detach_session, run_bounded, terminate_group};
 
 use crate::cli::Invocation;
