@@ -22,24 +22,13 @@ use super::pty::strip_ansi;
 const DENIAL_NEEDLE: &str = "no output produced \u{2014} a tool required the \"";
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
-    let resolved = tier::resolve(
-        invocation.provider,
-        invocation.tier,
-        invocation.model.as_deref(),
-        invocation.effort.as_deref(),
-    )?;
     let prompt = take_prompt(invocation)?.ok_or_else(|| {
         Error::new(
             2,
             "empty prompt (pass a prompt argument or pipe one via stdin)",
         )
     })?;
-    let (argv, note) = gemini_argv(
-        invocation,
-        resolved.model.as_deref(),
-        &resolved.effort,
-        &prompt,
-    );
+    let (argv, note) = plan(invocation, &prompt)?;
     proc::write_effort_note(&note);
     let home = cli_home();
     let track_files = invocation
@@ -101,6 +90,26 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     }
     proc::emit_report(&presented);
     Ok(presented.code)
+}
+
+fn plan(invocation: &Invocation, prompt: &str) -> Result<(Vec<String>, Option<String>), Error> {
+    let resolved = tier::resolve(
+        invocation.provider,
+        invocation.tier,
+        invocation.model.as_deref(),
+        invocation.effort.as_deref(),
+    )?;
+    Ok(gemini_argv(
+        invocation,
+        resolved.model.as_deref(),
+        &resolved.effort,
+        prompt,
+    ))
+}
+
+pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
+    let (argv, _) = plan(invocation, "")?;
+    Ok(proc::model_arg(&argv))
 }
 
 pub(super) fn gemini_argv(

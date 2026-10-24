@@ -215,6 +215,9 @@ fn run_internal(
     }
 
     let invocation = parse_trailing(job.provider, &job.trailing)?;
+    // Store the slug the child CLI is given, not the tier name. `ls` used to
+    // scan args for `-m`, which is absent when the user passed `--tier`.
+    let model = crate::providers::cli_model(&invocation)?;
 
     // Separate flags from prompt bytes
     let (flags, prompt_bytes) = if let Some(ref p) = invocation.prompt {
@@ -267,6 +270,7 @@ fn run_internal(
     let mut record = RunRecord {
         name: job.name.clone(),
         provider: job.provider.as_str().to_string(),
+        model,
         args: flags,
         cwd,
         note: job.note,
@@ -366,22 +370,16 @@ pub fn ls(json: bool) -> Result<i32, Error> {
         println!("{}", serde_json::to_string_pretty(&json_arr).unwrap());
     } else {
         println!(
-            "{:<14}  {:<8}  {:<10}  {:<23}  {:<5}",
+            "{:<14}  {:<8}  {:<10}  {:<24}  {:<5}",
             "NAME", "STATUS", "WRAPPER", "MODEL", "AGE"
         );
         for (rec, status) in records {
-            let model = rec
-                .args
-                .windows(2)
-                .find(|w| w[0] == "-m" || w[0] == "--model")
-                .map(|w| w[1].as_str())
-                .unwrap_or("-");
             println!(
-                "{:<14}  {:<8}  {:<10}  {:<23}  {:<5}",
+                "{:<14}  {:<8}  {:<10}  {:<24}  {:<5}",
                 rec.name,
                 status.as_str(),
                 rec.provider,
-                model,
+                listed_model(&rec),
                 format_age(&rec.created_at)
             );
         }
@@ -406,6 +404,7 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         println!("run: {}", rec.name);
         println!("status: {}", status.as_str());
         println!("provider: {}", rec.provider);
+        println!("model: {}", listed_model(&rec));
         println!("args: {:?}", rec.args);
         println!("cwd: {}", rec.cwd);
         if let Some(ref note) = rec.note {
@@ -433,6 +432,11 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
     }
 
     Ok(0)
+}
+
+/// `-` when the record has no model. Old records and grok-without-`-m` both qualify.
+fn listed_model(record: &RunRecord) -> &str {
+    record.model.as_deref().unwrap_or("-")
 }
 
 /// A Codex review scope stands in for the prompt. Bare `--review` does not.
@@ -687,6 +691,37 @@ pub fn supervise(name: &str) -> Result<i32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_model_is_the_cli_slug_not_the_tier_flag() {
+        let gemini = parse_trailing(
+            Provider::Gemini,
+            &[
+                "--tier".to_string(),
+                "smart".to_string(),
+                "ping".to_string(),
+            ],
+        )
+        .unwrap();
+        let resolved = crate::providers::cli_model(&gemini).unwrap();
+        assert_eq!(resolved.as_deref(), Some("gemini-3.8-flash-high"));
+        assert!(gemini.model.is_none());
+
+        let json = r#"{
+            "name": "readme-audit",
+            "provider": "gemini",
+            "args": ["--tier", "smart"],
+            "cwd": "/tmp",
+            "created_at": "2026-10-24T12:38:24Z"
+        }"#;
+        let mut rec: RunRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(listed_model(&rec), "-");
+        rec.model = resolved;
+        assert_eq!(listed_model(&rec), "gemini-3.8-flash-high");
+
+        let grok = parse_trailing(Provider::Grok, &["ping".to_string()]).unwrap();
+        assert_eq!(crate::providers::cli_model(&grok).unwrap(), None);
+    }
 
     #[test]
     fn age_formatting() {
