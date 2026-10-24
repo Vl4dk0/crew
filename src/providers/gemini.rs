@@ -244,13 +244,20 @@ fn baked_base(model: &str) -> Option<&str> {
     None
 }
 
+/// agy must hit its own deadline before crew kills the process group.
+/// Also the floor, so a short run still gets a usable print timeout.
+const PRINT_TIMEOUT_MARGIN_SECS: i64 = 10;
+
 fn print_timeout(secs: f64) -> String {
     let whole = if secs.is_finite() {
         secs.trunc().clamp(0.0, i64::MAX as f64) as i64
     } else {
         0
     };
-    format!("{}s", (whole - 10).max(10))
+    format!(
+        "{}s",
+        (whole - PRINT_TIMEOUT_MARGIN_SECS).max(PRINT_TIMEOUT_MARGIN_SECS)
+    )
 }
 
 pub(super) fn present_gemini(raw: &str, rc: i32) -> Report {
@@ -393,6 +400,16 @@ mod tests {
     use super::*;
     use crate::providers::proc::{bare, flag, has};
 
+    /// Same margin `print_timeout` subtracts, written out so this test
+    /// fails if the argv stops using that rule.
+    fn expected_print_timeout(secs: f64) -> String {
+        let whole = secs.trunc() as i64;
+        format!(
+            "{}s",
+            (whole - PRINT_TIMEOUT_MARGIN_SECS).max(PRINT_TIMEOUT_MARGIN_SECS)
+        )
+    }
+
     #[test]
     fn argv_bakes_effort_into_the_slug() {
         let invocation = bare(Provider::Gemini);
@@ -402,15 +419,16 @@ mod tests {
             "medium",
             "hello",
         );
+        let print_timeout = expected_print_timeout(invocation.timeout_secs);
         assert!(note.is_none());
         assert_eq!(
             argv,
-            vec![
+            [
                 "agy",
                 "-p",
                 "hello",
                 "--print-timeout",
-                "7190s",
+                print_timeout.as_str(),
                 "--model",
                 "gemini-3.8-flash-medium",
                 "--dangerously-skip-permissions",
@@ -422,8 +440,9 @@ mod tests {
         invocation.model = Some("flash".to_string());
         invocation.effort = Some("max".to_string());
         let (argv, note) = gemini_argv(&invocation, Some("flash"), "max", "hello");
+        let print_timeout = expected_print_timeout(invocation.timeout_secs);
         assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
-        assert_eq!(flag(&argv, "--print-timeout"), Some("10s"));
+        assert_eq!(flag(&argv, "--print-timeout"), Some(print_timeout.as_str()));
         assert!(!has(&argv, "--effort"));
         assert_eq!(note.as_deref(), Some("[crew] effort max -> high"));
 

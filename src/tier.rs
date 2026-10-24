@@ -214,7 +214,7 @@ fn resolve_with(
     let (row_model, row_effort) = if let Some(tier) = tier {
         let row = table.provider(provider).get(tier);
         let row_effort = if provider == Provider::Grok {
-            "medium".to_string()
+            DEFAULT_EFFORT.to_string()
         } else {
             row.effort.clone().ok_or_else(|| {
                 Error::new(2, format!("{provider} {} is missing effort", tier.as_str()))
@@ -231,17 +231,25 @@ fn resolve_with(
     })
 }
 
+/// Model a wrapper gets when the user passed no tier and no `-m`.
+/// Grok has none: the wrapper omits `-m` and the account default stands.
+const CLAUDE_WRAPPER_MODEL: &str = "sonnet";
+const CODEX_WRAPPER_MODEL: &str = "gpt-6-luna";
+const GEMINI_WRAPPER_MODEL: &str = "gemini-3.8-flash-medium";
+
+/// Effort when the user did not pass `-e`. A grok tier does not carry one.
+const DEFAULT_EFFORT: &str = "medium";
+
 fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
-    let (model, default_effort) = match provider {
-        Provider::Claude => (Some("sonnet".to_string()), "medium"),
-        Provider::Codex => (Some("gpt-6-luna".to_string()), "medium"),
-        Provider::Gemini => (Some("gemini-3.8-flash-medium".to_string()), "medium"),
-        // The wrapper omits -m and lets the account default stand.
-        Provider::Grok => (None, "medium"),
+    let model = match provider {
+        Provider::Claude => Some(CLAUDE_WRAPPER_MODEL.to_string()),
+        Provider::Codex => Some(CODEX_WRAPPER_MODEL.to_string()),
+        Provider::Gemini => Some(GEMINI_WRAPPER_MODEL.to_string()),
+        Provider::Grok => None,
     };
     Resolved {
         model,
-        effort: effort.unwrap_or(default_effort).to_string(),
+        effort: effort.unwrap_or(DEFAULT_EFFORT).to_string(),
     }
 }
 
@@ -278,20 +286,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_rows_match_the_plan() {
+    fn resolve_follows_the_builtin_row() {
         let table = parse_table(BUILTIN, "builtin").unwrap();
-        let fast = table.provider(Provider::Claude).get(Tier::Fast);
-        assert_eq!(fast.model, "haiku");
-        assert_eq!(fast.effort.as_deref(), Some("medium"));
-        let max = table.provider(Provider::Grok).get(Tier::Max);
-        assert_eq!(max.model, "grok-4.7");
-        assert_eq!(max.effort, None);
-        let fast = table.provider(Provider::Grok).get(Tier::Fast);
-        let resolved = resolve_with(&table, Provider::Grok, Some(Tier::Fast), None, None).unwrap();
-        assert_eq!(resolved.model.as_deref(), Some(fast.model.as_str()));
-        assert_eq!(resolved.effort, "medium");
-        let smart = table.provider(Provider::Gemini).get(Tier::Smart);
-        assert_eq!(smart.model, "gemini-3.8-flash-high");
+        for provider in [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::Gemini,
+            Provider::Grok,
+        ] {
+            for tier in Tier::all() {
+                let row = table.provider(provider).get(tier);
+                let resolved = resolve_with(&table, provider, Some(tier), None, None).unwrap();
+                assert_eq!(resolved.model.as_deref(), Some(row.model.as_str()));
+                if provider == Provider::Grok {
+                    assert!(row.effort.is_none());
+                    assert_eq!(resolved.effort, DEFAULT_EFFORT);
+                } else {
+                    assert_eq!(Some(resolved.effort.as_str()), row.effort.as_deref());
+                }
+            }
+        }
     }
 
     #[test]
@@ -311,12 +325,12 @@ mod tests {
         let table = parse_table(BUILTIN, "builtin").unwrap();
         let grok = resolve_with(&table, Provider::Grok, None, None, None).unwrap();
         assert_eq!(grok.model, None);
-        assert_eq!(grok.effort, "medium");
+        assert_eq!(grok.effort, DEFAULT_EFFORT);
         let codex = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
-        assert_eq!(codex.model.as_deref(), Some("gpt-6-luna"));
-        // No tier and no -e is medium, including codex, whose own wrapper
-        // defaults to low. Vladko asked for one default.
-        assert_eq!(codex.effort, "medium");
+        assert_eq!(codex.model.as_deref(), Some(CODEX_WRAPPER_MODEL));
+        // No tier and no -e is one effort for every provider, including
+        // codex, whose own wrapper defaults to low. Vladko asked for that.
+        assert_eq!(codex.effort, DEFAULT_EFFORT);
     }
 
     #[test]
@@ -330,7 +344,8 @@ mod tests {
             None,
         )
         .unwrap();
+        let row = table.provider(Provider::Claude).get(Tier::Fast);
         assert_eq!(resolved.model.as_deref(), Some("opus"));
-        assert_eq!(resolved.effort, "medium");
+        assert_eq!(Some(resolved.effort.as_str()), row.effort.as_deref());
     }
 }

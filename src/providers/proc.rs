@@ -906,7 +906,7 @@ pub(super) fn bare(provider: Provider) -> Invocation {
         tier: None,
         model: None,
         effort: None,
-        timeout_secs: 7200.0,
+        timeout_secs: crate::cli::DEFAULT_TIMEOUT_SECS,
         cwd: None,
         resume: None,
         continue_session: false,

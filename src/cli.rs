@@ -239,6 +239,10 @@ struct CodexArgs {
     commit: Option<String>,
 }
 
+/// Run deadline when the user does not pass `--timeout`.
+/// Clap, the invocation built for tests, and the gemini print-timeout all read this.
+pub const DEFAULT_TIMEOUT_SECS: f64 = 7200.0;
+
 #[derive(Debug, Args)]
 struct SharedArgs {
     /// fast, balanced, smart, or max. See `crew models`. -m overrides the row's model. A grok tier does not set effort.
@@ -251,7 +255,7 @@ struct SharedArgs {
     #[arg(short = 'e', long)]
     effort: Option<String>,
     /// Seconds before the process group is killed. Default 7200 (2 hours). Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds. Output already produced is kept. The exit code is 124.
-    #[arg(short = 't', long, default_value_t = 7200.0)]
+    #[arg(short = 't', long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout: f64,
     /// Working directory for the child. Maps to the CLI's own cwd flag where it has one.
     #[arg(short = 'C', long)]

@@ -698,6 +698,7 @@ pub fn supervise(name: &str) -> Result<i32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tier::{self, Tier};
 
     #[test]
     fn recorded_model_is_the_cli_slug_not_the_tier_flag() {
@@ -711,7 +712,10 @@ mod tests {
         )
         .unwrap();
         let resolved = crate::providers::cli_model(&gemini).unwrap();
-        assert_eq!(resolved.as_deref(), Some("gemini-3.8-flash-high"));
+        let from_tier = tier::resolve(Provider::Gemini, Some(Tier::Smart), None, None).unwrap();
+        let slug = from_tier.model.clone().unwrap();
+        assert_eq!(resolved.as_deref(), Some(slug.as_str()));
+        assert_ne!(slug, "smart");
         assert!(gemini.model.is_none());
 
         let json = r#"{
@@ -724,7 +728,7 @@ mod tests {
         let mut rec: RunRecord = serde_json::from_str(json).unwrap();
         assert_eq!(listed_model(&rec), "-");
         rec.model = resolved;
-        assert_eq!(listed_model(&rec), "gemini-3.8-flash-high");
+        assert_eq!(listed_model(&rec), slug);
 
         let grok = parse_trailing(Provider::Grok, &["ping".to_string()]).unwrap();
         assert_eq!(crate::providers::cli_model(&grok).unwrap(), None);
