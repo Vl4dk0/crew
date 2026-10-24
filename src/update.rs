@@ -1,17 +1,17 @@
 //! Update the harness CLIs with each CLI's own updater, then crew itself.
 //!
-//! A running crew agent is left alone: replacing its binary mid-run can
-//! break that process. A CLI that is not installed is reported and skipped.
-//! crew is last, and only a git install moves. A path install is Vladko's
-//! checkout, so it is left untouched. Cargo renames the new binary into
-//! place, so a crew process that is already running keeps the one it loaded.
+//! A missing CLI is reported and skipped. Running agents are not: the
+//! updater always runs, and a process that already loaded the old binary
+//! keeps it. crew is last, and only a git install moves. A path install is
+//! Vladko's checkout, so it is left untouched. Cargo renames the new crew
+//! binary into place, so a crew process that is already running keeps the
+//! one it loaded.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use crate::error::Error;
-use crate::load;
 use crate::providers;
 
 /// An updater that is still downloading must not hold the command open.
@@ -23,75 +23,41 @@ const CREW_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A private repo without credentials should fail here, not sit on a prompt.
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-struct Harness {
-    /// argv0 of that CLI, and the name printed on the report line.
-    bin: &'static str,
-    /// Key `crew load` uses. agy is the gemini provider.
-    provider: &'static str,
-}
-
 /// Spec order: claude, codex, grok, then gemini's `agy` binary.
-const HARNESSES: [Harness; 4] = [
-    Harness {
-        bin: "claude",
-        provider: "claude",
-    },
-    Harness {
-        bin: "codex",
-        provider: "codex",
-    },
-    Harness {
-        bin: "grok",
-        provider: "grok",
-    },
-    Harness {
-        bin: "agy",
-        provider: "gemini",
-    },
-];
+const HARNESSES: [&str; 4] = ["claude", "codex", "grok", "agy"];
 
 pub fn run() -> Result<i32, Error> {
     let mut failed = false;
-    for harness in HARNESSES {
-        if !binary_on_path(harness.bin) {
-            println!("{}: not found", harness.bin);
+    for bin in HARNESSES {
+        if !binary_on_path(bin) {
+            println!("{bin}: not found");
             continue;
         }
-        // Count immediately before the updater. An agent that started during
-        // the previous CLI's download still has to keep its own binary.
-        let running = load::running_agents()
-            .get(harness.provider)
-            .map(|pids| pids.len())
-            .unwrap_or(0);
-        if running > 0 {
-            println!("{} skipped: {running} running agent(s)", harness.bin);
-            continue;
-        }
-        let before = match read_version(harness.bin) {
+        let before = match read_version(bin) {
             Ok(version) => version,
             Err(reason) => {
-                println!("{} update failed: {reason}", harness.bin);
+                println!("{bin} update failed: {reason}");
                 failed = true;
                 continue;
             }
         };
-        if let Err(reason) = run_update(harness.bin) {
-            println!("{} update failed: {reason}", harness.bin);
+        if let Err(reason) = run_update(bin) {
+            println!("{bin} update failed: {reason}");
             failed = true;
             continue;
         }
-        let after = match read_version(harness.bin) {
+        let after = match read_version(bin) {
             Ok(version) => version,
             Err(reason) => {
-                println!("{} update failed: {reason}", harness.bin);
+                println!("{bin} update failed: {reason}");
                 failed = true;
                 continue;
             }
         };
         if before == after {
-            println!("{} {before} (up to date)", harness.bin);
+            println!("{bin} {before} (up to date)");
         } else {
-            println!("{} {before} -> {after}", harness.bin);
+            println!("{bin} {before} -> {after}");
         }
     }
     // After the harnesses. A failure there still tries crew; either one fails the run.

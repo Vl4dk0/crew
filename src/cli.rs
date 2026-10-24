@@ -35,7 +35,7 @@ use crate::tier::{self, Tier};
         Machine\n  \
         load      CPU, memory, GPU, and running agents per provider\n  \
         usage     plans, quota bars, resets\n  \
-        update    each CLI's own updater, then crew; skips a provider with running agents\n\
+        update    each CLI's own updater, then crew\n\
         \n\
         Config\n  \
         models    the tier table",
@@ -156,12 +156,13 @@ enum Command {
     )]
     Usage,
     #[command(
-        about = "Update each harness CLI, then crew, skipping providers with running agents",
+        about = "Update each harness CLI, then crew",
         long_about = "Run each CLI's own updater: `claude update`, `codex update`, \
-            `grok update`, and `agy update`. A missing binary is reported and \
-            skipped. A provider with running crew agents is skipped, because \
-            replacing that binary can break the run. crew is updated last from \
-            the git URL `cargo install` recorded. A path install is left untouched.",
+            `grok update`, and `agy update`, even while crew agents of that \
+            provider are running. A process that already loaded the old binary \
+            keeps it. A missing binary is reported and skipped. crew is updated \
+            last from the git URL `cargo install` recorded. A path install is \
+            left untouched.",
         after_long_help = "Examples:\n  crew update"
     )]
     Update,
