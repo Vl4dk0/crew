@@ -77,12 +77,15 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     } else if code == 125 {
         after.push_str("[crew] failed or incomplete turn (missing completion or final answer)\n");
     }
-    proc::emit_report(&Report {
-        code,
-        before_stderr: before,
-        stdout,
-        after_stderr: after,
-    });
+    proc::emit_report(
+        &Report {
+            code,
+            before_stderr: before,
+            stdout,
+            after_stderr: after,
+        },
+        captured.session_id.as_deref(),
+    );
     Ok(code)
 }
 

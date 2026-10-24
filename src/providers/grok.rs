@@ -52,7 +52,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured.stderr,
     );
     let report = proc::keep_timeout(report, captured.timed_out, invocation.timeout_secs);
-    proc::emit_report(&report);
+    proc::emit_report(&report, captured.session_id.as_deref());
     Ok(report.code)
 }
 

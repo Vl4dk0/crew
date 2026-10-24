@@ -4,6 +4,7 @@
 //! PTY, and the prompt is never written there. A deadline kills the process
 //! group: SIGTERM, five seconds, SIGKILL, except codex, which SIGKILLs at once.
 
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -48,6 +49,9 @@ pub(super) struct Captured {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Id already written as `SESSION_ID=` while the child was still running.
+    /// The final report must not print that same id again.
+    pub session_id: Option<String>,
 }
 
 pub(super) struct Report {
@@ -302,10 +306,37 @@ pub(super) fn write_effort_note(note: &Option<String>) {
     }
 }
 
-pub(super) fn emit_report(report: &Report) {
-    write_raw_stderr(&report.before_stderr);
+/// Write the report. `announced` is the id capture already printed, so the
+/// same `SESSION_ID` line is not written a second time. A different id, or
+/// one capture never saw, is still printed here.
+pub(super) fn emit_report(report: &Report, announced: Option<&str>) {
+    write_raw_stderr(&without_session_line(&report.before_stderr, announced));
     write_raw_stdout(&report.stdout);
-    write_raw_stderr(&report.after_stderr);
+    write_raw_stderr(&without_session_line(&report.after_stderr, announced));
+}
+
+fn without_session_line<'a>(text: &'a str, announced: Option<&str>) -> Cow<'a, str> {
+    let Some(id) = announced.filter(|id| !id.is_empty()) else {
+        return Cow::Borrowed(text);
+    };
+    let target = format!("SESSION_ID={id}");
+    if !text
+        .split_inclusive('\n')
+        .any(|chunk| is_session_line(chunk, &target))
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for chunk in text.split_inclusive('\n') {
+        if !is_session_line(chunk, &target) {
+            out.push_str(chunk);
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn is_session_line(chunk: &str, target: &str) -> bool {
+    chunk.trim_end_matches(['\n', '\r']) == target
 }
 
 /// The deadline still owns the exit code. Text and `SESSION_ID` already
@@ -431,6 +462,7 @@ pub(super) fn capture(
         stdout: stdout_text,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
+        session_id: announced,
     })
 }
 
@@ -874,7 +906,7 @@ pub(super) fn bare(provider: Provider) -> Invocation {
         tier: None,
         model: None,
         effort: None,
-        timeout_secs: 1800.0,
+        timeout_secs: 7200.0,
         cwd: None,
         resume: None,
         continue_session: false,
@@ -977,5 +1009,20 @@ mod tests {
         )
         .expect("sleep");
         assert!(captured.timed_out);
+    }
+
+    #[test]
+    fn final_report_omits_the_session_capture_already_announced() {
+        let text = "[crew] note\nSESSION_ID=abc\n[crew] usage\n";
+        assert_eq!(
+            without_session_line(text, Some("abc")).as_ref(),
+            "[crew] note\n[crew] usage\n"
+        );
+        assert_eq!(without_session_line(text, Some("other")).as_ref(), text);
+        assert_eq!(without_session_line(text, None).as_ref(), text);
+        assert_eq!(
+            without_session_line("SESSION_ID=abc\n", Some("abc")).as_ref(),
+            ""
+        );
     }
 }

@@ -110,7 +110,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     if let Some(id) = id.filter(|id| !id.is_empty()) {
         presented.after_stderr = format!("SESSION_ID={id}\n");
     }
-    proc::emit_report(&presented);
+    proc::emit_report(&presented, captured.session_id.as_deref());
     Ok(presented.code)
 }
 
@@ -410,7 +410,7 @@ mod tests {
                 "-p",
                 "hello",
                 "--print-timeout",
-                "1790s",
+                "7190s",
                 "--model",
                 "gemini-3.8-flash-medium",
                 "--dangerously-skip-permissions",
