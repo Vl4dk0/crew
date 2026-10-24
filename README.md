@@ -25,7 +25,7 @@ crew load
 # Check subscription plan quota meters and reset times
 crew usage
 
-# Update each installed CLI (skips a provider with running agents)
+# Update each installed CLI, then crew (a path install is left alone)
 crew update
 ```
 
