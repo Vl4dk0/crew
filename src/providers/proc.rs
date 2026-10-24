@@ -1,8 +1,10 @@
 //! Spawn a provider child and turn its status into a crew exit code.
 //!
 //! The child inherits the environment. Stdin is `/dev/null` except the gemini
-//! PTY, and the prompt is never written there. A deadline kills the process
-//! group: SIGTERM, five seconds, SIGKILL, except codex, which SIGKILLs at once.
+//! PTY, and the prompt is never written there. The child is its own session, so
+//! a deadline or a SIGTERM delivered to this process does not reach it. Both
+//! paths signal that session: SIGTERM, five seconds, SIGKILL, except codex,
+//! which SIGKILLs at once.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -27,7 +29,6 @@ use super::pty;
 pub(super) const LAUNCH_EXIT: i32 = 127;
 
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
-static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
 
 #[derive(Clone, Copy)]
@@ -405,7 +406,6 @@ pub(super) fn capture(
     timeout: Duration,
     kind: StdioKind,
     kill: KillStyle,
-    catch_signals: bool,
     watch: &mut dyn FnMut(&str) -> Option<String>,
 ) -> io::Result<Captured> {
     let _lock = CAPTURE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
@@ -413,47 +413,43 @@ pub(super) fn capture(
 
     let (mut child, readers) = spawn(argv, cwd, kind)?;
     let pid = child.id();
-    let _guard = if catch_signals {
-        InterruptGuard::install(pid).ok()
-    } else {
-        None
+    // detach_session makes the provider a session leader, so it is not in this
+    // process group. Without a handler, SIGTERM (job stop) takes the default
+    // action, this process dies, and that session is reparented to init.
+    let _guard = match InterruptGuard::install() {
+        Ok(guard) => guard,
+        Err(err) => {
+            kill_group(pid, libc::SIGKILL);
+            let _ = child.wait();
+            return Err(err);
+        }
     };
 
     let mut announced = None;
     let mut scanned = 0usize;
     let mut timed_out = false;
-    let status = if let Some(status) = reap_watching(
+    let status = reap_watching(
         &mut child,
         timeout,
         &readers.stdout,
         &mut scanned,
         &mut announced,
         watch,
-    )? {
-        status
-    } else {
-        timed_out = true;
-        match kill {
-            KillStyle::ImmediateKill => {
-                kill_group(pid, libc::SIGKILL);
-                child.wait()?
-            }
-            KillStyle::TermThenKill => {
-                kill_group(pid, libc::SIGTERM);
-                if let Some(status) = reap_watching(
-                    &mut child,
-                    Duration::from_secs(5),
-                    &readers.stdout,
-                    &mut scanned,
-                    &mut announced,
-                    watch,
-                )? {
-                    status
-                } else {
-                    kill_group(pid, libc::SIGKILL);
-                    child.wait()?
-                }
-            }
+        true,
+    )?;
+    let interrupted = INTERRUPTED.load(Ordering::SeqCst) != 0;
+    let status = match (status, interrupted) {
+        (Some(status), false) => status,
+        (status, true) | (status @ None, false) => {
+            timed_out = status.is_none() && !interrupted;
+            stop_group(
+                &mut child,
+                kill,
+                &readers.stdout,
+                &mut scanned,
+                &mut announced,
+                watch,
+            )?
         }
     };
     let (stdout, stderr) = finish_readers(readers);
@@ -462,8 +458,7 @@ pub(super) fn capture(
     let mut code = public_code(python_status(status));
     let interrupted = INTERRUPTED.swap(0, Ordering::SeqCst);
     if interrupted != 0 {
-        // The handler already killed the group. The wrapper reports the
-        // signal that arrived, and the deadline did not win.
+        // Job stop and Ctrl-C report the signal, not the deadline.
         code = interrupted;
         timed_out = false;
     }
@@ -510,6 +505,7 @@ fn reap_watching(
     scanned: &mut usize,
     announced: &mut Option<String>,
     watch: &mut dyn FnMut(&str) -> Option<String>,
+    interruptible: bool,
 ) -> io::Result<Option<ExitStatus>> {
     let start = Instant::now();
     loop {
@@ -518,11 +514,186 @@ fn reap_watching(
             drain_new_lines(stdout, scanned, announced, watch);
             return Ok(Some(status));
         }
+        // SIGTERM is only recorded here. stop_group snapshots the descendant
+        // tree before anyone is signaled, so this wait must not be cut short.
+        if interruptible && INTERRUPTED.load(Ordering::SeqCst) != 0 {
+            return Ok(None);
+        }
         if start.elapsed() >= timeout {
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Finish a deadline or a forwarded signal.
+///
+/// The provider is a session leader, and a tool it starts may call setsid
+/// again. killpg on the provider misses that process, and once the provider
+/// exits the tool is reparented to init. Name every descendant first, then
+/// signal that list and the provider's group.
+fn stop_group(
+    child: &mut Child,
+    kill: KillStyle,
+    stdout: &Mutex<Vec<u8>>,
+    scanned: &mut usize,
+    announced: &mut Option<String>,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+) -> io::Result<ExitStatus> {
+    let pid = child.id();
+    let (first, grace) = match kill {
+        KillStyle::ImmediateKill => (libc::SIGKILL, false),
+        KillStyle::TermThenKill => (libc::SIGTERM, true),
+    };
+    let mut marked = signal_tree(pid, first);
+    if grace {
+        let start = Instant::now();
+        loop {
+            drain_new_lines(stdout, scanned, announced, watch);
+            let status = child.try_wait()?;
+            if let Some(status) = status
+                && tree_dead(pid, &marked)
+            {
+                return Ok(status);
+            }
+            if start.elapsed() >= Duration::from_secs(5) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        marked = signal_tree(pid, libc::SIGKILL);
+    }
+    let status = reap_child(child)?;
+    let start = Instant::now();
+    while !tree_dead(pid, &marked) && start.elapsed() < Duration::from_secs(1) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(status)
+}
+
+fn tree_dead(root: u32, marked: &[u32]) -> bool {
+    !group_alive(root) && marked.iter().all(|pid| !process_alive(*pid))
+}
+
+/// Descendants first, then `root`, then whatever is still in `root`'s group.
+fn signal_tree(root: u32, signal: i32) -> Vec<u32> {
+    let mut marked = Vec::new();
+    collect_descendants(root, &mut marked);
+    for pid in &marked {
+        signal_pid(*pid, signal);
+    }
+    signal_pid(root, signal);
+    kill_group(root, signal);
+    marked.push(root);
+    marked
+}
+
+fn collect_descendants(pid: u32, out: &mut Vec<u32>) {
+    for child in direct_children(pid) {
+        if child <= 1 || out.contains(&child) {
+            continue;
+        }
+        collect_descendants(child, out);
+        out.push(child);
+    }
+}
+
+fn signal_pid(pid: u32, signal: i32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: kill is async-signal-safe. A pid that already exited returns ESRCH.
+    unsafe {
+        libc::kill(pid, signal);
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    // SAFETY: signal 0 only probes. ESRCH means the pid is gone.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "macos")]
+fn direct_children(parent: u32) -> Vec<u32> {
+    let Ok(parent) = i32::try_from(parent) else {
+        return Vec::new();
+    };
+    // SAFETY: a null buffer asks libproc how many child pids exist.
+    let needed = unsafe { proc_listchildpids(parent, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0i32; needed as usize];
+    let bytes = match i32::try_from(buf.len().saturating_mul(std::mem::size_of::<i32>())) {
+        Ok(bytes) => bytes,
+        Err(_) => return Vec::new(),
+    };
+    // SAFETY: buf is writable for `bytes` bytes. The return is a pid count.
+    let got = unsafe { proc_listchildpids(parent, buf.as_mut_ptr(), bytes) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    let got = (got as usize).min(buf.len());
+    buf.truncate(got);
+    buf.into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_listchildpids(ppid: i32, buffer: *mut i32, buffersize: i32) -> i32;
+}
+
+#[cfg(target_os = "linux")]
+fn direct_children(parent: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let ppid = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|rest| rest.trim().parse::<u32>().ok())
+        });
+        if ppid == Some(parent) && pid > 1 {
+            children.push(pid);
+        }
+    }
+    children
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn direct_children(_parent: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+fn reap_child(child: &mut Child) -> io::Result<ExitStatus> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(status);
+    }
+    child.wait()
 }
 
 fn drain_new_lines(
@@ -563,7 +734,6 @@ pub(crate) fn run_bounded(argv: &[String], timeout: Duration) -> io::Result<Capt
         timeout,
         StdioKind::Piped,
         KillStyle::TermThenKill,
-        false,
         &mut |_| None,
     )
 }
@@ -873,14 +1043,10 @@ fn dup_fd(src: &OwnedFd) -> io::Result<OwnedFd> {
 }
 
 extern "C" fn on_signal(signal: libc::c_int) {
+    // Only the flag. killpg here would reap the provider before the main
+    // thread can list descendants that have their own session, and those
+    // would be reparented to init with nothing left pointing at them.
     INTERRUPTED.store(128i32.saturating_add(signal), Ordering::SeqCst);
-    let pid = CHILD_PID.load(Ordering::SeqCst);
-    if pid > 0 {
-        // SAFETY: killpg is async-signal-safe, which a signal handler requires.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
-    }
 }
 
 struct InterruptGuard {
@@ -889,22 +1055,12 @@ struct InterruptGuard {
 }
 
 impl InterruptGuard {
-    fn install(pid: u32) -> io::Result<Self> {
-        let pid = i32::try_from(pid)
-            .map_err(|_| io::Error::other("pid does not fit in a process group id"))?;
-        CHILD_PID.store(pid, Ordering::SeqCst);
-        let previous_int = match install_handler(libc::SIGINT) {
-            Ok(previous) => previous,
-            Err(err) => {
-                CHILD_PID.store(0, Ordering::SeqCst);
-                return Err(err);
-            }
-        };
+    fn install() -> io::Result<Self> {
+        let previous_int = install_handler(libc::SIGINT)?;
         let previous_term = match install_handler(libc::SIGTERM) {
             Ok(previous) => previous,
             Err(err) => {
                 restore_handler(libc::SIGINT, previous_int);
-                CHILD_PID.store(0, Ordering::SeqCst);
                 return Err(err);
             }
         };
@@ -917,7 +1073,6 @@ impl InterruptGuard {
 
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
-        CHILD_PID.store(0, Ordering::SeqCst);
         restore_handler(libc::SIGINT, self.previous_int);
         restore_handler(libc::SIGTERM, self.previous_term);
     }
@@ -1032,7 +1187,6 @@ mod tests {
             Duration::from_secs(5),
             StdioKind::Pty,
             KillStyle::TermThenKill,
-            false,
             &mut |_| None,
         )
         .expect("pty echo");
@@ -1053,11 +1207,76 @@ mod tests {
             Duration::from_millis(300),
             StdioKind::Piped,
             KillStyle::TermThenKill,
-            false,
             &mut |_| None,
         )
         .expect("sleep");
         assert!(captured.timed_out);
+    }
+
+    #[test]
+    fn sigterm_kills_the_detached_session() {
+        // The child is a session leader, same as a provider CLI. Its perl
+        // grandchild calls setsid, which is what a provider tool process does,
+        // so it is not in the child's group. SIGTERM to us must reap both.
+        let path = std::env::temp_dir().join(format!("crew-sigterm-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let script = r#"echo $$ > "$1"; perl -e 'use POSIX (); POSIX::setsid(); open my $f, ">>", shift; print $f "$$\n"; close $f; sleep 60' "$1" & wait"#;
+        let path_arg = path.to_string_lossy().to_string();
+        let signaler = thread::spawn({
+            let path = path.clone();
+            move || {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(3) {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        let ready = text.lines().filter(|line| !line.trim().is_empty()).count();
+                        if ready >= 2 {
+                            unsafe {
+                                libc::kill(std::process::id() as i32, libc::SIGTERM);
+                            }
+                            return;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let captured = capture(
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+                "sh".to_string(),
+                path_arg,
+            ],
+            None,
+            Duration::from_secs(5),
+            StdioKind::Piped,
+            KillStyle::TermThenKill,
+            &mut |_| None,
+        )
+        .expect("capture");
+        let _ = signaler.join();
+
+        assert!(!captured.timed_out, "code {}", captured.code);
+        assert_eq!(captured.code, 128 + libc::SIGTERM);
+
+        let text = fs::read_to_string(&path).expect("pid file");
+        let pids: Vec<u32> = text
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        assert_eq!(pids.len(), 2, "{text:?}");
+        assert_ne!(pids[0], pids[1]);
+        assert!(pids.iter().all(|pid| *pid != std::process::id()));
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) && pids.iter().any(|pid| process_alive(*pid))
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let live: Vec<u32> = pids.into_iter().filter(|pid| process_alive(*pid)).collect();
+        let _ = fs::remove_file(&path);
+        assert!(live.is_empty(), "detached session still running: {live:?}");
     }
 
     #[test]
