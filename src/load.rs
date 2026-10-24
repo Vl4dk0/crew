@@ -1,8 +1,8 @@
-#![allow(clippy::collapsible_if)]
-
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
@@ -14,6 +14,8 @@ const PROVIDERS: [(&str, &[&str]); 4] = [
     ("grok", &["grok"]),
     ("codex", &["codex", "gpt", "chatgpt"]),
 ];
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemMetrics {
@@ -46,8 +48,8 @@ pub struct GpuCard {
 }
 
 /// One DRM card, already read from sysfs. Parsing stays free of I/O so the
-/// fixture tests can feed file contents directly. `idle_path` is only used
-/// by the sampler; both residency reads have to hit the same file.
+/// fixture tests can feed file contents directly. `idle_path` is fixed before
+/// the sample so both residency reads hit the same file.
 struct CardSnap {
     name: String,
     device_key: String,
@@ -63,225 +65,200 @@ struct CardSnap {
 #[derive(Debug, Clone)]
 pub struct ProcessRecord {
     pub pid: u32,
-    pub ppid: u32,
     pub cpu: f64,
     pub executable: String,
     pub arg1: String,
 }
 
-/// Execute a system command and return stdout as string, or empty string on error.
+/// A missing tool or a failed probe leaves that reading blank. `crew load`
+/// still prints the rest.
 fn run_cmd(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default()
 }
 
-/// Parse process snapshot from `ps -axww -o pid=,ppid=,%cpu=,command=`.
+/// Rows from `ps -axww -o pid=,ppid=,%cpu=,command=`. A row that does not
+/// parse is ignored so one bad line cannot shift the columns of the next.
 pub fn parse_ps_snapshot(output: &str) -> (HashMap<u32, ProcessRecord>, f64) {
     let mut processes = HashMap::new();
     let mut cpu_sum = 0.0;
-
     for line in output.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
+        let Some(record) = parse_ps_line(line) else {
             continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 4 {
-            continue;
-        }
-
-        let pid: u32 = match parts[0].parse() {
-            Ok(p) => p,
-            Err(_) => continue,
         };
-        let ppid: u32 = match parts[1].parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let cpu: f64 = match parts[2].parse() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let executable = parts[3].to_string();
-        let arg1 = if parts.len() > 4 {
-            parts[4].to_string()
-        } else {
-            String::new()
-        };
-
-        cpu_sum += cpu;
-        processes.insert(
-            pid,
-            ProcessRecord {
-                pid,
-                ppid,
-                cpu,
-                executable,
-                arg1,
-            },
-        );
+        cpu_sum += record.cpu;
+        processes.insert(record.pid, record);
     }
-
     (processes, cpu_sum)
 }
 
-/// Collect hardware telemetry on macOS (sysctl, vm_stat, ioreg).
+fn parse_ps_line(line: &str) -> Option<ProcessRecord> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    // `ppid` is only here to keep the columns aligned. Parentage is not how a
+    // run is counted; see `provider_of`.
+    parts.next().filter(|token| token.parse::<u32>().is_ok())?;
+    let cpu = parts.next()?.parse().ok()?;
+    let executable = parts.next()?.to_string();
+    Some(ProcessRecord {
+        pid,
+        cpu,
+        executable,
+        arg1: parts.next().unwrap_or("").to_string(),
+    })
+}
+
+/// CPU percent is the sum of per-process `%cpu` divided by logical cores, so
+/// the headline matches the `ps` snapshot. Anything a probe could not read
+/// stays empty and the line shows `?`.
 pub fn collect_metrics(cpu_sum: f64, has_processes: bool) -> SystemMetrics {
     let mut metrics = SystemMetrics::default();
-
     if cfg!(target_os = "macos") {
-        let sysctl_out = run_cmd(
-            "sysctl",
-            &["-n", "hw.ncpu", "vm.loadavg", "hw.memsize", "vm.swapusage"],
-        );
-        let lines: Vec<&str> = sysctl_out.lines().collect();
-
-        if let Some(l) = lines.first() {
-            if let Ok(c) = l.trim().parse::<usize>() {
-                metrics.cores = Some(c);
-            }
-        }
-        if lines.len() > 1 {
-            // "{ 2.45 2.10 1.95 }"
-            if let Some(first_num) = lines[1]
-                .split_whitespace()
-                .find(|s| !s.starts_with('{'))
-                .and_then(|s| s.parse::<f64>().ok())
-            {
-                metrics.load_1m = Some(first_num);
-            }
-        }
-        if lines.len() > 2 {
-            if let Ok(total) = lines[2].trim().parse::<u64>() {
-                metrics.ram_total_bytes = Some(total);
-            }
-        }
-        if lines.len() > 3 {
-            // "total = 3072.00M  used = 512.00M  free = 2560.00M  (encrypted)"
-            if let Some(used_idx) = lines[3].find("used = ") {
-                let rest = &lines[3][used_idx + 7..];
-                if let Some(token) = rest.split_whitespace().next() {
-                    if let Some(last_char) = token.chars().last() {
-                        let num_part = &token[..token.len() - 1];
-                        if let Ok(val) = num_part.parse::<f64>() {
-                            let scale: u64 = match last_char {
-                                'K' => 1024,
-                                'M' => 1024 * 1024,
-                                'G' => 1024 * 1024 * 1024,
-                                _ => 1,
-                            };
-                            metrics.swap_used_bytes = Some((val * scale as f64) as u64);
-                        }
-                    }
-                }
-            }
-        }
-
-        // vm_stat for used RAM
-        let vm_out = run_cmd("vm_stat", &[]);
-        let mut page_size: u64 = 4096;
-        for line in vm_out.lines() {
-            if line.contains("page size of ") {
-                if let Some(start) = line.find("page size of ") {
-                    let rest = &line[start + 13..];
-                    if let Some(end) = rest.find(" bytes") {
-                        if let Ok(ps) = rest[..end].trim().parse::<u64>() {
-                            page_size = ps;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut anonymous: Option<u64> = None;
-        let mut purgeable: Option<u64> = None;
-        let mut wired: Option<u64> = None;
-        let mut compressor: Option<u64> = None;
-
-        for line in vm_out.lines() {
-            if line.starts_with("Anonymous pages:") {
-                anonymous = extract_vm_stat_count(line);
-            } else if line.starts_with("Pages purgeable:") {
-                purgeable = extract_vm_stat_count(line);
-            } else if line.starts_with("Pages wired down:") {
-                wired = extract_vm_stat_count(line);
-            } else if line.starts_with("Pages occupied by compressor:") {
-                compressor = extract_vm_stat_count(line);
-            }
-        }
-
-        if let (Some(anon), Some(purge), Some(wire), Some(comp)) =
-            (anonymous, purgeable, wired, compressor)
-        {
-            let app_pages = anon.saturating_sub(purge);
-            let used_pages = app_pages + wire + comp;
-            metrics.ram_used_bytes = Some(used_pages * page_size);
-        }
-
-        // GPU via ioreg
-        let ioreg_out = run_cmd(
-            "ioreg",
-            &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
-        );
-        let mut max_gpu = 0;
-        let mut found_gpu = false;
-        let target = "\"Device Utilization %\"";
-        let mut idx = 0;
-        while let Some(pos) = ioreg_out[idx..].find(target) {
-            let start = idx + pos + target.len();
-            if let Some(eq_rel) = ioreg_out[start..].find('=') {
-                let num_start = start + eq_rel + 1;
-                let num_digits: String = ioreg_out[num_start..]
-                    .chars()
-                    .skip_while(|c| c.is_whitespace())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(val) = num_digits.parse::<u32>() {
-                    max_gpu = max_gpu.max(val);
-                    found_gpu = true;
-                }
-            }
-            idx = start;
-        }
-        if found_gpu {
-            metrics.gpu = GpuReport::Mac(Some(max_gpu));
-        }
+        fill_mac_metrics(&mut metrics);
     } else if cfg!(target_os = "linux") {
         fill_linux_metrics(&mut metrics);
     }
-
-    if let Some(cores) = metrics.cores {
-        if cores > 0 && has_processes {
-            metrics.cpu_percent = Some(cpu_sum / cores as f64);
-        }
-    }
-
+    metrics.cpu_percent = cpu_percent(cpu_sum, metrics.cores, has_processes);
     metrics
 }
 
-fn extract_vm_stat_count(line: &str) -> Option<u64> {
-    let colon_pos = line.find(':')?;
-    let val_str = line[colon_pos + 1..].trim().trim_end_matches('.');
-    val_str.parse::<u64>().ok()
+fn cpu_percent(cpu_sum: f64, cores: Option<usize>, has_processes: bool) -> Option<f64> {
+    if !has_processes {
+        return None;
+    }
+    let cores = cores.filter(|count| *count > 0)?;
+    Some(cpu_sum / cores as f64)
+}
+
+fn fill_mac_metrics(metrics: &mut SystemMetrics) {
+    apply_sysctl(
+        metrics,
+        &run_cmd(
+            "sysctl",
+            &["-n", "hw.ncpu", "vm.loadavg", "hw.memsize", "vm.swapusage"],
+        ),
+    );
+    apply_vm_stat(metrics, &run_cmd("vm_stat", &[]));
+    if let Some(percent) = max_accelerator_util(&run_cmd(
+        "ioreg",
+        &["-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+    )) {
+        metrics.gpu = GpuReport::Mac(Some(percent));
+    }
+}
+
+fn apply_sysctl(metrics: &mut SystemMetrics, text: &str) {
+    let mut lines = text.lines();
+    metrics.cores = lines.next().and_then(|line| line.trim().parse().ok());
+    metrics.load_1m = lines.next().and_then(|line| {
+        line.split_whitespace()
+            .find(|token| !token.starts_with('{'))?
+            .parse()
+            .ok()
+    });
+    metrics.ram_total_bytes = lines.next().and_then(|line| line.trim().parse().ok());
+    metrics.swap_used_bytes = lines.next().and_then(swap_used_from_sysctl);
+}
+
+/// `vm.swapusage` looks like `used = 512.00M`. The suffix is the unit.
+fn swap_used_from_sysctl(line: &str) -> Option<u64> {
+    let token = line.split_once("used = ")?.1.split_whitespace().next()?;
+    let mut chars = token.chars();
+    let suffix = chars.next_back()?;
+    let scale = match suffix {
+        'K' => 1024.0,
+        'M' => 1024.0 * 1024.0,
+        'G' => GIB,
+        _ => 1.0,
+    };
+    let value: f64 = chars.as_str().parse().ok()?;
+    Some((value * scale) as u64)
+}
+
+fn apply_vm_stat(metrics: &mut SystemMetrics, text: &str) {
+    let mut page_size = 4096u64;
+    let mut anonymous = None;
+    let mut purgeable = None;
+    let mut wired = None;
+    let mut compressor = None;
+    for line in text.lines() {
+        if let Some(size) = page_size_of(line) {
+            page_size = size;
+        }
+        if line.starts_with("Anonymous pages:") {
+            anonymous = vm_count(line);
+        } else if line.starts_with("Pages purgeable:") {
+            purgeable = vm_count(line);
+        } else if line.starts_with("Pages wired down:") {
+            wired = vm_count(line);
+        } else if line.starts_with("Pages occupied by compressor:") {
+            compressor = vm_count(line);
+        }
+    }
+    if let (Some(anon), Some(purge), Some(wire), Some(comp)) =
+        (anonymous, purgeable, wired, compressor)
+    {
+        // App memory is anonymous pages that are not also purgeable, plus
+        // wired and compressor pages. That matches Activity Monitor's "Memory Used".
+        let used_pages = anon.saturating_sub(purge) + wire + comp;
+        metrics.ram_used_bytes = Some(used_pages * page_size);
+    }
+}
+
+fn page_size_of(line: &str) -> Option<u64> {
+    let rest = line.split_once("page size of ")?.1;
+    rest.split_once(" bytes")?.0.trim().parse().ok()
+}
+
+fn vm_count(line: &str) -> Option<u64> {
+    line.split_once(':')?
+        .1
+        .trim()
+        .trim_end_matches('.')
+        .parse()
+        .ok()
+}
+
+/// Several accelerators can report at once. The line shows the busiest one.
+fn max_accelerator_util(ioreg: &str) -> Option<u32> {
+    let target = "\"Device Utilization %\"";
+    let mut max_gpu = 0u32;
+    let mut found = false;
+    let mut rest = ioreg;
+    while let Some(pos) = rest.find(target) {
+        rest = &rest[pos + target.len()..];
+        let Some(after_eq) = rest.split_once('=').map(|(_, value)| value) else {
+            continue;
+        };
+        let digits: String = after_eq
+            .chars()
+            .skip_while(|ch| ch.is_whitespace())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if let Ok(value) = digits.parse() {
+            max_gpu = max_gpu.max(value);
+            found = true;
+        }
+    }
+    found.then_some(max_gpu)
 }
 
 fn fill_linux_metrics(metrics: &mut SystemMetrics) {
-    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+    if let Ok(text) = fs::read_to_string("/proc/loadavg") {
         metrics.load_1m = load_1m_from_loadavg(&text);
     }
-    if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
+    if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
         metrics.cores = cores_from_cpuinfo(&text);
     }
-    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(mem) = parse_meminfo(&text) {
-            metrics.ram_total_bytes = Some(mem.total_bytes);
-            metrics.ram_used_bytes = Some(mem.used_bytes);
-            metrics.swap_used_bytes = mem.swap_used_bytes;
-        }
+    if let Ok(text) = fs::read_to_string("/proc/meminfo")
+        && let Some(mem) = parse_meminfo(&text)
+    {
+        metrics.ram_total_bytes = Some(mem.total_bytes);
+        metrics.ram_used_bytes = Some(mem.used_bytes);
+        metrics.swap_used_bytes = mem.swap_used_bytes;
     }
     metrics.gpu = GpuReport::Linux(linux_gpus());
 }
@@ -298,18 +275,19 @@ fn load_1m_from_loadavg(text: &str) -> Option<f64> {
 
 /// Logical CPUs, matching macOS `hw.ncpu`. A `processor` key is one logical CPU.
 fn cores_from_cpuinfo(text: &str) -> Option<usize> {
-    let n = text
+    let count = text
         .lines()
         .filter(|line| {
             line.split_once(':')
                 .is_some_and(|(key, _)| key.trim() == "processor")
         })
         .count();
-    if n == 0 { None } else { Some(n) }
+    if count == 0 { None } else { Some(count) }
 }
 
 /// `MemAvailable` is the kernel's own estimate of memory that can be used
-/// without swapping. Used is what is not in that pool.
+/// without swapping. Used is what is not in that pool. A broken swap figure
+/// must not throw away the RAM reading.
 fn parse_meminfo(text: &str) -> Option<MemSnap> {
     let mut total_kb = None;
     let mut available_kb = None;
@@ -329,11 +307,8 @@ fn parse_meminfo(text: &str) -> Option<MemSnap> {
             _ => {}
         }
     }
-    let total_kb = total_kb?;
-    let available_kb = available_kb?;
-    let total_bytes = total_kb.checked_mul(1024)?;
-    let available_bytes = available_kb.checked_mul(1024)?;
-    // A broken swap figure must not throw away the RAM reading.
+    let total_bytes = total_kb?.checked_mul(1024)?;
+    let available_bytes = available_kb?.checked_mul(1024)?;
     let swap_used_bytes = match (swap_total_kb, swap_free_kb) {
         (Some(total), Some(free)) => total.saturating_sub(free).checked_mul(1024),
         _ => None,
@@ -347,24 +322,12 @@ fn parse_meminfo(text: &str) -> Option<MemSnap> {
 
 fn linux_gpus() -> Vec<GpuCard> {
     let mut cards = read_drm_cards();
-    if cards
-        .iter()
-        .any(|card| card_needs_idle_sample(card.driver.as_deref()))
-    {
-        let started = Instant::now();
-        let befores: Vec<Option<u64>> = cards.iter().map(read_idle_counter).collect();
-        std::thread::sleep(Duration::from_millis(200));
-        let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
-        for (card, before) in cards.iter_mut().zip(befores) {
-            card.idle_before_ms = before;
-            card.idle_after_ms = read_idle_counter(card);
-            card.wall_ms = wall_ms;
-        }
-    }
+    sample_idle(&mut cards);
     let nvidia_smi = if cards
         .iter()
-        .any(|card| is_nvidia_smi_driver(card.driver.as_deref()))
+        .any(|card| card.driver.as_deref().is_some_and(is_nvidia_smi_driver))
     {
+        // Sysfs has no utilization for the proprietary driver.
         run_cmd(
             "nvidia-smi",
             &[
@@ -378,55 +341,51 @@ fn linux_gpus() -> Vec<GpuCard> {
     gpus_from_cards(cards, &nvidia_smi)
 }
 
-fn card_needs_idle_sample(driver: Option<&str>) -> bool {
-    matches!(driver, Some("i915") | Some("xe"))
-}
-
-fn is_nvidia_smi_driver(driver: Option<&str>) -> bool {
-    matches!(driver, Some("nvidia") | Some("nvidia-drm"))
+fn is_nvidia_smi_driver(driver: &str) -> bool {
+    matches!(driver, "nvidia" | "nvidia-drm")
 }
 
 fn read_drm_cards() -> Vec<CardSnap> {
-    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
         return Vec::new();
     };
-    let mut cards = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if card_index(&name).is_none() {
-            continue;
-        }
-        let base = entry.path();
-        let device_key = std::fs::canonicalize(base.join("device"))
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| format!("unresolved:{name}"));
-        let driver = std::fs::read_link(base.join("device/driver"))
-            .ok()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            });
-        let busy_text = if driver.as_deref() == Some("amdgpu") {
-            std::fs::read_to_string(base.join("device/gpu_busy_percent")).ok()
-        } else {
-            None
-        };
-        let idle_path = driver
-            .as_deref()
-            .and_then(|driver| first_existing_idle(&base, driver));
-        cards.push(CardSnap {
-            name,
-            device_key,
-            vendor_text: std::fs::read_to_string(base.join("device/vendor")).ok(),
-            driver,
-            busy_text,
-            idle_before_ms: None,
-            idle_after_ms: None,
-            wall_ms: 0,
-            idle_path,
+    entries
+        .flatten()
+        .filter_map(|entry| card_snap(&entry))
+        .collect()
+}
+
+fn card_snap(entry: &DirEntry) -> Option<CardSnap> {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    // Connector nodes (`card0-HDMI-A-1`) are not separate GPUs.
+    card_index(&name)?;
+    let base = entry.path();
+    let device_key = fs::canonicalize(base.join("device"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| format!("unresolved:{name}"));
+    let driver = fs::read_link(base.join("device/driver"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
         });
-    }
-    cards
+    let busy_text = (driver.as_deref() == Some("amdgpu"))
+        .then(|| fs::read_to_string(base.join("device/gpu_busy_percent")).ok())
+        .flatten();
+    let idle_path = driver
+        .as_deref()
+        .and_then(|driver| first_existing_idle(&base, driver));
+    Some(CardSnap {
+        name,
+        device_key,
+        vendor_text: fs::read_to_string(base.join("device/vendor")).ok(),
+        driver,
+        busy_text,
+        idle_path,
+        idle_before_ms: None,
+        idle_after_ms: None,
+        wall_ms: 0,
+    })
 }
 
 fn card_index(name: &str) -> Option<u32> {
@@ -454,9 +413,30 @@ fn first_existing_idle(card: &Path, driver: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// RC6 and Xe GT-idle tick in milliseconds. The window has to be long enough
+/// for the counter to move and short enough that `crew load` stays quick.
+fn sample_idle(cards: &mut [CardSnap]) {
+    let needs_sample = cards.iter().any(|card| {
+        card.driver
+            .as_deref()
+            .is_some_and(|driver| !idle_counter_candidates(driver).is_empty())
+    });
+    if !needs_sample {
+        return;
+    }
+    let started = Instant::now();
+    let befores: Vec<Option<u64>> = cards.iter().map(read_idle_counter).collect();
+    thread::sleep(Duration::from_millis(200));
+    let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
+    for (card, before) in cards.iter_mut().zip(befores) {
+        card.idle_before_ms = before;
+        card.idle_after_ms = read_idle_counter(card);
+        card.wall_ms = wall_ms;
+    }
+}
+
 fn read_idle_counter(card: &CardSnap) -> Option<u64> {
-    let path = card.idle_path.as_ref()?;
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = fs::read_to_string(card.idle_path.as_ref()?).ok()?;
     parse_u64_token(&text)
 }
 
@@ -487,23 +467,21 @@ fn vendor_label(id: u32) -> String {
 }
 
 fn parse_nvidia_smi(text: &str) -> Vec<Option<u32>> {
-    let mut values = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((_, util)) = line.split_once(',') else {
-            continue;
-        };
-        let util = util.trim().trim_matches(|ch| ch == '[' || ch == ']');
-        if util.eq_ignore_ascii_case("n/a") {
-            values.push(None);
-            continue;
-        }
-        values.push(parse_percent(util));
-    }
-    values
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let util = line.split_once(',')?.1;
+            let util = util.trim().trim_matches(|ch| ch == '[' || ch == ']');
+            Some(if util.eq_ignore_ascii_case("n/a") {
+                None
+            } else {
+                parse_percent(util)
+            })
+        })
+        .collect()
 }
 
 /// RC6 and Xe GT-idle are cumulative idle time. Busy is the part of the
@@ -517,11 +495,7 @@ fn busy_from_idle_ms(before: u64, after: u64, wall_ms: u64) -> Option<u32> {
     if idle >= wall_ms {
         return Some(0);
     }
-    let busy = (wall_ms - idle) as f64 * 100.0 / wall_ms as f64;
-    if !busy.is_finite() {
-        return None;
-    }
-    let rounded = busy.round();
+    let rounded = ((wall_ms - idle) as f64 * 100.0 / wall_ms as f64).round();
     if !(0.0..=100.0).contains(&rounded) {
         return None;
     }
@@ -538,6 +512,7 @@ fn gpus_from_cards(mut cards: Vec<CardSnap>, nvidia_smi: &str) -> Vec<GpuCard> {
         if card_index(&card.name).is_none() {
             continue;
         }
+        // Several DRM nodes can name one GPU. The lowest card index wins.
         if !seen.insert(card.device_key.clone()) {
             continue;
         }
@@ -545,62 +520,53 @@ fn gpus_from_cards(mut cards: Vec<CardSnap>, nvidia_smi: &str) -> Vec<GpuCard> {
             .vendor_text
             .as_deref()
             .and_then(parse_vendor_id)
-            .map_or_else(|| "n/a".to_string(), vendor_label);
-        let percent = match card.driver.as_deref() {
-            Some("amdgpu") => card.busy_text.as_deref().and_then(parse_percent),
-            Some("i915") | Some("xe") => match (card.idle_before_ms, card.idle_after_ms) {
-                (Some(before), Some(after)) => busy_from_idle_ms(before, after, card.wall_ms),
-                _ => None,
-            },
-            Some(driver) if is_nvidia_smi_driver(Some(driver)) => {
-                let percent = nvidia.get(nvidia_index).copied().flatten();
-                nvidia_index += 1;
-                percent
-            }
-            _ => None,
-        };
-        out.push(GpuCard { vendor, percent });
+            .map(vendor_label)
+            .unwrap_or_else(|| "n/a".to_string());
+        out.push(GpuCard {
+            vendor,
+            percent: card_percent(&card, &nvidia, &mut nvidia_index),
+        });
     }
     out
 }
 
-/// Format the first line matching subagentcounter exactly.
-pub fn format_load_line(metrics: &SystemMetrics) -> String {
-    let cpu_text = metrics
-        .cpu_percent
-        .map(|c| format!("{:.0}%", c))
-        .unwrap_or_else(|| "?%".to_string());
-
-    let load_text = metrics
-        .load_1m
-        .map(|l| format!("{:.1}", l))
-        .unwrap_or_else(|| "?".to_string());
-
-    let cores_text = metrics
-        .cores
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "?".to_string());
-
-    let ram_text = match (metrics.ram_used_bytes, metrics.ram_total_bytes) {
-        (Some(used), Some(total)) if total > 0 => {
-            let used_gb = used as f64 / (1024.0 * 1024.0 * 1024.0);
-            let total_gb = total as f64 / (1024.0 * 1024.0 * 1024.0);
-            let pct = ((used as f64 * 100.0) / total as f64).round() as u64;
-            let mut s = format!("{:.1} / {:.1} GB ({}%)", used_gb, total_gb, pct);
-            if let Some(swap) = metrics.swap_used_bytes {
-                if swap > 0 {
-                    let swap_gb = swap as f64 / (1024.0 * 1024.0 * 1024.0);
-                    s.push_str(&format!(", swap {:.1} GB", swap_gb));
-                }
-            }
-            s
+fn card_percent(card: &CardSnap, nvidia: &[Option<u32>], nvidia_index: &mut usize) -> Option<u32> {
+    match card.driver.as_deref() {
+        Some("amdgpu") => card.busy_text.as_deref().and_then(parse_percent),
+        Some(driver) if !idle_counter_candidates(driver).is_empty() => {
+            busy_from_idle_ms(card.idle_before_ms?, card.idle_after_ms?, card.wall_ms)
         }
-        _ => "?".to_string(),
-    };
+        Some(driver) if is_nvidia_smi_driver(driver) => {
+            let percent = nvidia.get(*nvidia_index).copied().flatten();
+            *nvidia_index += 1;
+            percent
+        }
+        _ => None,
+    }
+}
 
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / GIB
+}
+
+/// The first printed line. The shape stays fixed so two machines can be
+/// compared by eye. Missing readings are `?`, not a dropped field.
+pub fn format_load_line(metrics: &SystemMetrics) -> String {
+    let cpu = match metrics.cpu_percent {
+        Some(value) => format!("{value:.0}%"),
+        None => "?%".to_string(),
+    };
+    let load = match metrics.load_1m {
+        Some(value) => format!("{value:.1}"),
+        None => "?".to_string(),
+    };
+    let cores = match metrics.cores {
+        Some(value) => value.to_string(),
+        None => "?".to_string(),
+    };
     let mut line = format!(
-        "CPU {} (load {} / {} cores) | RAM {}",
-        cpu_text, load_text, cores_text, ram_text
+        "CPU {cpu} (load {load} / {cores} cores) | RAM {}",
+        format_ram(metrics)
     );
     if let Some(gpu) = format_gpu(&metrics.gpu) {
         line.push_str(" | ");
@@ -609,19 +575,27 @@ pub fn format_load_line(metrics: &SystemMetrics) -> String {
     line
 }
 
+fn format_ram(metrics: &SystemMetrics) -> String {
+    let (Some(used), Some(total)) = (metrics.ram_used_bytes, metrics.ram_total_bytes) else {
+        return "?".to_string();
+    };
+    if total == 0 {
+        return "?".to_string();
+    }
+    let pct = ((used as f64 * 100.0) / total as f64).round() as u64;
+    let mut text = format!("{:.1} / {:.1} GB ({pct}%)", gib(used), gib(total));
+    if let Some(swap) = metrics.swap_used_bytes.filter(|swap| *swap > 0) {
+        text.push_str(&format!(", swap {:.1} GB", gib(swap)));
+    }
+    text
+}
+
 fn format_gpu(report: &GpuReport) -> Option<String> {
     match report {
-        GpuReport::Mac(percent) => {
-            let text = match percent {
-                Some(value) => format!("{value}%"),
-                None => "?%".to_string(),
-            };
-            Some(format!("GPU {text}"))
-        }
+        GpuReport::Mac(Some(value)) => Some(format!("GPU {value}%")),
+        GpuReport::Mac(None) => Some("GPU ?%".to_string()),
+        GpuReport::Linux(cards) if cards.is_empty() => None,
         GpuReport::Linux(cards) => {
-            if cards.is_empty() {
-                return None;
-            }
             let parts: Vec<String> = cards
                 .iter()
                 .map(|card| match card.percent {
@@ -634,36 +608,39 @@ fn format_gpu(report: &GpuReport) -> Option<String> {
     }
 }
 
-/// Running crew agents per provider. A run is exactly one `crew <provider>`
-/// process: detached jobs are supervised by `crew --supervise <name>`, which
-/// spawns that same process, so supervisors and the provider CLI's own
-/// children never count a run twice.
+/// A run is the `crew <provider>` process itself. Detached jobs are supervised
+/// by `crew --supervise`, which spawns that same process, so the supervisor
+/// and the provider CLI's own children must not count a second time.
 pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<&'static str, Vec<u32>> {
     let mut matches: HashMap<&'static str, Vec<u32>> = PROVIDERS
         .iter()
         .map(|&(name, _)| (name, Vec::new()))
         .collect();
-
     for record in processes.values() {
-        let is_crew = Path::new(&record.executable)
-            .file_name()
-            .is_some_and(|n| n == "crew");
-        if !is_crew {
+        let Some(name) = provider_of(record) else {
             continue;
-        }
-        if let Some(&(name, _)) = PROVIDERS
-            .iter()
-            .find(|(_, names)| names.contains(&record.arg1.as_str()))
-        {
-            matches.get_mut(name).unwrap().push(record.pid);
+        };
+        if let Some(pids) = matches.get_mut(name) {
+            pids.push(record.pid);
         }
     }
-
     for pids in matches.values_mut() {
         pids.sort_unstable();
     }
-
     matches
+}
+
+fn provider_of(record: &ProcessRecord) -> Option<&'static str> {
+    let is_crew = Path::new(&record.executable)
+        .file_name()
+        .is_some_and(|name| name == "crew");
+    if !is_crew {
+        return None;
+    }
+    PROVIDERS
+        .iter()
+        .find(|(_, names)| names.contains(&record.arg1.as_str()))
+        .map(|(name, _)| *name)
 }
 
 /// One line per provider that has running crew agents, in print order. Idle
@@ -676,13 +653,12 @@ pub fn format_provider_lines(agent_pids: &HashMap<&'static str, Vec<u32>>) -> Ve
             if pids.is_empty() {
                 return None;
             }
-            let pid_strs: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
-            Some(format!(
-                "{}: {} | {}",
-                provider,
-                pids.len(),
-                pid_strs.join("; ")
-            ))
+            let joined = pids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            Some(format!("{provider}: {} | {joined}", pids.len()))
         })
         .collect()
 }
@@ -692,13 +668,10 @@ pub fn print_load() -> Result<i32, Error> {
     let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
     let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
     let metrics = collect_metrics(cpu_sum, !processes.is_empty());
-
     println!("{}", format_load_line(&metrics));
-
     for line in format_provider_lines(&find_agent_pids(&processes)) {
-        println!("{}", line);
+        println!("{line}");
     }
-
     Ok(0)
 }
 
@@ -714,14 +687,12 @@ mod tests {
             cores: Some(10),
             // 17_440_000_000 bytes = 16.242 GiB (formats as 16.2 GB, 67.7% -> 68%)
             ram_used_bytes: Some(17_440_000_000),
-            ram_total_bytes: Some((24.0 * 1024.0 * 1024.0 * 1024.0) as u64),
+            ram_total_bytes: Some((24.0 * GIB) as u64),
             gpu: GpuReport::Mac(Some(4)),
-            swap_used_bytes: Some((0.5 * 1024.0 * 1024.0 * 1024.0) as u64),
+            swap_used_bytes: Some((0.5 * GIB) as u64),
         };
-
-        let line = format_load_line(&metrics);
         assert_eq!(
-            line,
+            format_load_line(&metrics),
             "CPU 12% (load 2.4 / 10 cores) | RAM 16.2 / 24.0 GB (68%), swap 0.5 GB | GPU 4%"
         );
     }
@@ -732,15 +703,13 @@ mod tests {
             cpu_percent: Some(5.0),
             load_1m: Some(1.5),
             cores: Some(8),
-            ram_used_bytes: Some((8.0 * 1024.0 * 1024.0 * 1024.0) as u64),
-            ram_total_bytes: Some((16.0 * 1024.0 * 1024.0 * 1024.0) as u64),
+            ram_used_bytes: Some((8.0 * GIB) as u64),
+            ram_total_bytes: Some((16.0 * GIB) as u64),
             gpu: GpuReport::Mac(Some(0)),
             swap_used_bytes: Some(0),
         };
-
-        let line = format_load_line(&metrics);
         assert_eq!(
-            line,
+            format_load_line(&metrics),
             "CPU 5% (load 1.5 / 8 cores) | RAM 8.0 / 16.0 GB (50%) | GPU 0%"
         );
     }
@@ -828,6 +797,13 @@ SwapFree:         50000 kB
         card
     }
 
+    fn gpu(vendor: &str, percent: Option<u32>) -> GpuCard {
+        GpuCard {
+            vendor: vendor.to_string(),
+            percent,
+        }
+    }
+
     #[test]
     fn linux_gpu_fixtures() {
         assert_eq!(
@@ -869,43 +845,18 @@ SwapFree:         50000 kB
             ),
             with_idle(card("card9", "pci-xe", "0x8086", Some("xe")), 0, 50, 200),
         ];
-        let smi = "0, 81\n1, [N/A]\n";
-        let gpus = gpus_from_cards(cards, smi);
+        let gpus = gpus_from_cards(cards, "0, 81\n1, [N/A]\n");
         assert_eq!(
             gpus,
             vec![
-                GpuCard {
-                    vendor: "intel".to_string(),
-                    percent: Some(50)
-                },
-                GpuCard {
-                    vendor: "nvidia".to_string(),
-                    percent: Some(81)
-                },
-                GpuCard {
-                    vendor: "nvidia".to_string(),
-                    percent: None
-                },
-                GpuCard {
-                    vendor: "nvidia".to_string(),
-                    percent: None
-                },
-                GpuCard {
-                    vendor: "amd".to_string(),
-                    percent: Some(7)
-                },
-                GpuCard {
-                    vendor: "0x1234".to_string(),
-                    percent: None
-                },
-                GpuCard {
-                    vendor: "amd".to_string(),
-                    percent: None
-                },
-                GpuCard {
-                    vendor: "intel".to_string(),
-                    percent: Some(75)
-                },
+                gpu("intel", Some(50)),
+                gpu("nvidia", Some(81)),
+                gpu("nvidia", None),
+                gpu("nvidia", None),
+                gpu("amd", Some(7)),
+                gpu("0x1234", None),
+                gpu("amd", None),
+                gpu("intel", Some(75)),
             ]
         );
 
