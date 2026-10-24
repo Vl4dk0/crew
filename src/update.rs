@@ -7,8 +7,6 @@
 //! binary into place, so a crew process that is already running keeps the
 //! one it loaded.
 
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use crate::error::Error;
@@ -29,7 +27,7 @@ const HARNESSES: [&str; 4] = ["claude", "codex", "grok", "agy"];
 pub fn run() -> Result<i32, Error> {
     let mut failed = false;
     for bin in HARNESSES {
-        if !binary_on_path(bin) {
+        if !providers::binary_on_path(bin) {
             println!("{bin}: not found");
             continue;
         }
@@ -90,6 +88,12 @@ enum CrewInstall {
 }
 
 fn update_self() -> Result<(), String> {
+    // If cargo is missing, crew cannot have been installed via cargo here and
+    // cannot update itself. Skip rather than failing the run.
+    if !providers::binary_on_path("cargo") {
+        println!("crew: cargo not found, skipped");
+        return Ok(());
+    }
     let list = read_install_list()?;
     match parse_install_list(&list) {
         CrewInstall::Missing => {
@@ -121,7 +125,7 @@ fn read_install_list() -> Result<String, String> {
         ],
         VERSION_TIMEOUT,
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| format!("cargo install --list: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());
     }
@@ -155,8 +159,8 @@ fn install_if_moved(url: &str, branch: Option<&str>, installed: &str) -> Result<
     }
     argv.push("--locked".to_string());
     argv.push("--force".to_string());
-    let captured =
-        providers::run_bounded(&argv, CREW_INSTALL_TIMEOUT).map_err(|err| err.to_string())?;
+    let captured = providers::run_bounded(&argv, CREW_INSTALL_TIMEOUT)
+        .map_err(|err| format!("cargo install: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());
     }
@@ -186,7 +190,7 @@ fn remote_sha(url: &str, branch: Option<&str>) -> Result<String, String> {
         ],
         LS_REMOTE_TIMEOUT,
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| format!("git ls-remote: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());
     }
@@ -369,7 +373,7 @@ fn is_hex_sha(text: &str) -> bool {
 fn read_version(bin: &str) -> Result<String, String> {
     let captured =
         providers::run_bounded(&[bin.to_string(), "--version".to_string()], VERSION_TIMEOUT)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| format!("{bin} --version: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());
     }
@@ -388,7 +392,7 @@ fn read_version(bin: &str) -> Result<String, String> {
 
 fn run_update(bin: &str) -> Result<(), String> {
     let captured = providers::run_bounded(&[bin.to_string(), "update".to_string()], UPDATE_TIMEOUT)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("{bin} update: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());
     }
@@ -467,20 +471,6 @@ fn strip_ansi(text: &str) -> String {
         out.push(ch);
     }
     out
-}
-
-fn binary_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        fs::metadata(&candidate).is_ok_and(|meta| meta.is_file() && is_executable(&meta))
-    })
-}
-
-fn is_executable(meta: &fs::Metadata) -> bool {
-    meta.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(test)]
