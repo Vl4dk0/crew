@@ -6,9 +6,13 @@ Start with `crew models` for the tier table, then `crew <provider> --tier fast "
 
 ## Install
 
+Runs on macOS and Linux. Needs a Rust toolchain and at least one of the `claude`, `agy`, `grok` or `codex` CLIs, logged in.
+
 ```console
-cargo install --path .
+cargo install --git https://github.com/Vl4dk0/crew --locked
 ```
+
+`crew update` later updates the installed CLIs and crew itself.
 
 ## Quick Start
 
@@ -25,7 +29,7 @@ crew load
 # Check subscription plan quota meters and reset times
 crew usage
 
-# Update each installed CLI, then crew (a path install is left alone)
+# Update each installed CLI, then crew
 crew update
 ```
 
