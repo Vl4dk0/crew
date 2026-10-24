@@ -402,19 +402,7 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    // SAFETY: setsid runs only in the forked child. It is async-signal-safe,
-    // and it is what puts the provider in its own process group so a timeout
-    // can signal grandchildren too.
-    unsafe {
-        cmd.pre_exec(|| {
-            let rc = libc::setsid();
-            if rc == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
+    detach_session(&mut cmd);
     match kind {
         StdioKind::Piped => {
             cmd.stdin(Stdio::null())
@@ -545,6 +533,57 @@ fn python_status(status: ExitStatus) -> i32 {
         return -signal;
     }
     1
+}
+
+/// New session for the child, so its descendants share a process group the
+/// caller can signal after the child itself has exited.
+pub(crate) fn detach_session(cmd: &mut Command) {
+    // SAFETY: setsid runs only in the forked child. It is async-signal-safe,
+    // and it is what puts the child in its own process group so a later
+    // killpg reaches descendants that stay in that group.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+/// SIGTERM the child's process group, then SIGKILL if anyone is still in it.
+/// The direct child is reaped here. Descendants that outlive it are the point:
+/// a quota probe can exit while the servers it spawned keep the group occupied.
+pub(crate) fn terminate_group(child: &mut Child) {
+    let pid = child.id();
+    kill_group(pid, libc::SIGTERM);
+    let start = Instant::now();
+    loop {
+        let reaped = matches!(child.try_wait(), Ok(Some(_)));
+        if reaped && !group_alive(pid) {
+            return;
+        }
+        if start.elapsed() >= Duration::from_secs(5) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    kill_group(pid, libc::SIGKILL);
+    let _ = child.wait();
+}
+
+fn group_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: killpg with signal 0 only probes membership. ESRCH means the
+    // group is gone; any other result means someone is still in it.
+    let rc = unsafe { libc::killpg(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn kill_group(pid: u32, signal: i32) {

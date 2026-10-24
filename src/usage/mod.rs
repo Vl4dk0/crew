@@ -7,9 +7,11 @@ use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
+
+use crate::providers::{detach_session, terminate_group};
 
 use serde_json::Value;
 
@@ -26,8 +28,29 @@ fn state_dir() -> PathBuf {
     }
 }
 
+/// The probe's descendants stay in its session. Drop signals that group so
+/// MCP servers do not keep running after `agy` has already exited.
+struct ProbeChild {
+    child: Child,
+}
+
+impl ProbeChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+}
+
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        terminate_group(&mut self.child);
+    }
+}
+
 fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
+    // agy starts MCP servers as grandchildren. Own the session so the probe
+    // can signal them on the way out, not only the direct child.
+    detach_session(&mut cmd);
     let mut master: libc::c_int = 0;
     let mut slave: libc::c_int = 0;
 
@@ -53,9 +76,11 @@ fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
     cmd.stdout(Stdio::from(slave_file));
     cmd.stderr(Stdio::from(slave_file_err));
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::new(2, format!("failed to spawn on pty: {}", e)))?;
+    let mut child = ProbeChild {
+        child: cmd
+            .spawn()
+            .map_err(|e| Error::new(2, format!("failed to spawn on pty: {}", e)))?,
+    };
 
     let mut master_file = unsafe { fs::File::from_raw_fd(master) };
     let master_fd = master_file.as_raw_fd();
@@ -107,8 +132,6 @@ fn run_on_pty(mut cmd: Command, timeout: Duration) -> Result<Vec<u8>, Error> {
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
     Ok(output)
 }
 
@@ -855,5 +878,60 @@ mod tests {
             .and_then(super::render::reset_instant);
         assert!(reset.is_some());
         assert_eq!(gauges[1].window_secs, Some(7 * 24 * 3600));
+    }
+
+    #[test]
+    fn pty_probe_kills_grandchild_that_ignores_hangup() {
+        let dir = std::env::temp_dir().join(format!("crew-pty-group-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("pid");
+        let script = r#"
+import os, signal, sys, time
+path = sys.argv[1]
+pid = os.fork()
+if pid == 0:
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(path, "w") as handle:
+        handle.write(str(os.getpid()))
+        handle.flush()
+    time.sleep(60)
+else:
+    for _ in range(100):
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            break
+        time.sleep(0.02)
+    os._exit(0)
+"#;
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c").arg(script).arg(&pid_path);
+        super::run_on_pty(cmd, std::time::Duration::from_secs(5)).expect("pty probe");
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("pid integer");
+        let mut state = String::new();
+        for _ in 0..50 {
+            let listed = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps");
+            state = String::from_utf8_lossy(&listed.stdout).trim().to_string();
+            let running = state.starts_with('S')
+                || state.starts_with('R')
+                || state.starts_with('U')
+                || state.starts_with('I');
+            if !running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let running = state.starts_with('S')
+            || state.starts_with('R')
+            || state.starts_with('U')
+            || state.starts_with('I');
+        assert!(!running, "grandchild {pid} still running (state {state:?})");
     }
 }

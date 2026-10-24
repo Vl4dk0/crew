@@ -5,6 +5,8 @@ mod grok;
 mod proc;
 mod pty;
 
+pub(crate) use proc::{detach_session, terminate_group};
+
 use crate::cli::Invocation;
 use crate::error::Error;
 
