@@ -16,15 +16,6 @@ use super::proc::{
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
-    let resolved = tier::resolve(
-        invocation.provider,
-        invocation.tier,
-        invocation.model.as_deref(),
-        invocation.effort.as_deref(),
-    )?;
-    let model = resolved
-        .model
-        .ok_or_else(|| Error::new(2, "claude needs a model"))?;
     let prompt = take_prompt(invocation)?.ok_or_else(|| {
         Error::new(
             2,
@@ -35,13 +26,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         Some(schema) => Some(proc::load_schema_literal(schema)?),
         None => None,
     };
-    let (argv, note) = claude_argv(
-        invocation,
-        &model,
-        &resolved.effort,
-        &prompt,
-        schema.as_deref(),
-    );
+    let (argv, note) = plan(invocation, &prompt, schema.as_deref())?;
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
     let captured = match proc::launch_or_note(proc::capture(
@@ -72,6 +57,35 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     );
     proc::emit_report(&report);
     Ok(report.code)
+}
+
+/// Same argv `run` launches, so the recorded model cannot drift from the CLI.
+fn plan(
+    invocation: &Invocation,
+    prompt: &str,
+    schema: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), Error> {
+    let resolved = tier::resolve(
+        invocation.provider,
+        invocation.tier,
+        invocation.model.as_deref(),
+        invocation.effort.as_deref(),
+    )?;
+    let model = resolved
+        .model
+        .ok_or_else(|| Error::new(2, "claude needs a model"))?;
+    Ok(claude_argv(
+        invocation,
+        &model,
+        &resolved.effort,
+        prompt,
+        schema,
+    ))
+}
+
+pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
+    let (argv, _) = plan(invocation, "", None)?;
+    Ok(proc::model_arg(&argv))
 }
 
 pub(super) fn claude_argv(

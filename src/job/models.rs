@@ -51,6 +51,10 @@ pub struct JobUsage {
 pub struct RunRecord {
     pub name: String,
     pub provider: String,
+    /// Model flag passed to the provider CLI after tier resolution.
+    /// Absent when that CLI is started without one (grok's account default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub args: Vec<String>,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +151,7 @@ mod tests {
         let mut rec = RunRecord {
             name: "test".to_string(),
             provider: "claude".to_string(),
+            model: None,
             args: vec![],
             cwd: "/tmp".to_string(),
             note: None,

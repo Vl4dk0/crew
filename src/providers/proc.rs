@@ -734,6 +734,13 @@ pub(super) fn bare(provider: Provider) -> Invocation {
     }
 }
 
+/// Model value from `-m` / `--model` on an argv this crate built.
+pub(crate) fn model_arg(argv: &[String]) -> Option<String> {
+    argv.windows(2)
+        .find(|pair| pair[0] == "-m" || pair[0] == "--model")
+        .map(|pair| pair[1].clone())
+}
+
 #[cfg(test)]
 pub(super) fn flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
     argv.windows(2)

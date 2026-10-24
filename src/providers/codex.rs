@@ -25,17 +25,8 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "pass only one of --uncommitted, --base, --commit",
         ));
     }
-    let resolved = tier::resolve(
-        invocation.provider,
-        invocation.tier,
-        invocation.model.as_deref(),
-        invocation.effort.as_deref(),
-    )?;
-    let model = resolved
-        .model
-        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
     let prompt = take_prompt(invocation)?;
-    let (argv, note) = codex_argv(invocation, &model, &resolved.effort, prompt.as_deref());
+    let (argv, note) = plan(invocation, prompt.as_deref())?;
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
     let captured = match proc::launch_or_note(proc::capture(
@@ -97,6 +88,27 @@ fn scope_count(invocation: &Invocation) -> usize {
     usize::from(invocation.uncommitted)
         + usize::from(invocation.base.is_some())
         + usize::from(invocation.commit.is_some())
+}
+
+fn plan(
+    invocation: &Invocation,
+    prompt: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), Error> {
+    let resolved = tier::resolve(
+        invocation.provider,
+        invocation.tier,
+        invocation.model.as_deref(),
+        invocation.effort.as_deref(),
+    )?;
+    let model = resolved
+        .model
+        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
+    Ok(codex_argv(invocation, &model, &resolved.effort, prompt))
+}
+
+pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
+    let (argv, _) = plan(invocation, None)?;
+    Ok(proc::model_arg(&argv))
 }
 
 pub(super) fn codex_argv(
