@@ -13,7 +13,7 @@ use crate::tier;
 
 use super::proc::{
     self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, looks_like_usage_limit,
-    map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
+    map_effort, py_display, py_truthy, shown, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -479,15 +479,57 @@ fn last_json_value(text: &str) -> String {
     }
 }
 
+/// `streaming-messages-json` has no `total_tokens`. The json format's total is
+/// input plus both cache buckets plus output. Reasoning is already inside output.
+fn grok_token_total(usage: &Value) -> Option<u64> {
+    if let Some(total) = count_field(usage.get("total_tokens")) {
+        return Some(total);
+    }
+    let mut sum = 0u64;
+    let mut any = false;
+    for key in [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens",
+    ] {
+        let Some(count) = count_field(usage.get(key)) else {
+            continue;
+        };
+        sum = sum.saturating_add(count);
+        any = true;
+    }
+    any.then_some(sum)
+}
+
+fn count_field(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(count) = value.as_u64() {
+        return Some(count);
+    }
+    let count = value.as_i64()?;
+    u64::try_from(count).ok()
+}
+
 fn grok_usage_line(data: &Value) -> Option<String> {
-    let usage = data.get("usage").filter(|value| py_truthy(Some(value)))?;
-    let mut line = format!(
-        "[crew] tokens={} turns={}",
-        py_display(usage.get("total_tokens")),
-        py_display(data.get("num_turns")),
-    );
-    if let Some(cost) = data.get("total_cost_usd").filter(|value| !value.is_null()) {
-        line.push_str(&format!(" cost=${}", py_display(Some(cost))));
+    let tokens = data
+        .get("usage")
+        .filter(|value| py_truthy(Some(value)))
+        .and_then(grok_token_total);
+    let turns = shown(data.get("num_turns"));
+    let cost = shown(data.get("total_cost_usd"));
+    if tokens.is_none() && turns.is_none() && cost.is_none() {
+        return None;
+    }
+    let mut line = String::from("[crew]");
+    if let Some(tokens) = tokens {
+        line.push_str(&format!(" tokens={tokens}"));
+    }
+    if let Some(turns) = turns {
+        line.push_str(&format!(" turns={turns}"));
+    }
+    if let Some(cost) = cost {
+        line.push_str(&format!(" cost=${cost}"));
     }
     Some(line)
 }
@@ -593,5 +635,64 @@ mod tests {
         let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None);
         assert_eq!(flag(&argv, "--max-turns"), Some("3"));
         assert!(has(&argv, "--continue"));
+    }
+
+    #[test]
+    fn stream_usage_reports_the_token_total() {
+        let input = 10u64;
+        let output = 4u64;
+        let cache_read = 6u64;
+        let cache_write = 1u64;
+        let reasoning = 3u64;
+        let turns = 2u64;
+        let cost = "0.5";
+        let stream = format!(
+            r#"{{"type":"system","subtype":"init","session_id":"s1"}}
+{{"type":"result","subtype":"success","num_turns":{turns},"result":"pong","stop_reason":"end_turn","total_cost_usd":{cost},"usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":{cache_read},"cache_creation_input_tokens":{cache_write},"reasoning_tokens":{reasoning}}}}}
+"#
+        );
+        let report = assess_grok(false, false, 0, &stream, "");
+        // Reasoning is already inside output, same as the json format's total_tokens.
+        let total = input + cache_read + cache_write + output;
+        let line = format!("[crew] tokens={total} turns={turns} cost=${cost}");
+        assert!(
+            report.after_stderr.contains(&line),
+            "{}",
+            report.after_stderr
+        );
+        assert!(!report.after_stderr.contains("None"));
+
+        let explicit = input + output + 50;
+        let legacy = format!(
+            r#"{{"text":"pong","num_turns":{turns},"total_cost_usd":{cost},"usage":{{"input_tokens":{input},"output_tokens":{output},"total_tokens":{explicit}}}}}"#
+        );
+        let report = assess_grok(false, false, 0, &legacy, "");
+        assert!(report.after_stderr.contains(&format!(
+            "[crew] tokens={explicit} turns={turns} cost=${cost}"
+        )));
+
+        let no_counts = format!(
+            r#"{{"type":"result","result":"pong","stop_reason":"end_turn","num_turns":{turns},"total_cost_usd":{cost},"usage":{{"server_tool_use":{{"web_search_requests":0}}}}}}"#
+        );
+        let report = assess_grok(false, false, 0, &no_counts, "");
+        assert!(
+            report
+                .after_stderr
+                .contains(&format!("[crew] turns={turns} cost=${cost}"))
+        );
+        assert!(!report.after_stderr.contains("tokens="));
+        assert!(!report.after_stderr.contains("None"));
+
+        let no_turns = format!(
+            r#"{{"text":"pong","total_cost_usd":{cost},"usage":{{"total_tokens":{explicit}}}}}"#
+        );
+        let report = assess_grok(false, false, 0, &no_turns, "");
+        assert!(
+            report
+                .after_stderr
+                .contains(&format!("[crew] tokens={explicit} cost=${cost}"))
+        );
+        assert!(!report.after_stderr.contains("turns="));
+        assert!(!report.after_stderr.contains("None"));
     }
 }

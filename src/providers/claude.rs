@@ -14,7 +14,7 @@ use crate::tier;
 
 use super::proc::{
     self, KillStyle, Report, StdioKind, USAGE_LIMIT_EXIT, code_or_one, looks_like_usage_limit,
-    map_effort, py_display, py_truthy, take_prompt, usage_limit_line,
+    map_effort, py_display, py_truthy, shown, take_prompt, usage_limit_line,
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
@@ -482,18 +482,25 @@ fn denial_names(data: &Value) -> Vec<String> {
 
 fn claude_usage_line(data: &Value) -> Option<String> {
     let usage = data.get("usage").filter(|value| py_truthy(Some(value)));
-    let cost = data.get("total_cost_usd").filter(|value| !value.is_null());
-    if usage.is_none() && cost.is_none() {
+    let input = shown(usage.and_then(|value| value.get("input_tokens")));
+    let output = shown(usage.and_then(|value| value.get("output_tokens")));
+    let turns = shown(data.get("num_turns"));
+    let cost = shown(data.get("total_cost_usd"));
+    if input.is_none() && output.is_none() && turns.is_none() && cost.is_none() {
         return None;
     }
-    let mut line = format!(
-        "[crew] in={} out={} turns={}",
-        py_display(usage.and_then(|value| value.get("input_tokens"))),
-        py_display(usage.and_then(|value| value.get("output_tokens"))),
-        py_display(data.get("num_turns")),
-    );
+    let mut line = String::from("[crew]");
+    if let Some(input) = input {
+        line.push_str(&format!(" in={input}"));
+    }
+    if let Some(output) = output {
+        line.push_str(&format!(" out={output}"));
+    }
+    if let Some(turns) = turns {
+        line.push_str(&format!(" turns={turns}"));
+    }
     if let Some(cost) = cost {
-        line.push_str(&format!(" cost=${}", py_display(Some(cost))));
+        line.push_str(&format!(" cost=${cost}"));
     }
     Some(line)
 }

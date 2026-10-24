@@ -243,6 +243,15 @@ pub(super) fn py_display(value: Option<&Value>) -> String {
     }
 }
 
+/// A stats field that the provider left out. `py_display` would say `None`,
+/// which is a missing value, not a count, so the caller omits the field.
+pub(super) fn shown(value: Option<&Value>) -> Option<String> {
+    match value {
+        None | Some(Value::Null) => None,
+        some => Some(py_display(some)),
+    }
+}
+
 /// Exit code for a run that stopped because the provider's usage, quota,
 /// rate, or credit limit was hit. EX_TEMPFAIL: retrying later can succeed,
 /// which is what separates it from a failed or denied run (125).
