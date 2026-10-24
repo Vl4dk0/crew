@@ -72,7 +72,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             timeout,
             StdioKind::Pty,
             KillStyle::TermThenKill,
-            false,
             &mut watch,
         ),
     ) {

@@ -160,7 +160,9 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
             record.stopped = true;
-            // Send SIGTERM to wrapper process group
+            // The provider CLI is not in this group. It is a session leader
+            // (proc::detach_session), and the wrapper forwards SIGTERM there,
+            // then waits up to 5s before SIGKILL. This grace has to cover that.
             unsafe {
                 libc::killpg(wrapper_pid as i32, libc::SIGTERM);
             }
