@@ -147,9 +147,3 @@ A probe that fails shows its error; nothing is cached or estimated in its place.
 - **Symlink Protection**: Run store files (`run.json`, `stdout`, `stderr`, `resume.lock`) are opened with `O_NOFOLLOW | O_NONBLOCK` and verified via `fstat` as regular files.
 - **Civil Calendar Math**: Timestamp calculations implement Howard Hinnant's algorithm to eliminate leap-year and day-of-year drift.
 - **Zero Hacks & Minimal Flags**: Validated inputs, `< 100` targeted unit tests, zero warnings on `cargo clippy --all-targets -- -D warnings`.
-
----
-
-## Documentation Links
-
-- [MIGRATION.md](MIGRATION.md): Proposed shims for replacing legacy shell wrappers.
