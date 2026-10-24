@@ -20,8 +20,22 @@ use render::{Gauge, ProviderView, render_blocks};
 
 fn state_dir() -> PathBuf {
     if let Ok(p) = std::env::var("USAGEBAR_STATE") {
-        PathBuf::from(p)
-    } else if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(p);
+    }
+    // Linux has no Application Support. Follow the XDG base dir spec and
+    // keep the same directory name the macOS build already uses.
+    if cfg!(target_os = "linux") {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("UsageBar");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local/share/UsageBar");
+        }
+        return PathBuf::from(".");
+    }
+    if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join("Library/Application Support/UsageBar")
     } else {
         PathBuf::from(".")
