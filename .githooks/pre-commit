@@ -1,0 +1,46 @@
+#!/bin/sh
+# Commits that touch Rust should already contain rustfmt output.
+# A staged .rs file that also has unstaged edits is refused: formatting
+# the worktree and re-staging it would pull those unstaged hunks in.
+
+set -eu
+
+staged=$(mktemp)
+partial=$(mktemp)
+trap 'rm -f "$staged" "$partial"' EXIT
+
+git diff --cached --name-only --diff-filter=ACMR -- '*.rs' >"$staged"
+if [ ! -s "$staged" ]; then
+    exit 0
+fi
+
+while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    if ! git diff --quiet -- "$file"; then
+        printf '%s\n' "$file" >>"$partial"
+    fi
+done <"$staged"
+
+if [ -s "$partial" ]; then
+    printf '%s\n' "pre-commit: refusing to format partially staged Rust files." >&2
+    printf '%s\n' "These staged files also have unstaged changes:" >&2
+    sed 's/^/  /' "$partial" >&2
+    printf '%s\n' "Stage the rest of each file (git add), or format it yourself, then commit." >&2
+    printf '%s\n' "cargo fmt rewrites the worktree file; re-staging it would include the unstaged hunks." >&2
+    exit 1
+fi
+
+# Format only the staged paths. A bare `cargo fmt` would also rewrite
+# other dirty .rs files that are not part of this commit.
+set --
+while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    set -- "$@" "$file"
+done <"$staged"
+
+cargo fmt -- "$@"
+
+while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    git add -- "$file"
+done <"$staged"

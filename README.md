@@ -34,3 +34,7 @@ crew update
 ```
 
 Run `crew help <cmd>` or `<cmd> --help` for details.
+
+## Contributing
+
+Enable the format-on-commit hook: `git config core.hooksPath .githooks`
