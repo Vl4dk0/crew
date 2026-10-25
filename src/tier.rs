@@ -1,14 +1,14 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use crate::config::{self, UserTier};
 use crate::error::Error;
 use crate::id::{Provider, parse_effort};
 
 const BUILTIN: &str = include_str!("../tiers.toml");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum Tier {
     Fast,
     Balanced,
@@ -38,12 +38,6 @@ pub struct Resolved {
     pub effort: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Source {
-    Builtin,
-    User,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Row {
@@ -71,6 +65,15 @@ impl ProviderRows {
             Tier::Max => &self.max,
         }
     }
+
+    fn get_mut(&mut self, tier: Tier) -> &mut Row {
+        match tier {
+            Tier::Fast => &mut self.fast,
+            Tier::Balanced => &mut self.balanced,
+            Tier::Smart => &mut self.smart,
+            Tier::Max => &mut self.max,
+        }
+    }
 }
 
 /// A full table. A partial user file is an error so a typo cannot silently
@@ -93,11 +96,23 @@ impl Table {
             Provider::Grok => &self.grok,
         }
     }
+
+    fn provider_mut(&mut self, provider: Provider) -> &mut ProviderRows {
+        match provider {
+            Provider::Claude => &mut self.claude,
+            Provider::Codex => &mut self.codex,
+            Provider::Gemini => &mut self.gemini,
+            Provider::Grok => &mut self.grok,
+        }
+    }
 }
 
 struct Loaded {
     table: Table,
-    source: Source,
+    /// Built-in rows the user file replaced. The rest stay `builtin`.
+    overridden: BTreeSet<(String, String)>,
+    /// pi and custom agents. They have no built-in rows.
+    extras: BTreeMap<String, BTreeMap<Tier, UserTier>>,
 }
 
 fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
@@ -156,32 +171,48 @@ fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
     Ok(table)
 }
 
-fn user_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("CREW_TIERS") {
-        return Some(PathBuf::from(path));
+fn tier_named(name: &str) -> Option<Tier> {
+    match name {
+        "fast" => Some(Tier::Fast),
+        "balanced" => Some(Tier::Balanced),
+        "smart" => Some(Tier::Smart),
+        "max" => Some(Tier::Max),
+        _ => None,
     }
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".config/crew/tiers.toml");
-    path.is_file().then_some(path)
 }
 
 fn load() -> Result<Loaded, Error> {
-    let Some(path) = user_path() else {
-        return Ok(Loaded {
-            table: parse_table(BUILTIN, "builtin")?,
-            source: Source::Builtin,
-        });
+    let mut loaded = Loaded {
+        table: parse_table(BUILTIN, "builtin")?,
+        overridden: BTreeSet::new(),
+        extras: BTreeMap::new(),
     };
-    let text = fs::read_to_string(&path).map_err(|err| {
-        Error::new(
-            2,
-            format!("cannot read tier config {}: {err}", path.display()),
-        )
-    })?;
-    Ok(Loaded {
-        table: parse_table(&text, &path.display().to_string())?,
-        source: Source::User,
-    })
+    let Some(user) = config::load_user()? else {
+        return Ok(loaded);
+    };
+    for (owner, rows) in user.tiers {
+        for (tier_name, row) in rows {
+            let Some(tier) = tier_named(&tier_name) else {
+                continue;
+            };
+            // "pi" is not a built-in table. It lands in extras with the agents.
+            if let Ok(provider) = owner.parse::<Provider>() {
+                let slot = loaded.table.provider_mut(provider).get_mut(tier);
+                slot.model = row.model;
+                if let Some(effort) = row.effort {
+                    slot.effort = Some(effort);
+                }
+                loaded.overridden.insert((owner.clone(), tier_name));
+            } else {
+                loaded
+                    .extras
+                    .entry(owner.clone())
+                    .or_default()
+                    .insert(tier, row);
+            }
+        }
+    }
+    Ok(loaded)
 }
 
 /// What the runner should put on the CLI.
@@ -255,11 +286,7 @@ fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
 
 pub fn print() -> Result<i32, Error> {
     let loaded = load()?;
-    let source = match loaded.source {
-        Source::Builtin => "builtin",
-        Source::User => "user",
-    };
-    println!("provider  tier      model                      effort  source");
+    println!("provider    tier      model                      effort  source");
     for provider in [
         Provider::Claude,
         Provider::Codex,
@@ -268,17 +295,42 @@ pub fn print() -> Result<i32, Error> {
     ] {
         for tier in Tier::all() {
             let row = loaded.table.provider(provider).get(tier);
-            let effort = row.effort.as_deref().unwrap_or("-");
-            println!(
-                "{:<8}  {:<8}  {:<25}  {:<6}  {source}",
+            let source = if loaded
+                .overridden
+                .contains(&(provider.as_str().to_string(), tier.as_str().to_string()))
+            {
+                "config"
+            } else {
+                "builtin"
+            };
+            print_row(
                 provider.as_str(),
-                tier.as_str(),
-                row.model,
-                effort,
+                tier,
+                &row.model,
+                row.effort.as_deref(),
+                source,
             );
         }
     }
+    for (owner, rows) in &loaded.extras {
+        for tier in Tier::all() {
+            let Some(row) = rows.get(&tier) else {
+                continue;
+            };
+            print_row(owner, tier, &row.model, row.effort.as_deref(), "config");
+        }
+    }
     Ok(0)
+}
+
+fn print_row(owner: &str, tier: Tier, model: &str, effort: Option<&str>, source: &str) {
+    println!(
+        "{:<10}  {:<8}  {:<25}  {:<6}  {source}",
+        owner,
+        tier.as_str(),
+        model,
+        effort.unwrap_or("-"),
+    );
 }
 
 #[cfg(test)]

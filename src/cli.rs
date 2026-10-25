@@ -169,8 +169,11 @@ enum Command {
     #[command(
         about = "Print the tier table",
         long_about = "Print provider, tier, model, effort, and whether the \
-            row is the built-in table or ~/.config/crew/tiers.toml. \
-            CREW_TIERS overrides that path. A user file replaces the whole table. \
+            row is built in or from config.toml. The file is \
+            $XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml. \
+            A missing file changes nothing. A row under [tiers] overrides \
+            that one built-in row. pi and custom agents have no built-in \
+            rows; they are listed only when config.toml defines them. \
             Grok effort is '-', because -e selects it.",
         after_long_help = "Examples:\n  crew models"
     )]

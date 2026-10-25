@@ -1,5 +1,6 @@
-# Built-in tier map. A user file at ~/.config/crew/tiers.toml replaces this
-# whole table. Model strings are what the runner puts on the CLI.
+# Built-in tier map. A row in config.toml overrides that one row.
+# The file is $XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml.
+# Model strings are what the runner puts on the CLI.
 
 [claude.fast]
 model = "haiku"

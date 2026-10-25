@@ -4,6 +4,7 @@
 unsafe extern "C" {}
 
 pub mod cli;
+pub mod config;
 pub mod error;
 pub mod id;
 pub mod job;
