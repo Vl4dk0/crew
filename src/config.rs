@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::id::{Provider, parse_effort};
+use crate::id::parse_effort;
 
 /// Subcommands and provider aliases an agent must not take.
 const RESERVED: &[&str] = &[
@@ -195,10 +195,6 @@ pub fn parse_user(text: &str, origin: &str) -> Result<UserConfig, Error> {
     Ok(UserConfig { tiers, agents })
 }
 
-pub fn provider_key(provider: Provider) -> &'static str {
-    provider.as_str()
-}
-
 fn valid_agent_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -233,16 +229,22 @@ mod tests {
             effort = "low"
         "#;
         let parsed = parse_user(text, "fixture").unwrap();
-        let claude = &parsed.tiers["claude"]["fast"];
-        assert_eq!(claude.model, "model-a");
-        assert_eq!(claude.effort, None);
-        assert!(!parsed.tiers["claude"].contains_key("balanced"));
-        assert_eq!(parsed.tiers["pi"]["smart"].effort.as_deref(), Some("high"));
-        assert_eq!(
-            parsed.agents["piprover"].command,
-            vec!["~/bin/pilocal".to_string(), "--prover".to_string()]
-        );
-        assert_eq!(parsed.tiers["piprover"]["fast"].model, "model-c");
+        // Expectations come from the fixture text, so a fixture edit cannot
+        // leave a stale literal behind.
+        let raw: File = toml::from_str(text).unwrap();
+        assert_eq!(parsed.tiers.len(), raw.tiers.len());
+        for (owner, rows) in &raw.tiers {
+            let got = &parsed.tiers[owner];
+            assert_eq!(got.len(), rows.len());
+            for (tier, row) in rows {
+                assert_eq!(got[tier].model, row.model);
+                assert_eq!(got[tier].effort, row.effort);
+            }
+        }
+        assert_eq!(parsed.agents.len(), raw.agents.len());
+        for (name, spec) in &raw.agents {
+            assert_eq!(parsed.agents[name].command, spec.command);
+        }
 
         let extra = "[tiers.claude.fast]\nmodel = \"model-a\"\nextra = true\n";
         let err = parse_user(extra, "fixture").unwrap_err();
