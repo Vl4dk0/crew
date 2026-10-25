@@ -725,20 +725,97 @@ fn fetch_claude() -> ProviderView {
     provider_view("claude", "claude", "✳", windows, error)
 }
 
+/// One provider probe. `bin` is the CLI on `PATH`; the other fields are what
+/// a panicked probe still has to print, in the same shape as a normal view.
+struct UsageProbe {
+    bin: &'static str,
+    key: &'static str,
+    name: &'static str,
+    mark: &'static str,
+    fetch: fn() -> ProviderView,
+}
+
+/// The probes only talk to their own CLIs. Each one writes its own files
+/// (antigravity cache, Claude probe dir, grok auth refresh), so they can run
+/// at the same time. Wall time is the slowest probe, and the views come back
+/// in `probes` order. A panic is that provider's error line; the rest still show.
+fn probe_in_parallel(probes: &[UsageProbe]) -> Vec<ProviderView> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = probes
+            .iter()
+            .map(|probe| {
+                scope.spawn(|| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (probe.fetch)()))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(probes)
+            .map(|(handle, probe)| match handle.join() {
+                Ok(Ok(view)) => view,
+                Ok(Err(payload)) | Err(payload) => provider_view(
+                    probe.key,
+                    probe.name,
+                    probe.mark,
+                    Vec::new(),
+                    Some(panic_text(payload)),
+                ),
+            })
+            .collect()
+    })
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|msg| (*msg).to_string()))
+        .unwrap_or_else(|| "probe panicked".to_string())
+}
+
 /// Plan and quota bars. Never log credential values.
 pub fn print_usage() -> Result<i32, Error> {
-    type Fetch = fn() -> ProviderView;
-    let providers: [(&str, Fetch); 4] = [
-        ("claude", fetch_claude),
-        ("agy", fetch_gemini),
-        ("codex", fetch_codex),
-        ("grok", fetch_grok),
+    let providers = [
+        UsageProbe {
+            bin: "claude",
+            key: "claude",
+            name: "claude",
+            mark: "✳",
+            fetch: fetch_claude,
+        },
+        UsageProbe {
+            bin: "agy",
+            key: "gemini",
+            name: "antigravity",
+            mark: "✦",
+            fetch: fetch_gemini,
+        },
+        UsageProbe {
+            bin: "codex",
+            key: "codex",
+            name: "codex",
+            mark: "⚛",
+            fetch: fetch_codex,
+        },
+        UsageProbe {
+            bin: "grok",
+            key: "grok",
+            name: "grok",
+            mark: "✕",
+            fetch: fetch_grok,
+        },
     ];
-    let mut views: Vec<ProviderView> = providers
-        .iter()
-        .filter(|(bin, _)| crate::providers::binary_on_path(bin))
-        .map(|(_, fetch)| fetch())
+    let selected: Vec<UsageProbe> = providers
+        .into_iter()
+        .filter(|probe| crate::providers::binary_on_path(probe.bin))
         .collect();
+    // Claude used to create this directory before agy wrote its cache. Do that
+    // up front so those two probes are not creating the same parent at once.
+    if selected.iter().any(|probe| probe.bin == "claude") {
+        let _ = fs::create_dir_all(state_dir());
+    }
+    let mut views = probe_in_parallel(&selected);
 
     for view in views
         .iter_mut()
@@ -898,5 +975,43 @@ else:
         assert!(!claude_probe_says_no_auth(
             &serde_json::json!({ "type": "control_response" })
         ));
+    }
+
+    #[test]
+    fn panicking_probe_keeps_the_other_providers() {
+        fn ok() -> ProviderView {
+            provider_view(
+                "claude",
+                "claude",
+                "✳",
+                Vec::new(),
+                Some("not logged in".to_string()),
+            )
+        }
+        fn boom() -> ProviderView {
+            panic!("codex broke");
+        }
+        let probes = [
+            UsageProbe {
+                bin: "claude",
+                key: "claude",
+                name: "claude",
+                mark: "✳",
+                fetch: ok,
+            },
+            UsageProbe {
+                bin: "codex",
+                key: "codex",
+                name: "codex",
+                mark: "⚛",
+                fetch: boom,
+            },
+        ];
+        let views = probe_in_parallel(&probes);
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].error.as_deref(), Some("not logged in"));
+        assert_eq!(views[1].key, "codex");
+        assert!(views[1].windows.is_empty());
+        assert_eq!(views[1].error.as_deref(), Some("codex broke"));
     }
 }
