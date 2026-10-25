@@ -80,6 +80,8 @@ pub(super) fn map_effort(
         (Provider::Gemini, _) => "high",
         (Provider::Grok, Some("grok-4.5")) => "high",
         (Provider::Grok, _) => "xhigh",
+        // pi's own scale already has max. xhigh stays off this CLI.
+        (Provider::Pi, _) => "max",
     };
     let note = (wire != "max").then(|| format!("[crew] effort max -> {wire}"));
     (wire.to_string(), note)

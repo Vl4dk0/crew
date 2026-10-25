@@ -13,6 +13,7 @@ pub enum Provider {
     Gemini,
     Grok,
     Codex,
+    Pi,
 }
 
 impl Provider {
@@ -22,6 +23,7 @@ impl Provider {
             Self::Gemini => "gemini",
             Self::Grok => "grok",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         }
     }
 
@@ -32,6 +34,7 @@ impl Provider {
             Self::Gemini => &["gemini", "antigravity", "agy"],
             Self::Grok => &["grok"],
             Self::Codex => &["codex", "gpt", "chatgpt"],
+            Self::Pi => &["pi"],
         }
     }
 }
@@ -51,9 +54,10 @@ impl FromStr for Provider {
             "gemini" | "antigravity" | "agy" => Ok(Self::Gemini),
             "grok" => Ok(Self::Grok),
             "codex" | "gpt" | "chatgpt" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
             other => Err(Error::new(
                 2,
-                format!("unknown provider {other} (claude, gemini, grok, codex)"),
+                format!("unknown provider {other} (claude, gemini, grok, codex, pi)"),
             )),
         }
     }
@@ -85,6 +89,7 @@ mod tests {
         assert_eq!("antigravity".parse::<Provider>().unwrap(), Provider::Gemini);
         assert_eq!("gpt".parse::<Provider>().unwrap(), Provider::Codex);
         assert_eq!("chatgpt".parse::<Provider>().unwrap(), Provider::Codex);
+        assert_eq!("pi".parse::<Provider>().unwrap(), Provider::Pi);
         assert!("claude-run".parse::<Provider>().is_err());
     }
 

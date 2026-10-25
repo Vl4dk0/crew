@@ -94,6 +94,8 @@ impl Table {
             Provider::Codex => &self.codex,
             Provider::Gemini => &self.gemini,
             Provider::Grok => &self.grok,
+            // pi rows are not in the built-in table. Callers use `pi_settings`.
+            Provider::Pi => panic!("pi has no built-in tier row"),
         }
     }
 
@@ -103,6 +105,7 @@ impl Table {
             Provider::Codex => &mut self.codex,
             Provider::Gemini => &mut self.gemini,
             Provider::Grok => &mut self.grok,
+            Provider::Pi => panic!("pi has no built-in tier row"),
         }
     }
 }
@@ -195,8 +198,10 @@ fn load() -> Result<Loaded, Error> {
             let Some(tier) = tier_named(&tier_name) else {
                 continue;
             };
-            // "pi" is not a built-in table. It lands in extras with the agents.
-            if let Ok(provider) = owner.parse::<Provider>() {
+            // pi is a provider name, but its rows are not in the built-in table.
+            if owner != "pi"
+                && let Ok(provider) = owner.parse::<Provider>()
+            {
                 let slot = loaded.table.provider_mut(provider).get_mut(tier);
                 slot.model = row.model;
                 if let Some(effort) = row.effort {
@@ -225,8 +230,64 @@ pub fn resolve(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Resolved, Error> {
+    if provider == Provider::Pi {
+        return Err(Error::new(
+            2,
+            "pi has no built-in model default. Pass -m, or add a tier row to config.toml",
+        ));
+    }
     let loaded = load()?;
     resolve_with(&loaded.table, provider, tier, model, effort)
+}
+
+/// Model and thinking for `pi` or a pi-based agent.
+///
+/// `thinking` is None when neither `-e` nor the tier row set an effort, so
+/// the runner omits `--thinking` and pi keeps its own default.
+pub struct PiSettings {
+    pub model: Option<String>,
+    pub thinking: Option<String>,
+}
+
+pub fn pi_settings(
+    name: &str,
+    tier: Option<Tier>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<PiSettings, Error> {
+    if let Some(effort) = effort {
+        parse_effort(effort)?;
+    }
+    let loaded = load()?;
+    let row = match tier {
+        None => None,
+        Some(tier) => Some(
+            loaded
+                .extras
+                .get(name)
+                .and_then(|rows| rows.get(&tier))
+                .ok_or_else(|| {
+                    Error::new(
+                        2,
+                        format!(
+                            "no [tiers.{name}.{}] in {}. Add [tiers.{name}.{}] to config.toml",
+                            tier.as_str(),
+                            config::config_path().display(),
+                            tier.as_str()
+                        ),
+                    )
+                })?,
+        ),
+    };
+    let model = match model {
+        Some(model) => Some(model.to_string()),
+        None => row.map(|row| row.model.clone()),
+    };
+    let thinking = match effort {
+        Some(effort) => Some(effort.to_string()),
+        None => row.and_then(|row| row.effort.clone()),
+    };
+    Ok(PiSettings { model, thinking })
 }
 
 fn resolve_with(
@@ -277,6 +338,7 @@ fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
         Provider::Codex => Some(CODEX_WRAPPER_MODEL.to_string()),
         Provider::Gemini => Some(GEMINI_WRAPPER_MODEL.to_string()),
         Provider::Grok => None,
+        Provider::Pi => None,
     };
     Resolved {
         model,

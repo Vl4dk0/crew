@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use crate::error::Error;
 
 /// Providers in print order, with the subcommand names that select each.
-const PROVIDERS: [(&str, &[&str]); 4] = [
+const PROVIDERS: [(&str, &[&str]); 5] = [
     ("claude", &["claude"]),
     ("gemini", &["gemini", "agy", "antigravity"]),
     ("grok", &["grok"]),
     ("codex", &["codex", "gpt", "chatgpt"]),
+    ("pi", &["pi"]),
 ];
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;

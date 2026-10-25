@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 mod gemini;
 mod grok;
+mod pi;
 mod proc;
 mod pty;
 
@@ -22,6 +23,7 @@ pub fn execute(invocation: &Invocation) -> Result<i32, Error> {
         Provider::Gemini => gemini::run(invocation),
         Provider::Grok => grok::run(invocation),
         Provider::Codex => codex::run(invocation),
+        Provider::Pi => pi::run(invocation),
     }
 }
 
@@ -36,5 +38,6 @@ pub fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
         Provider::Gemini => gemini::cli_model(invocation),
         Provider::Grok => grok::cli_model(invocation),
         Provider::Codex => codex::cli_model(invocation),
+        Provider::Pi => pi::cli_model(invocation),
     }
 }

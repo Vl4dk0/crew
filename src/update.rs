@@ -21,12 +21,19 @@ const CREW_INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// A private repo without credentials should fail here, not sit on a prompt.
 const LS_REMOTE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-/// Spec order: claude, codex, grok, then gemini's `agy` binary.
-const HARNESSES: [&str; 4] = ["claude", "codex", "grok", "agy"];
+/// Spec order: claude, codex, grok, gemini's `agy` binary, then pi.
+/// pi's updater is `pi update --self`, not `pi update`.
+const HARNESSES: [(&str, &[&str]); 5] = [
+    ("claude", &["update"]),
+    ("codex", &["update"]),
+    ("grok", &["update"]),
+    ("agy", &["update"]),
+    ("pi", &["update", "--self"]),
+];
 
 pub fn run() -> Result<i32, Error> {
     let mut failed = false;
-    for bin in HARNESSES {
+    for (bin, update_args) in HARNESSES {
         if !providers::binary_on_path(bin) {
             println!("{bin}: not found");
             continue;
@@ -39,7 +46,7 @@ pub fn run() -> Result<i32, Error> {
                 continue;
             }
         };
-        if let Err(reason) = run_update(bin) {
+        if let Err(reason) = run_update(bin, update_args) {
             println!("{bin} update failed: {reason}");
             failed = true;
             continue;
@@ -390,8 +397,10 @@ fn read_version(bin: &str) -> Result<String, String> {
         .ok_or_else(|| "no version in --version output".to_string())
 }
 
-fn run_update(bin: &str) -> Result<(), String> {
-    let captured = providers::run_bounded(&[bin.to_string(), "update".to_string()], UPDATE_TIMEOUT)
+fn run_update(bin: &str, args: &[&str]) -> Result<(), String> {
+    let mut argv = vec![bin.to_string()];
+    argv.extend(args.iter().copied().map(str::to_string));
+    let captured = providers::run_bounded(&argv, UPDATE_TIMEOUT)
         .map_err(|err| format!("{bin} update: {err}"))?;
     if captured.timed_out {
         return Err("timed out".to_string());

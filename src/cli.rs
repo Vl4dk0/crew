@@ -13,7 +13,7 @@ use crate::tier::{self, Tier};
     name = "crew",
     version,
     about = "Run agent CLIs, named jobs, machine load, and credit usage",
-    long_about = "crew is one binary over claude, gemini, grok, and codex.\n\
+    long_about = "crew is one binary over claude, gemini, grok, codex, and pi.\n\
         \n\
         Start with `crew models` for the tier table, then \
         `crew <provider> --tier fast \"...\"`. Every run has full autonomy.\n\
@@ -27,7 +27,8 @@ use crate::tier::{self, Tier};
         claude\n  \
         gemini    aliases: agy, antigravity\n  \
         grok\n  \
-        codex     aliases: gpt, chatgpt\n\
+        codex     aliases: gpt, chatgpt\n  \
+        pi\n\
         \n\
         Jobs\n  \
         job       run, ls, show, result, log, wait, resume, stop\n\
@@ -111,6 +112,20 @@ enum Command {
     )]
     Codex(CodexArgs),
     #[command(
+        about = "Run the pi coding agent",
+        long_about = "Run pi. There are no built-in pi tiers, because the \
+            models depend on the user's pi setup. --tier needs a \
+            [tiers.pi.<tier>] row in config.toml. -e maps onto the same pi \
+            --thinking level (low, medium, high, max). With no -e and no \
+            effort on the tier row, --thinking is omitted and pi keeps its \
+            own default. -r is pi --session. -C is the child's working directory.",
+        after_long_help = "Examples:\n  \
+            crew pi \"Reply with the single word pong\"\n  \
+            crew pi -m provider/model -e high \"Look at the last commit\"\n  \
+            crew pi -C ~/Projects/crew \"What does src/tier.rs decide?\""
+    )]
+    Pi(PiArgs),
+    #[command(
         about = "Run, list, and resume named background jobs",
         long_about = "Detach a provider run under a name and pick it up later. \
             The store is $CREW_HOME or ~/.local/share/crew. Status is derived \
@@ -125,7 +140,7 @@ enum Command {
     #[command(
         about = "Show CPU, memory, GPU, and running agents per provider",
         long_about = "One machine line, then a line for each provider (claude, gemini, \
-            grok, codex) that has running crew agents, with their count and pids. \
+            grok, codex, pi) that has running crew agents, with their count and pids. \
             Idle providers are not listed. Foreground runs and detached jobs each \
             count once. macOS only for the GPU figure.",
         after_long_help = "Examples:\n  crew load"
@@ -158,11 +173,12 @@ enum Command {
     #[command(
         about = "Update each harness CLI, then crew",
         long_about = "Run each CLI's own updater: `claude update`, `codex update`, \
-            `grok update`, and `agy update`, even while crew agents of that \
-            provider are running. A process that already loaded the old binary \
-            keeps it. A missing binary is reported and skipped. crew is updated \
-            last from the git URL `cargo install` recorded. A path install is \
-            left untouched.",
+            `grok update`, `agy update`, and `pi update --self`, even while crew \
+            agents of that provider are running. A process that already loaded \
+            the old binary keeps it. A missing binary is reported and skipped. \
+            crew is updated last from the git URL `cargo install` recorded. A \
+            path install is left untouched. pi has no account quota, so \
+            `crew usage` does not show it.",
         after_long_help = "Examples:\n  crew update"
     )]
     Update,
@@ -230,6 +246,12 @@ struct GrokArgs {
 }
 
 #[derive(Debug, Args)]
+struct PiArgs {
+    #[command(flatten)]
+    shared: SharedArgs,
+}
+
+#[derive(Debug, Args)]
 struct CodexArgs {
     #[command(flatten)]
     shared: SharedArgs,
@@ -267,7 +289,7 @@ struct SharedArgs {
     /// Override the tier model. Passed through. Claude short names: haiku, sonnet, opus, fable.
     #[arg(short = 'm', long)]
     model: Option<String>,
-    /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5).
+    /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude, pi), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5). pi omits --thinking when no -e and no tier effort are set.
     #[arg(short = 'e', long)]
     effort: Option<String>,
     /// Seconds before the process group is killed. Default 7200 (2 hours). Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds. Output already produced is kept. The exit code is 124.
@@ -276,7 +298,7 @@ struct SharedArgs {
     /// Working directory for the child. Maps to the CLI's own cwd flag where it has one.
     #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
-    /// Resume this session id, the one crew printed as SESSION_ID. Claude and Codex reject -r together with -c. Grok keeps -r and drops -c. Gemini forwards both.
+    /// Resume this session id, the one crew printed as SESSION_ID. Claude, Codex, and pi reject -r together with -c. Pi sends it as --session. Grok keeps -r and drops -c. Gemini forwards both.
     #[arg(short = 'r', long)]
     resume: Option<String>,
     /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
@@ -443,7 +465,7 @@ struct JobRunArgs {
     /// Job name. Must match ^[a-z0-9][a-z0-9._-]{0,63}$.
     #[arg(value_name = "NAME")]
     name: String,
-    /// claude, gemini (agy, antigravity), grok, or codex (gpt, chatgpt).
+    /// claude, gemini (agy, antigravity), grok, codex (gpt, chatgpt), or pi.
     #[arg(value_name = "PROVIDER")]
     provider: String,
     /// Wrapper flags and the prompt. Passed through to `crew <provider>`.
@@ -481,6 +503,7 @@ fn dispatch(cli: Cli) -> Result<i32, Error> {
         Some(Command::Gemini(args)) => crate::providers::execute(&invocation_from_gemini(args)?),
         Some(Command::Grok(args)) => crate::providers::execute(&invocation_from_grok(args)?),
         Some(Command::Codex(args)) => crate::providers::execute(&invocation_from_codex(args)?),
+        Some(Command::Pi(args)) => crate::providers::execute(&invocation_from_pi(args)?),
     }
 }
 
@@ -535,6 +558,7 @@ pub fn parse_trailing(provider: Provider, trailing: &[String]) -> Result<Invocat
         (Provider::Gemini, Some(Command::Gemini(args))) => invocation_from_gemini(args),
         (Provider::Grok, Some(Command::Grok(args))) => invocation_from_grok(args),
         (Provider::Codex, Some(Command::Codex(args))) => invocation_from_codex(args),
+        (Provider::Pi, Some(Command::Pi(args))) => invocation_from_pi(args),
         _ => Err(Error::new(
             2,
             "job run trailing args are not a provider invocation",
@@ -554,10 +578,10 @@ fn finish(
     if let Some(effort) = &shared.effort {
         parse_effort(effort)?;
     }
-    // Claude and codex reject both. Grok keeps -r and drops -c. Gemini forwards both.
+    // Claude, codex, and pi reject both. Grok keeps -r and drops -c. Gemini forwards both.
     if shared.resume.is_some()
         && shared.continue_session
-        && matches!(provider, Provider::Claude | Provider::Codex)
+        && matches!(provider, Provider::Claude | Provider::Codex | Provider::Pi)
     {
         return Err(Error::new(2, "pass -r or -c, not both"));
     }
@@ -651,6 +675,10 @@ fn invocation_from_grok(args: GrokArgs) -> Result<Invocation, Error> {
             ..Extra::default()
         },
     )
+}
+
+fn invocation_from_pi(args: PiArgs) -> Result<Invocation, Error> {
+    finish(Provider::Pi, args.shared, Vec::new(), Extra::default())
 }
 
 fn invocation_from_codex(args: CodexArgs) -> Result<Invocation, Error> {

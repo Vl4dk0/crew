@@ -1,12 +1,12 @@
 # crew
 
-One binary over Claude, Gemini (`agy`), Grok, and Codex (`gpt`).
+One binary over Claude, Gemini (`agy`), Grok, Codex (`gpt`), and pi.
 
 Start with `crew models` for the tier table, then `crew <provider> --tier fast "..."`. Every run has full autonomy.
 
 ## Install
 
-Runs on macOS and Linux. Needs a Rust toolchain and at least one of the `claude`, `agy`, `grok` or `codex` CLIs, logged in.
+Runs on macOS and Linux. Needs a Rust toolchain and at least one of the `claude`, `agy`, `grok`, `codex`, or `pi` CLIs, logged in.
 
 ```console
 cargo install --git https://github.com/Vl4dk0/crew --locked
