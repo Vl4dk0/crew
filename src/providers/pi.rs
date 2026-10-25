@@ -24,18 +24,31 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "empty prompt (pass a prompt argument or pipe one via stdin)",
         )
     })?;
+    let name = invocation.user_agent.as_deref().unwrap_or("pi");
     let settings = tier::pi_settings(
-        "pi",
+        name,
         invocation.tier,
         invocation.model.as_deref(),
         invocation.effort.as_deref(),
     )?;
-    execute(invocation, &prompt, &settings, &["pi".to_string()], "pi")
+    let program = match &invocation.user_agent {
+        None => vec!["pi".to_string()],
+        Some(agent) => {
+            let spec = tier::agent(agent)?
+                .ok_or_else(|| Error::new(2, format!("unknown agent {agent} in config.toml")))?;
+            spec.command
+                .iter()
+                .map(|part| proc::expand_user(part).to_string_lossy().into_owned())
+                .collect()
+        }
+    };
+    execute(invocation, &prompt, &settings, &program, name)
 }
 
 pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
+    let name = invocation.user_agent.as_deref().unwrap_or("pi");
     let settings = tier::pi_settings(
-        "pi",
+        name,
         invocation.tier,
         invocation.model.as_deref(),
         invocation.effort.as_deref(),
@@ -60,21 +73,11 @@ pub(super) fn execute(
     argv.extend(tail);
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
-    let bin = argv
-        .first()
-        .map(|path| {
-            std::path::Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(label)
-        })
-        .unwrap_or(label);
-    // The missing-binary line for pi itself has to name pi, even when the
-    // path's file name would too. Agents pass their own binary.
-    let noted = if label == "pi" { "pi" } else { bin };
+    // `pi` is the message the missing-binary path must print. An agent
+    // names itself, which is the word the user typed.
     let mut watch = |line: &str| session_from_line(line);
     let captured = match proc::launch_or_note(
-        noted,
+        label,
         proc::capture(
             &argv,
             invocation.cwd.as_deref(),
@@ -367,6 +370,26 @@ mod tests {
                 "max",
                 "--session",
                 "sess-1",
+                "pong",
+            ]
+        );
+
+        let mut agent = vec!["tool".to_string(), "--fixed".to_string()];
+        let (tail, _) = pi_tail(&bare(Provider::Pi), Some("model-c"), Some("high"), "pong");
+        agent.extend(tail);
+        assert_eq!(
+            agent,
+            vec![
+                "tool",
+                "--fixed",
+                "-p",
+                "--mode",
+                "json",
+                "--approve",
+                "--model",
+                "model-c",
+                "--thinking",
+                "high",
                 "pong",
             ]
         );

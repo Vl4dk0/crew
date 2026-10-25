@@ -13,9 +13,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::cli::parse_trailing;
+use crate::cli::parse_command;
 use crate::error::Error;
-use crate::id::Provider;
 use models::{RunRecord, Status, status_of, validate_run_name};
 use process::is_process_alive;
 use store::{load_record, open_safe_read, run_dir, runs_dir, save_record, tail_lines};
@@ -23,7 +22,8 @@ use store::{load_record, open_safe_read, run_dir, runs_dir, save_record, tail_li
 /// A job the supervisor has not started yet.
 pub struct NewJob {
     pub name: String,
-    pub provider: Provider,
+    /// Built-in provider or custom agent. The supervisor re-execs `crew` with this word.
+    pub provider: String,
     pub note: Option<String>,
     pub trailing: Vec<String>,
 }
@@ -214,7 +214,7 @@ fn run_internal(
         return Err(Error::new(2, format!("run {} already exists", job.name)));
     }
 
-    let invocation = parse_trailing(job.provider, &job.trailing)?;
+    let invocation = parse_command(&job.provider, &job.trailing)?;
     // Store the slug the child CLI is given, not the tier name. `ls` used to
     // scan args for `-m`, which is absent when the user passed `--tier`.
     let model = crate::providers::cli_model(&invocation)?;
@@ -269,7 +269,7 @@ fn run_internal(
 
     let mut record = RunRecord {
         name: job.name.clone(),
-        provider: job.provider.as_str().to_string(),
+        provider: job.provider.clone(),
         model,
         args: flags,
         cwd,
@@ -634,7 +634,7 @@ pub fn resume(name: &str, prompt: Option<String>) -> Result<i32, Error> {
         next_name = format!("{}.{}", base_name, n);
     }
 
-    let provider: Provider = parent.provider.parse()?;
+    let provider = parent.provider.clone();
 
     // Build new args reusing parent args (which contain only flags!)
     let mut new_args = Vec::new();
@@ -698,6 +698,8 @@ pub fn supervise(name: &str) -> Result<i32, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::parse_trailing;
+    use crate::id::Provider;
     use crate::tier::{self, Tier};
 
     #[test]

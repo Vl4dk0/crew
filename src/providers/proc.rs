@@ -1128,6 +1128,7 @@ pub(super) fn bare(provider: Provider) -> Invocation {
         uncommitted: false,
         base: None,
         commit: None,
+        user_agent: None,
     }
 }
 

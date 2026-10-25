@@ -612,16 +612,26 @@ fn format_gpu(report: &GpuReport) -> Option<String> {
 /// A run is the `crew <provider>` process itself. Detached jobs are supervised
 /// by `crew --supervise`, which spawns that same process, so the supervisor
 /// and the provider CLI's own children must not count a second time.
-pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<&'static str, Vec<u32>> {
-    let mut matches: HashMap<&'static str, Vec<u32>> = PROVIDERS
+pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<String, Vec<u32>> {
+    find_agent_pids_with(processes, &[])
+}
+
+fn find_agent_pids_with(
+    processes: &HashMap<u32, ProcessRecord>,
+    agents: &[String],
+) -> HashMap<String, Vec<u32>> {
+    let mut matches: HashMap<String, Vec<u32>> = PROVIDERS
         .iter()
-        .map(|&(name, _)| (name, Vec::new()))
+        .map(|&(name, _)| (name.to_string(), Vec::new()))
         .collect();
+    for name in agents {
+        matches.entry(name.clone()).or_default();
+    }
     for record in processes.values() {
-        let Some(name) = provider_of(record) else {
+        let Some(name) = provider_of(record, agents) else {
             continue;
         };
-        if let Some(pids) = matches.get_mut(name) {
+        if let Some(pids) = matches.get_mut(&name) {
             pids.push(record.pid);
         }
     }
@@ -631,26 +641,40 @@ pub fn find_agent_pids(processes: &HashMap<u32, ProcessRecord>) -> HashMap<&'sta
     matches
 }
 
-fn provider_of(record: &ProcessRecord) -> Option<&'static str> {
+fn provider_of(record: &ProcessRecord, agents: &[String]) -> Option<String> {
     let is_crew = Path::new(&record.executable)
         .file_name()
         .is_some_and(|name| name == "crew");
     if !is_crew {
         return None;
     }
-    PROVIDERS
+    if let Some((name, _)) = PROVIDERS
         .iter()
         .find(|(_, names)| names.contains(&record.arg1.as_str()))
-        .map(|(name, _)| *name)
+    {
+        return Some((*name).to_string());
+    }
+    agents.iter().find(|name| *name == &record.arg1).cloned()
 }
 
 /// One line per provider that has running crew agents, in print order. Idle
 /// providers are left out so the output lists only work that is in flight.
-pub fn format_provider_lines(agent_pids: &HashMap<&'static str, Vec<u32>>) -> Vec<String> {
-    PROVIDERS
+pub fn format_provider_lines(agent_pids: &HashMap<String, Vec<u32>>) -> Vec<String> {
+    let mut names: Vec<String> = PROVIDERS
         .iter()
-        .filter_map(|&(provider, _)| {
-            let pids = &agent_pids[provider];
+        .map(|&(provider, _)| provider.to_string())
+        .collect();
+    let mut extras: Vec<String> = agent_pids
+        .keys()
+        .filter(|name| !names.iter().any(|builtin| builtin == *name))
+        .cloned()
+        .collect();
+    extras.sort();
+    names.extend(extras);
+    names
+        .into_iter()
+        .filter_map(|provider| {
+            let pids = agent_pids.get(&provider)?;
             if pids.is_empty() {
                 return None;
             }
@@ -670,7 +694,8 @@ pub fn print_load() -> Result<i32, Error> {
     let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
     let metrics = collect_metrics(cpu_sum, !processes.is_empty());
     println!("{}", format_load_line(&metrics));
-    for line in format_provider_lines(&find_agent_pids(&processes)) {
+    let agents = crate::tier::agent_names()?;
+    for line in format_provider_lines(&find_agent_pids_with(&processes, &agents)) {
         println!("{line}");
     }
     Ok(0)

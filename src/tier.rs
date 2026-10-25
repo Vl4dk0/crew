@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::config::{self, UserTier};
+use crate::config::{self, AgentSpec, UserTier};
 use crate::error::Error;
 use crate::id::{Provider, parse_effort};
 
@@ -116,6 +116,7 @@ struct Loaded {
     overridden: BTreeSet<(String, String)>,
     /// pi and custom agents. They have no built-in rows.
     extras: BTreeMap<String, BTreeMap<Tier, UserTier>>,
+    agents: BTreeMap<String, AgentSpec>,
 }
 
 fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
@@ -189,10 +190,12 @@ fn load() -> Result<Loaded, Error> {
         table: parse_table(BUILTIN, "builtin")?,
         overridden: BTreeSet::new(),
         extras: BTreeMap::new(),
+        agents: BTreeMap::new(),
     };
     let Some(user) = config::load_user()? else {
         return Ok(loaded);
     };
+    loaded.agents = user.agents;
     for (owner, rows) in user.tiers {
         for (tier_name, row) in rows {
             let Some(tier) = tier_named(&tier_name) else {
@@ -247,6 +250,14 @@ pub fn resolve(
 pub struct PiSettings {
     pub model: Option<String>,
     pub thinking: Option<String>,
+}
+
+pub fn agent(name: &str) -> Result<Option<AgentSpec>, Error> {
+    Ok(load()?.agents.get(name).cloned())
+}
+
+pub fn agent_names() -> Result<Vec<String>, Error> {
+    Ok(load()?.agents.keys().cloned().collect())
 }
 
 pub fn pi_settings(

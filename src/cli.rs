@@ -30,6 +30,11 @@ use crate::tier::{self, Tier};
         codex     aliases: gpt, chatgpt\n  \
         pi\n\
         \n\
+        Custom agents come from config.toml \
+        ($XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml). \
+        An [agents.<name>] table with base = \"pi\" and a command array \
+        runs that command with the same flags as `crew pi`.\n\
+        \n\
         Jobs\n  \
         job       run, ls, show, result, log, wait, resume, stop\n\
         \n\
@@ -125,6 +130,9 @@ enum Command {
             crew pi -C ~/Projects/crew \"What does src/tier.rs decide?\""
     )]
     Pi(PiArgs),
+    /// A name from config.toml that is not one of the built-in commands.
+    #[command(external_subcommand)]
+    External(Vec<String>),
     #[command(
         about = "Run, list, and resume named background jobs",
         long_about = "Detach a provider run under a name and pick it up later. \
@@ -140,8 +148,9 @@ enum Command {
     #[command(
         about = "Show CPU, memory, GPU, and running agents per provider",
         long_about = "One machine line, then a line for each provider (claude, gemini, \
-            grok, codex, pi) that has running crew agents, with their count and pids. \
-            Idle providers are not listed. Foreground runs and detached jobs each \
+            grok, codex, pi) and each custom agent that has running crew processes, \
+            with their count and pids. Idle names are not listed. A custom agent \
+            is shown under its own name. Foreground runs and detached jobs each \
             count once. macOS only for the GPU figure.",
         after_long_help = "Examples:\n  crew load"
     )]
@@ -178,7 +187,8 @@ enum Command {
             the old binary keeps it. A missing binary is reported and skipped. \
             crew is updated last from the git URL `cargo install` recorded. A \
             path install is left untouched. pi has no account quota, so \
-            `crew usage` does not show it.",
+            `crew usage` does not show it. Custom agents are skipped here: \
+            they are pi, which is updated once.",
         after_long_help = "Examples:\n  crew update"
     )]
     Update,
@@ -338,6 +348,8 @@ pub struct Invocation {
     pub uncommitted: bool,
     pub base: Option<String>,
     pub commit: Option<String>,
+    /// Set when the command name is a config.toml agent rather than `pi`.
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -465,7 +477,7 @@ struct JobRunArgs {
     /// Job name. Must match ^[a-z0-9][a-z0-9._-]{0,63}$.
     #[arg(value_name = "NAME")]
     name: String,
-    /// claude, gemini (agy, antigravity), grok, codex (gpt, chatgpt), or pi.
+    /// claude, gemini (agy, antigravity), grok, codex (gpt, chatgpt), pi, or a custom agent.
     #[arg(value_name = "PROVIDER")]
     provider: String,
     /// Wrapper flags and the prompt. Passed through to `crew <provider>`.
@@ -504,18 +516,41 @@ fn dispatch(cli: Cli) -> Result<i32, Error> {
         Some(Command::Grok(args)) => crate::providers::execute(&invocation_from_grok(args)?),
         Some(Command::Codex(args)) => crate::providers::execute(&invocation_from_codex(args)?),
         Some(Command::Pi(args)) => crate::providers::execute(&invocation_from_pi(args)?),
+        Some(Command::External(args)) => dispatch_external(args),
     }
+}
+
+fn dispatch_external(args: Vec<String>) -> Result<i32, Error> {
+    let mut args = args.into_iter();
+    let Some(name) = args.next() else {
+        return Err(Error::new(2, "missing command"));
+    };
+    let trailing: Vec<String> = args.collect();
+    if trailing.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "{name} is a custom agent from {}. It takes the same flags as `crew pi`.",
+            crate::config::config_path().display()
+        );
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let pi = command
+            .find_subcommand_mut("pi")
+            .ok_or_else(|| Error::new(2, "pi help is missing"))?;
+        pi.print_long_help()
+            .map_err(|err| Error::new(2, format!("cannot print help: {err}")))?;
+        return Ok(0);
+    }
+    let invocation = parse_command(&name, &trailing)?;
+    crate::providers::execute(&invocation)
 }
 
 fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
     match args.command {
         JobCommand::Run(args) => {
-            let provider: Provider = args.provider.parse()?;
-            // Reject a trailing command that is not a legal invocation of that provider.
-            let _ = parse_trailing(provider, &args.trailing)?;
+            // Reject a trailing command that is not a legal invocation.
+            let _ = parse_command(&args.provider, &args.trailing)?;
             job::run(NewJob {
                 name: args.name,
-                provider,
+                provider: args.provider,
                 note: args.note,
                 trailing: args.trailing,
             })
@@ -546,6 +581,22 @@ fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
         }
         JobCommand::Stop { name } => job::stop(&name),
     }
+}
+
+/// Parse `crew job run <name> <command> ...` for a built-in provider or a custom agent.
+pub fn parse_command(name: &str, trailing: &[String]) -> Result<Invocation, Error> {
+    if let Ok(provider) = name.parse::<Provider>() {
+        return parse_trailing(provider, trailing);
+    }
+    if tier::agent(name)?.is_none() {
+        return Err(Error::new(
+            2,
+            format!("unknown provider {name} (claude, gemini, grok, codex, pi)"),
+        ));
+    }
+    let mut invocation = parse_trailing(Provider::Pi, trailing)?;
+    invocation.user_agent = Some(name.to_string());
+    Ok(invocation)
 }
 
 /// Parse the trailing words of `crew job run` as `crew <provider> ...`.
@@ -616,6 +667,7 @@ fn finish(
         uncommitted: extra.uncommitted,
         base: extra.base,
         commit: extra.commit,
+        user_agent: None,
     })
 }
 

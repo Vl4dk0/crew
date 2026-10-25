@@ -35,6 +35,22 @@ crew update
 
 Run `crew help <cmd>` or `<cmd> --help` for details.
 
+## Custom agents
+
+`~/.config/crew/config.toml` (or `$XDG_CONFIG_HOME/crew/config.toml`) can add a pi-based command without putting it in this repo. A row under `[tiers]` overrides that one built-in row.
+
+```toml
+[agents.piprover]
+base = "pi"
+command = ["~/dotfiles/scripts/pilocal", "--prover"]
+
+[tiers.piprover.smart]
+model = "..."
+effort = "high"
+```
+
+`crew piprover --tier smart "..."` then runs that command with pi's print flags.
+
 ## Contributing
 
 Enable the format-on-commit hook: `git config core.hooksPath .githooks`
