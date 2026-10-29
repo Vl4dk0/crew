@@ -82,7 +82,7 @@ enum Command {
         long_about = "Run agy. Aliases: antigravity, agy. Built-in tier models \
             bake effort into the model slug (gemini-3.8-flash-low, etc.). A \
             custom model or --agent with -e forwards --effort. A deadline kills \
-            the process group and drops the partial transcript.",
+            the process group. The partial transcript is kept.",
         after_long_help = "Examples:\n  \
             crew gemini --tier fast \"Reply with the single word pong\"\n  \
             crew agy \"Summarize src/cli.rs\"\n  \
@@ -151,7 +151,7 @@ enum Command {
             grok, codex, pi) and each custom agent that has running crew processes, \
             with their count and pids. Idle names are not listed. A custom agent \
             is shown under its own name. Foreground runs and detached jobs each \
-            count once. macOS only for the GPU figure.",
+            count once. GPU is the macOS accelerator, or each Linux DRM card.",
         after_long_help = "Examples:\n  crew load"
     )]
     Load,
@@ -396,8 +396,9 @@ enum JobCommand {
     },
     #[command(
         about = "Print a finished job's stdout",
-        long_about = "Exit 2 while the job is running, 3 if the supervisor is gone \
-            without a recorded exit. Refuses a symlink.",
+        long_about = "Exit 2 while the job is running. Exit 3 when the supervisor \
+            is gone without a recorded exit (a lost job). `job wait` returns 0 \
+            for that same job. Refuses a symlink.",
         after_long_help = "Examples:\n  crew job result demo"
     )]
     Result {
@@ -421,6 +422,7 @@ enum JobCommand {
     #[command(
         about = "Block until the named jobs finish",
         long_about = "Exit with the job's code. A stopped job returns 130. \
+            A lost job has no recorded exit and returns 0 (`job result` exits 3). \
             An unknown name is exit 2. --timeout expiring is exit 4.",
         after_long_help = "Examples:\n  \
             crew job wait demo\n  \

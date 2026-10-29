@@ -285,7 +285,6 @@ fn run_internal(
         session_id: None,
         exit_code: None,
         stopped: false,
-        usage: None,
     };
 
     save_record(&job.name, &record)?;

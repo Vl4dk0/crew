@@ -31,23 +31,8 @@ impl std::fmt::Display for Status {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct JobUsage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turns: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RunRecordWire")]
 pub struct RunRecord {
     pub name: String,
     pub provider: String,
@@ -80,8 +65,69 @@ pub struct RunRecord {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub stopped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<JobUsage>,
+}
+
+/// Deserialize shape of [`RunRecord`]. `usage` is accepted and discarded:
+/// the field was never written, but old job files still contain it.
+/// Other unknown keys still fail.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunRecordWire {
+    name: String,
+    provider: String,
+    #[serde(default)]
+    model: Option<String>,
+    args: Vec<String>,
+    cwd: String,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    resume_session: Option<String>,
+    created_at: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    finished_at: Option<String>,
+    #[serde(default)]
+    supervisor_pid: Option<u32>,
+    #[serde(default)]
+    supervisor_start: Option<String>,
+    #[serde(default)]
+    wrapper_pid: Option<u32>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    stopped: bool,
+    #[serde(default, rename = "usage")]
+    _usage: Option<serde::de::IgnoredAny>,
+}
+
+impl From<RunRecordWire> for RunRecord {
+    fn from(wire: RunRecordWire) -> Self {
+        Self {
+            name: wire.name,
+            provider: wire.provider,
+            model: wire.model,
+            args: wire.args,
+            cwd: wire.cwd,
+            note: wire.note,
+            parent: wire.parent,
+            resume_session: wire.resume_session,
+            created_at: wire.created_at,
+            started_at: wire.started_at,
+            finished_at: wire.finished_at,
+            supervisor_pid: wire.supervisor_pid,
+            supervisor_start: wire.supervisor_start,
+            wrapper_pid: wire.wrapper_pid,
+            session_id: wire.session_id,
+            exit_code: wire.exit_code,
+            stopped: wire.stopped,
+        }
+    }
 }
 
 /// Derive dynamic status from record state and supervisor liveness.
@@ -166,7 +212,6 @@ mod tests {
             session_id: None,
             exit_code: None,
             stopped: false,
-            usage: None,
         };
 
         assert_eq!(status_of(&rec, true), Status::Running);
@@ -203,5 +248,18 @@ mod tests {
 
         let res = serde_json::from_str::<RunRecord>(json);
         assert!(res.is_err());
+
+        let with_usage = r#"{
+            "name": "test",
+            "provider": "claude",
+            "args": [],
+            "cwd": "/tmp",
+            "created_at": "2026-10-20T20:00:00Z",
+            "stopped": false,
+            "usage": {"input_tokens": 3, "cost_usd": "0.01"}
+        }"#;
+        let rec = serde_json::from_str::<RunRecord>(with_usage).unwrap();
+        let stored = serde_json::to_string(&rec).unwrap();
+        assert!(!stored.contains("usage"));
     }
 }
