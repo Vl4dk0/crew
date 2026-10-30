@@ -110,7 +110,14 @@ fn plan(
     let model = resolved
         .model
         .ok_or_else(|| Error::new(2, "codex needs a model"))?;
-    Ok(codex_argv(invocation, &model, &resolved.effort, prompt))
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
+    Ok(codex_argv(
+        invocation,
+        &model,
+        &resolved.effort,
+        prompt,
+        verbatim.as_deref(),
+    ))
 }
 
 pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
@@ -123,8 +130,9 @@ pub(super) fn codex_argv(
     model: &str,
     effort: &str,
     prompt: Option<&str>,
+    verbatim: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
-    let (wire, note) = map_effort(Provider::Codex, Some(model), effort);
+    let (wire, note) = map_effort(Provider::Codex, Some(model), effort, verbatim);
     let mut argv = vec![
         "codex".to_string(),
         "exec".to_string(),
@@ -321,7 +329,7 @@ mod tests {
     #[test]
     fn argv_matches_the_wrapper() {
         let invocation = bare(Provider::Codex);
-        let (argv, note) = codex_argv(&invocation, "gpt-6.1-sol", "medium", Some("hello"));
+        let (argv, note) = codex_argv(&invocation, "gpt-6.1-sol", "medium", Some("hello"), None);
         assert!(note.is_none());
         assert_eq!(
             argv,
@@ -342,7 +350,7 @@ mod tests {
             ]
         );
 
-        let (argv, note) = codex_argv(&invocation, "gpt-6.1-sol", "max", Some("hello"));
+        let (argv, note) = codex_argv(&invocation, "gpt-6.1-sol", "max", Some("hello"), None);
         assert_eq!(flag(&argv, "-c"), Some("approval_policy=\"never\""));
         assert!(
             argv.iter()
@@ -350,7 +358,7 @@ mod tests {
         );
         assert_eq!(note.as_deref(), Some("[crew] effort max -> ultra"));
 
-        let (argv, note) = codex_argv(&invocation, "gpt-6-luna", "max", Some("hello"));
+        let (argv, note) = codex_argv(&invocation, "gpt-6-luna", "max", Some("hello"), None);
         assert!(
             argv.iter()
                 .any(|arg| arg == "model_reasoning_effort=\"max\"")
@@ -360,21 +368,21 @@ mod tests {
         let mut invocation = bare(Provider::Codex);
         assert!(has(&argv, "--dangerously-bypass-approvals-and-sandbox"));
 
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"), None);
         assert_eq!(argv.last().map(String::as_str), Some("hello"));
 
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None, None);
         assert!(!has(&argv, "--"));
 
         invocation.resume = Some("abc".to_string());
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"), None);
         assert!(has(&argv, "resume"));
         assert!(argv.iter().any(|arg| arg == "abc"));
         assert!(!has(&argv, "--last"));
 
         invocation.resume = None;
         invocation.continue_session = true;
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"), None);
         assert!(has(&argv, "resume"));
         assert!(has(&argv, "--last"));
 
@@ -382,7 +390,7 @@ mod tests {
         invocation.review = true;
         invocation.uncommitted = true;
         assert!(codex_scope(&invocation));
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None);
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None, None);
         assert!(has(&argv, "review"));
         assert!(has(&argv, "--uncommitted"));
         assert!(!has(&argv, "--"));
@@ -390,7 +398,7 @@ mod tests {
         invocation.uncommitted = false;
         invocation.schema = Some("{".to_string());
         invocation.add_dir = vec!["~/nope".into()];
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"));
+        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"), None);
         assert_eq!(argv.last().map(String::as_str), Some("hello"));
         let schema = flag(&argv, "--output-schema").unwrap();
         assert!(Path::new(schema).is_absolute());

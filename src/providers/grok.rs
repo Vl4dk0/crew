@@ -69,12 +69,14 @@ fn plan(
         invocation.model.as_deref(),
         invocation.effort.as_deref(),
     )?;
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
     Ok(grok_argv(
         invocation,
         resolved.model.as_deref(),
         &resolved.effort,
         prompt,
         schema,
+        verbatim.as_deref(),
     ))
 }
 
@@ -89,8 +91,9 @@ pub(super) fn grok_argv(
     effort: &str,
     prompt: &str,
     schema: Option<&str>,
+    verbatim: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
-    let (wire, note) = map_effort(Provider::Grok, model, effort);
+    let (wire, note) = map_effort(Provider::Grok, model, effort, verbatim);
     let mut argv = vec![
         "grok".to_string(),
         "-p".to_string(),
@@ -604,18 +607,18 @@ mod tests {
     #[test]
     fn argv_omits_model_and_prefers_resume() {
         let invocation = bare(Provider::Grok);
-        let (argv, note) = grok_argv(&invocation, None, "medium", "hello", None);
+        let (argv, note) = grok_argv(&invocation, None, "medium", "hello", None, None);
         assert!(note.is_none());
         assert!(!has(&argv, "-m"));
         assert_eq!(flag(&argv, "--effort"), Some("medium"));
         assert!(has(&argv, "--always-approve"));
         assert!(!has(&argv, "--sandbox"));
 
-        let (argv, note) = grok_argv(&invocation, None, "max", "hello", None);
+        let (argv, note) = grok_argv(&invocation, None, "max", "hello", None, None);
         assert_eq!(flag(&argv, "--effort"), Some("xhigh"));
         assert_eq!(note.as_deref(), Some("[crew] effort max -> xhigh"));
 
-        let (argv, note) = grok_argv(&invocation, Some("grok-4.5"), "max", "hello", None);
+        let (argv, note) = grok_argv(&invocation, Some("grok-4.5"), "max", "hello", None, None);
         assert_eq!(flag(&argv, "--effort"), Some("high"));
         assert_eq!(note.as_deref(), Some("[crew] effort max -> high"));
         assert_eq!(flag(&argv, "-m"), Some("grok-4.5"));
@@ -625,7 +628,7 @@ mod tests {
         invocation.continue_session = true;
         invocation.max_turns = Some(0);
         invocation.cwd = Some("/tmp/work".into());
-        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None);
+        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None, None);
         assert_eq!(flag(&argv, "--effort"), Some("low"));
         assert!(has(&argv, "--resume"));
         assert!(!has(&argv, "--continue"));
@@ -634,7 +637,7 @@ mod tests {
 
         invocation.max_turns = Some(3);
         invocation.resume = None;
-        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None);
+        let (argv, _) = grok_argv(&invocation, Some("grok-4.7"), "low", "hello", None, None);
         assert_eq!(flag(&argv, "--max-turns"), Some("3"));
         assert!(has(&argv, "--continue"));
     }

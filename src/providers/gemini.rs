@@ -123,11 +123,13 @@ fn plan(invocation: &Invocation, prompt: &str) -> Result<(Vec<String>, Option<St
         invocation.model.as_deref(),
         invocation.effort.as_deref(),
     )?;
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
     Ok(gemini_argv(
         invocation,
         resolved.model.as_deref(),
         &resolved.effort,
         prompt,
+        verbatim.as_deref(),
     ))
 }
 
@@ -141,6 +143,7 @@ pub(super) fn gemini_argv(
     resolved_model: Option<&str>,
     resolved_effort: &str,
     prompt: &str,
+    verbatim: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
     let (model, effort_flag, note) = gemini_model(
         invocation.model.as_deref(),
@@ -148,6 +151,7 @@ pub(super) fn gemini_argv(
         invocation.agent.is_some(),
         resolved_model,
         resolved_effort,
+        verbatim,
     );
     let mut argv = vec![
         "agy".to_string(),
@@ -188,50 +192,48 @@ fn gemini_model(
     agent: bool,
     resolved_model: Option<&str>,
     resolved_effort: &str,
+    verbatim: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     if agent && user_model.is_none() {
-        return effort_only(user_set_effort, resolved_effort);
+        return effort_flag(resolved_effort, verbatim);
     }
     let Some(model) = user_model.or(resolved_model) else {
-        return effort_only(user_set_effort, resolved_effort);
+        return effort_flag(resolved_effort, verbatim);
     };
-    if model == "flash" || model == "argon" {
-        let (wire, note) = map_effort(Provider::Gemini, None, resolved_effort);
-        let slug = if model == "flash" {
-            format!("gemini-3.8-flash-{wire}")
-        } else {
-            format!("gemini-4-argon-{wire}")
-        };
-        return (Some(slug), None, note);
+    // flash / argon and the unsuffixed family names are bases. The effort
+    // belongs in the slug. agy rejects --effort beside a suffixed model.
+    if let Some(base) = family_base(model) {
+        let (wire, note) = map_effort(Provider::Gemini, None, resolved_effort, verbatim);
+        return (Some(format!("{base}-{wire}")), None, note);
     }
-    // A user `-m` that already names the effort is sent unchanged. agy rejects
-    // a second `--effort` on that slug.
+    // A user -m that already names the effort is kept. Dropping the word
+    // they typed would look like crew accepted it.
     if user_model.is_some() && baked_base(model).is_some() {
-        return (Some(model.to_string()), None, None);
+        let note = user_set_effort
+            .then(|| format!("[crew] effort {resolved_effort} ignored; {model} already sets it"));
+        return (Some(model.to_string()), None, note);
     }
     if let Some(base) = baked_base(model) {
-        if user_set_effort {
-            let (wire, note) = map_effort(Provider::Gemini, Some(model), resolved_effort);
-            return (Some(format!("{base}-{wire}")), None, note);
-        }
-        return (Some(model.to_string()), None, None);
+        let (wire, note) = map_effort(Provider::Gemini, Some(model), resolved_effort, verbatim);
+        return (Some(format!("{base}-{wire}")), None, note);
     }
-    if user_set_effort {
-        let (wire, note) = map_effort(Provider::Gemini, Some(model), resolved_effort);
-        return (Some(model.to_string()), Some(wire), note);
-    }
-    (Some(model.to_string()), None, None)
+    let (wire, note) = map_effort(Provider::Gemini, Some(model), resolved_effort, verbatim);
+    (Some(model.to_string()), Some(wire), note)
 }
 
-fn effort_only(
-    user_set_effort: bool,
+fn effort_flag(
     resolved_effort: &str,
+    verbatim: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
-    if user_set_effort {
-        let (wire, note) = map_effort(Provider::Gemini, None, resolved_effort);
-        (None, Some(wire), note)
-    } else {
-        (None, None, None)
+    let (wire, note) = map_effort(Provider::Gemini, None, resolved_effort, verbatim);
+    (None, Some(wire), note)
+}
+
+fn family_base(model: &str) -> Option<&'static str> {
+    match model {
+        "flash" | "gemini-3.8-flash" => Some("gemini-3.8-flash"),
+        "argon" | "gemini-4-argon" => Some("gemini-4-argon"),
+        _ => None,
     }
 }
 
@@ -400,7 +402,7 @@ fn path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::proc::{bare, flag, has};
+    use crate::providers::proc::{bare, flag, has, map_effort};
 
     /// Same margin `print_timeout` subtracts, written out so this test
     /// fails if the argv stops using that rule.
@@ -420,6 +422,7 @@ mod tests {
             Some("gemini-3.8-flash-medium"),
             "medium",
             "hello",
+            None,
         );
         let print_timeout = expected_print_timeout(invocation.timeout_secs);
         assert!(note.is_none());
@@ -441,46 +444,76 @@ mod tests {
         invocation.timeout_secs = 15.0;
         invocation.model = Some("flash".to_string());
         invocation.effort = Some("max".to_string());
-        let (argv, note) = gemini_argv(&invocation, Some("flash"), "max", "hello");
+        let (wire, expected_note) = map_effort(Provider::Gemini, None, "max", None);
+        let (argv, note) = gemini_argv(&invocation, Some("flash"), "max", "hello", None);
         let print_timeout = expected_print_timeout(invocation.timeout_secs);
-        assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
+        let slug = format!("gemini-3.8-flash-{wire}");
+        assert_eq!(flag(&argv, "--model"), Some(slug.as_str()));
         assert_eq!(flag(&argv, "--print-timeout"), Some(print_timeout.as_str()));
         assert!(!has(&argv, "--effort"));
-        assert_eq!(note.as_deref(), Some("[crew] effort max -> high"));
+        assert_eq!(note, expected_note);
 
         invocation.model = Some("argon".to_string());
         invocation.effort = None;
-        let (argv, note) = gemini_argv(&invocation, Some("argon"), "medium", "hello");
-        assert_eq!(flag(&argv, "--model"), Some("gemini-4-argon-medium"));
+        let (wire, _) = map_effort(Provider::Gemini, None, "medium", None);
+        let (argv, note) = gemini_argv(&invocation, Some("argon"), "medium", "hello", None);
+        let slug = format!("gemini-4-argon-{wire}");
+        assert_eq!(flag(&argv, "--model"), Some(slug.as_str()));
         assert!(note.is_none());
         assert!(!has(&argv, "--effort"));
 
-        invocation.model = Some("gemini-3.8-flash-high".to_string());
+        let baked = "gemini-3.8-flash-high";
+        invocation.model = Some(baked.to_string());
         invocation.effort = Some("max".to_string());
-        let (argv, note) = gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "max", "hello");
-        assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
+        let (argv, note) = gemini_argv(&invocation, Some(baked), "max", "hello", None);
+        assert_eq!(flag(&argv, "--model"), Some(baked));
         assert!(!has(&argv, "--effort"));
-        assert!(note.is_none());
+        assert_eq!(
+            note.as_deref(),
+            Some("[crew] effort max ignored; gemini-3.8-flash-high already sets it")
+        );
 
         invocation.model = None;
         invocation.effort = Some("high".to_string());
-        let (argv, note) = gemini_argv(&invocation, Some("gemini-3.8-flash-low"), "high", "hello");
-        assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash-high"));
+        let (wire, _) = map_effort(Provider::Gemini, None, "high", None);
+        let (argv, note) = gemini_argv(
+            &invocation,
+            Some("gemini-3.8-flash-low"),
+            "high",
+            "hello",
+            None,
+        );
+        let slug = format!("gemini-3.8-flash-{wire}");
+        assert_eq!(flag(&argv, "--model"), Some(slug.as_str()));
         assert!(!has(&argv, "--effort"));
         assert!(note.is_none());
 
         invocation.model = Some("gemini-3.8-flash".to_string());
         invocation.effort = Some("high".to_string());
-        let (argv, _) = gemini_argv(&invocation, Some("gemini-3.8-flash"), "high", "hello");
-        assert_eq!(flag(&argv, "--model"), Some("gemini-3.8-flash"));
-        assert_eq!(flag(&argv, "--effort"), Some("high"));
+        let (argv, note) =
+            gemini_argv(&invocation, Some("gemini-3.8-flash"), "high", "hello", None);
+        let slug = format!("gemini-3.8-flash-{wire}");
+        assert_eq!(flag(&argv, "--model"), Some(slug.as_str()));
+        assert!(!has(&argv, "--effort"));
+        assert!(note.is_none());
+
+        invocation.model = Some("other-model".to_string());
+        let (argv, _) = gemini_argv(&invocation, Some("other-model"), "high", "hello", None);
+        assert_eq!(flag(&argv, "--model"), Some("other-model"));
+        assert_eq!(flag(&argv, "--effort"), Some(wire.as_str()));
 
         invocation.model = None;
         invocation.effort = None;
         invocation.agent = Some("reviewer".to_string());
-        let (argv, _) = gemini_argv(&invocation, Some("gemini-3.8-flash-high"), "high", "hello");
+        let (argv, _) = gemini_argv(
+            &invocation,
+            Some("gemini-3.8-flash-high"),
+            "high",
+            "hello",
+            None,
+        );
         assert!(!has(&argv, "--model"));
-        assert!(!has(&argv, "--effort"));
+        assert_eq!(flag(&argv, "--effort"), Some(wire.as_str()));
         assert_eq!(flag(&argv, "--agent"), Some("reviewer"));
 
         invocation.agent = None;
@@ -491,6 +524,7 @@ mod tests {
             Some("gemini-3.8-flash-medium"),
             "medium",
             "hello",
+            None,
         );
         assert!(has(&argv, "--dangerously-skip-permissions"));
         assert!(has(&argv, "--sandbox"));

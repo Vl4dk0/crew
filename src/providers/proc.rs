@@ -69,7 +69,14 @@ pub(super) fn map_effort(
     provider: Provider,
     model: Option<&str>,
     effort: &str,
+    verbatim: Option<&str>,
 ) -> (String, Option<String>) {
+    // A config value is the wire word. Mapping it again would turn a
+    // deliberate `max = "max"` back into ultra or xhigh.
+    if let Some(wire) = verbatim {
+        let note = (wire != effort).then(|| format!("[crew] effort {effort} -> {wire}"));
+        return (wire.to_string(), note);
+    }
     if effort != "max" {
         return (effort.to_string(), None);
     }
@@ -85,6 +92,20 @@ pub(super) fn map_effort(
     };
     let note = (wire != "max").then(|| format!("[crew] effort max -> {wire}"));
     (wire.to_string(), note)
+}
+
+/// Config remap for the command that is actually running.
+///
+/// Custom agents do not inherit `[effort.pi]`. The table key is their name.
+pub(super) fn effort_verbatim(
+    invocation: &Invocation,
+    effort: &str,
+) -> Result<Option<String>, Error> {
+    let owner = invocation
+        .user_agent
+        .as_deref()
+        .unwrap_or(invocation.provider.as_str());
+    crate::tier::effort_override(owner, effort)
 }
 
 /// Only an omitted prompt or a literal `-` consumes crew's stdin.

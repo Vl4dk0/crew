@@ -63,11 +63,13 @@ pub(super) fn execute(
     program: &[String],
     label: &str,
 ) -> Result<i32, Error> {
+    let verbatim = proc::effort_verbatim(invocation, &settings.thinking)?;
     let (tail, note) = pi_tail(
         invocation,
         settings.model.as_deref(),
-        settings.thinking.as_deref(),
+        &settings.thinking,
         prompt,
+        verbatim.as_deref(),
     );
     let mut argv = program.to_vec();
     argv.extend(tail);
@@ -100,8 +102,9 @@ pub(super) fn execute(
 pub(super) fn pi_tail(
     invocation: &Invocation,
     model: Option<&str>,
-    thinking: Option<&str>,
+    thinking: &str,
     prompt: &str,
+    verbatim: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
     let mut argv = vec![
         "-p".to_string(),
@@ -112,13 +115,9 @@ pub(super) fn pi_tail(
     if let Some(model) = model {
         proc::push_pair(&mut argv, "--model", model);
     }
-    let note = if let Some(thinking) = thinking {
-        let (wire, note) = map_effort(Provider::Pi, model, thinking);
-        proc::push_pair(&mut argv, "--thinking", &wire);
-        note
-    } else {
-        None
-    };
+    // Always. Omitting --thinking let pi pick its own level, which hid the default.
+    let (wire, note) = map_effort(Provider::Pi, model, thinking, verbatim);
+    proc::push_pair(&mut argv, "--thinking", &wire);
     if let Some(resume) = &invocation.resume {
         proc::push_pair(&mut argv, "--session", resume);
     } else if invocation.continue_session {
@@ -349,13 +348,24 @@ mod tests {
         assert!(!report.after_stderr.contains("None"));
 
         let invocation = bare(Provider::Pi);
-        let (tail, note) = pi_tail(&invocation, None, None, "pong");
+        let (tail, note) = pi_tail(&invocation, None, "medium", "pong", None);
         assert!(note.is_none());
-        assert_eq!(tail, vec!["-p", "--mode", "json", "--approve", "pong"]);
+        assert_eq!(
+            tail,
+            vec![
+                "-p",
+                "--mode",
+                "json",
+                "--approve",
+                "--thinking",
+                "medium",
+                "pong"
+            ]
+        );
 
         let mut with_flags = invocation;
         with_flags.resume = Some("sess-1".to_string());
-        let (tail, note) = pi_tail(&with_flags, Some("provider/model"), Some("max"), "pong");
+        let (tail, note) = pi_tail(&with_flags, Some("provider/model"), "max", "pong", None);
         assert!(note.is_none());
         assert_eq!(
             tail,
@@ -375,7 +385,7 @@ mod tests {
         );
 
         let mut agent = vec!["tool".to_string(), "--fixed".to_string()];
-        let (tail, _) = pi_tail(&bare(Provider::Pi), Some("model-c"), Some("high"), "pong");
+        let (tail, _) = pi_tail(&bare(Provider::Pi), Some("model-c"), "high", "pong", None);
         agent.extend(tail);
         assert_eq!(
             agent,

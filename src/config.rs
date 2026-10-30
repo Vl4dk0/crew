@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::error::Error;
-use crate::id::parse_effort;
+use crate::id::EFFORTS;
 
 /// Subcommands and provider aliases an agent must not take.
 const RESERVED: &[&str] = &[
@@ -40,7 +40,6 @@ const TIER_KEYS: &[&str] = &["fast", "balanced", "smart", "max"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTier {
     pub model: String,
-    pub effort: Option<String>,
 }
 
 /// A pi-based command. `command[0]` is the binary, the rest are fixed args.
@@ -54,6 +53,9 @@ pub struct AgentSpec {
 pub struct UserConfig {
     pub tiers: BTreeMap<String, BTreeMap<String, UserTier>>,
     pub agents: BTreeMap<String, AgentSpec>,
+    /// Owner (canonical provider or custom agent) to user-word to wire word.
+    /// The wire word is sent as written. It is not passed through the built-in map.
+    pub effort: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,14 +65,18 @@ struct File {
     tiers: BTreeMap<String, BTreeMap<String, UserRow>>,
     #[serde(default)]
     agents: BTreeMap<String, AgentToml>,
+    #[serde(default)]
+    effort: BTreeMap<String, BTreeMap<String, String>>,
+    /// Already in the user file for a later SSH feature. This branch does not dial it.
+    /// Rejecting the key would make every command fail before that feature lands.
+    #[serde(default, rename = "hosts")]
+    _hosts: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserRow {
     model: String,
-    #[serde(default)]
-    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,28 +177,46 @@ pub fn parse_user(text: &str, origin: &str) -> Result<UserConfig, Error> {
                     format!("config {origin}: {key}.model: model is empty"),
                 ));
             }
-            if owner == "grok" && row.effort.is_some() {
-                return Err(Error::new(
-                    2,
-                    format!("config {origin}: {key}.effort: grok must not set effort. Pass -e."),
-                ));
-            }
-            if let Some(effort) = &row.effort {
-                parse_effort(effort).map_err(|err| {
-                    Error::new(2, format!("config {origin}: {key}.effort: {}", err.message))
-                })?;
-            }
-            parsed.insert(
-                tier_name,
-                UserTier {
-                    model: row.model,
-                    effort: row.effort,
-                },
-            );
+            parsed.insert(tier_name, UserTier { model: row.model });
         }
         tiers.insert(owner, parsed);
     }
-    Ok(UserConfig { tiers, agents })
+    let mut effort = BTreeMap::new();
+    for (owner, words) in file.effort {
+        let known = PROVIDER_KEYS.contains(&owner.as_str()) || agents.contains_key(&owner);
+        if !known {
+            return Err(Error::new(
+                2,
+                format!("config {origin}: effort.{owner}: unknown provider or agent"),
+            ));
+        }
+        let mut parsed = BTreeMap::new();
+        for (word, wire) in words {
+            let key = format!("effort.{owner}.{word}");
+            if !EFFORTS.contains(&word.as_str()) {
+                return Err(Error::new(
+                    2,
+                    format!(
+                        "config {origin}: {key}: effort must be {}",
+                        EFFORTS.join(", ")
+                    ),
+                ));
+            }
+            if wire.is_empty() {
+                return Err(Error::new(
+                    2,
+                    format!("config {origin}: {key}: wire word is empty"),
+                ));
+            }
+            parsed.insert(word, wire);
+        }
+        effort.insert(owner, parsed);
+    }
+    Ok(UserConfig {
+        tiers,
+        agents,
+        effort,
+    })
 }
 
 fn valid_agent_name(name: &str) -> bool {
@@ -218,7 +242,6 @@ mod tests {
 
             [tiers.pi.smart]
             model = "model-b"
-            effort = "high"
 
             [agents.piprover]
             base = "pi"
@@ -226,7 +249,12 @@ mod tests {
 
             [tiers.piprover.fast]
             model = "model-c"
-            effort = "low"
+
+            [effort.claude]
+            max = "high"
+
+            [effort.piprover]
+            low = "high"
         "#;
         let parsed = parse_user(text, "fixture").unwrap();
         // Expectations come from the fixture text, so a fixture edit cannot
@@ -238,12 +266,15 @@ mod tests {
             assert_eq!(got.len(), rows.len());
             for (tier, row) in rows {
                 assert_eq!(got[tier].model, row.model);
-                assert_eq!(got[tier].effort, row.effort);
             }
         }
         assert_eq!(parsed.agents.len(), raw.agents.len());
         for (name, spec) in &raw.agents {
             assert_eq!(parsed.agents[name].command, spec.command);
+        }
+        assert_eq!(parsed.effort.len(), raw.effort.len());
+        for (owner, words) in &raw.effort {
+            assert_eq!(&parsed.effort[owner], words);
         }
 
         let extra = "[tiers.claude.fast]\nmodel = \"model-a\"\nextra = true\n";
@@ -263,5 +294,17 @@ mod tests {
         let unknown = "[tiers.nope.fast]\nmodel = \"model-a\"\n";
         let err = parse_user(unknown, "fixture").unwrap_err();
         assert!(err.message.contains("tiers.nope"), "{}", err.message);
+
+        let alias = "[effort.agy]\nmax = \"high\"\n";
+        let err = parse_user(alias, "fixture").unwrap_err();
+        assert!(err.message.contains("effort.agy"), "{}", err.message);
+
+        let bad_word = "[effort.claude]\nultra = \"high\"\n";
+        let err = parse_user(bad_word, "fixture").unwrap_err();
+        assert!(
+            err.message.contains("effort.claude.ultra"),
+            "{}",
+            err.message
+        );
     }
 }

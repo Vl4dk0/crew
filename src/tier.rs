@@ -4,11 +4,11 @@ use serde::Deserialize;
 
 use crate::config::{self, AgentSpec, UserTier};
 use crate::error::Error;
-use crate::id::{Provider, parse_effort};
+use crate::id::{EFFORTS, Provider};
 
 const BUILTIN: &str = include_str!("../tiers.toml");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Fast,
     Balanced,
@@ -26,8 +26,18 @@ impl Tier {
         }
     }
 
-    fn all() -> [Self; 4] {
+    pub fn all() -> [Self; 4] {
         [Self::Fast, Self::Balanced, Self::Smart, Self::Max]
+    }
+}
+
+pub fn parse_name(name: &str) -> Option<Tier> {
+    match name {
+        "fast" => Some(Tier::Fast),
+        "balanced" => Some(Tier::Balanced),
+        "smart" => Some(Tier::Smart),
+        "max" => Some(Tier::Max),
+        _ => None,
     }
 }
 
@@ -42,9 +52,6 @@ pub struct Resolved {
 #[serde(deny_unknown_fields)]
 struct Row {
     model: String,
-    /// Absent for grok. A grok tier does not select effort. `-e` does.
-    #[serde(default)]
-    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +124,7 @@ struct Loaded {
     /// pi and custom agents. They have no built-in rows.
     extras: BTreeMap<String, BTreeMap<Tier, UserTier>>,
     agents: BTreeMap<String, AgentSpec>,
+    effort: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
@@ -130,37 +138,6 @@ fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
     ] {
         for tier in Tier::all() {
             let row = table.provider(provider).get(tier);
-            match (provider, row.effort.as_deref()) {
-                (Provider::Grok, Some(_)) => {
-                    return Err(Error::new(
-                        2,
-                        format!(
-                            "tier config {origin}: grok {} must not set effort. Pass -e.",
-                            tier.as_str()
-                        ),
-                    ));
-                }
-                (Provider::Grok, None) => {}
-                (_, None) => {
-                    return Err(Error::new(
-                        2,
-                        format!(
-                            "tier config {origin}: {provider} {} is missing effort",
-                            tier.as_str()
-                        ),
-                    ));
-                }
-                (_, Some(effort)) => parse_effort(effort).map_err(|err| {
-                    Error::new(
-                        2,
-                        format!(
-                            "tier config {origin}: {provider} {} effort: {}",
-                            tier.as_str(),
-                            err.message
-                        ),
-                    )
-                })?,
-            }
             if row.model.is_empty() {
                 return Err(Error::new(
                     2,
@@ -175,30 +152,22 @@ fn parse_table(text: &str, origin: &str) -> Result<Table, Error> {
     Ok(table)
 }
 
-fn tier_named(name: &str) -> Option<Tier> {
-    match name {
-        "fast" => Some(Tier::Fast),
-        "balanced" => Some(Tier::Balanced),
-        "smart" => Some(Tier::Smart),
-        "max" => Some(Tier::Max),
-        _ => None,
-    }
-}
-
 fn load() -> Result<Loaded, Error> {
     let mut loaded = Loaded {
         table: parse_table(BUILTIN, "builtin")?,
         overridden: BTreeSet::new(),
         extras: BTreeMap::new(),
         agents: BTreeMap::new(),
+        effort: BTreeMap::new(),
     };
     let Some(user) = config::load_user()? else {
         return Ok(loaded);
     };
     loaded.agents = user.agents;
+    loaded.effort = user.effort;
     for (owner, rows) in user.tiers {
         for (tier_name, row) in rows {
-            let Some(tier) = tier_named(&tier_name) else {
+            let Some(tier) = parse_name(&tier_name) else {
                 continue;
             };
             // pi is a provider name, but its rows are not in the built-in table.
@@ -207,9 +176,6 @@ fn load() -> Result<Loaded, Error> {
             {
                 let slot = loaded.table.provider_mut(provider).get_mut(tier);
                 slot.model = row.model;
-                if let Some(effort) = row.effort {
-                    slot.effort = Some(effort);
-                }
                 loaded.overridden.insert((owner.clone(), tier_name));
             } else {
                 loaded
@@ -223,10 +189,24 @@ fn load() -> Result<Loaded, Error> {
     Ok(loaded)
 }
 
+/// Config wire word for this owner and user word, if the file remaps it.
+///
+/// The owner is the canonical provider or the custom agent name. An alias
+/// such as `agy` is not a key, and a custom agent does not inherit `[effort.pi]`.
+pub fn effort_override(owner: &str, effort: &str) -> Result<Option<String>, Error> {
+    let loaded = load()?;
+    Ok(loaded
+        .effort
+        .get(owner)
+        .and_then(|words| words.get(effort))
+        .cloned())
+}
+
 /// What the runner should put on the CLI.
 ///
-/// No tier and no `-m` keeps the wrapper's model default and uses effort
-/// `medium`. It does not apply `balanced`, because grok's wrapper omits `-m`.
+/// No tier and no `-m` keeps the wrapper's model default. Effort is the word
+/// the user typed, or `medium`. A tier never changes it. Grok's wrapper still
+/// omits `-m` when both are absent, so this does not apply `balanced`.
 pub fn resolve(
     provider: Provider,
     tier: Option<Tier>,
@@ -245,11 +225,10 @@ pub fn resolve(
 
 /// Model and thinking for `pi` or a pi-based agent.
 ///
-/// `thinking` is None when neither `-e` nor the tier row set an effort, so
-/// the runner omits `--thinking` and pi keeps its own default.
+/// `thinking` is always set. Pi has no separate default once crew owns the run.
 pub struct PiSettings {
     pub model: Option<String>,
-    pub thinking: Option<String>,
+    pub thinking: String,
 }
 
 pub fn agent(name: &str) -> Result<Option<AgentSpec>, Error> {
@@ -266,8 +245,13 @@ pub fn pi_settings(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<PiSettings, Error> {
-    if let Some(effort) = effort {
-        parse_effort(effort)?;
+    if let Some(effort) = effort
+        && !EFFORTS.contains(&effort)
+    {
+        return Err(Error::new(
+            2,
+            format!("effort must be one of {}", EFFORTS.join(", ")),
+        ));
     }
     let loaded = load()?;
     let row = match tier {
@@ -294,11 +278,10 @@ pub fn pi_settings(
         Some(model) => Some(model.to_string()),
         None => row.map(|row| row.model.clone()),
     };
-    let thinking = match effort {
-        Some(effort) => Some(effort.to_string()),
-        None => row.and_then(|row| row.effort.clone()),
-    };
-    Ok(PiSettings { model, thinking })
+    Ok(PiSettings {
+        model,
+        thinking: effort.unwrap_or(DEFAULT_EFFORT).to_string(),
+    })
 }
 
 fn resolve_with(
@@ -308,29 +291,24 @@ fn resolve_with(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<Resolved, Error> {
-    if let Some(effort) = effort {
-        parse_effort(effort)?;
+    if let Some(effort) = effort
+        && !EFFORTS.contains(&effort)
+    {
+        return Err(Error::new(
+            2,
+            format!("effort must be one of {}", EFFORTS.join(", ")),
+        ));
     }
-    if tier.is_none() && model.is_none() {
-        return Ok(wrapper_default(provider, effort));
-    }
-    let (row_model, row_effort) = if let Some(tier) = tier {
-        let row = table.provider(provider).get(tier);
-        let row_effort = if provider == Provider::Grok {
-            DEFAULT_EFFORT.to_string()
-        } else {
-            row.effort.clone().ok_or_else(|| {
-                Error::new(2, format!("{provider} {} is missing effort", tier.as_str()))
-            })?
-        };
-        (row.model.clone(), row_effort)
+    let model = if let Some(model) = model {
+        Some(model.to_string())
+    } else if let Some(tier) = tier {
+        Some(table.provider(provider).get(tier).model.clone())
     } else {
-        let default = wrapper_default(provider, None);
-        (default.model.unwrap_or_default(), default.effort)
+        return Ok(wrapper_default(provider, effort));
     };
     Ok(Resolved {
-        model: Some(model.unwrap_or(&row_model).to_string()),
-        effort: effort.unwrap_or(&row_effort).to_string(),
+        model,
+        effort: effort.unwrap_or(DEFAULT_EFFORT).to_string(),
     })
 }
 
@@ -340,8 +318,8 @@ const CLAUDE_WRAPPER_MODEL: &str = "sonnet";
 const CODEX_WRAPPER_MODEL: &str = "gpt-6-luna";
 const GEMINI_WRAPPER_MODEL: &str = "gemini-3.8-flash-medium";
 
-/// Effort when the user did not pass `-e`. A grok tier does not carry one.
-const DEFAULT_EFFORT: &str = "medium";
+/// Effort when the command names none. Every provider sends this.
+pub const DEFAULT_EFFORT: &str = "medium";
 
 fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
     let model = match provider {
@@ -359,7 +337,7 @@ fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
 
 pub fn print() -> Result<i32, Error> {
     let loaded = load()?;
-    println!("provider    tier      model                      effort  source");
+    println!("provider    tier      model                      source");
     for provider in [
         Provider::Claude,
         Provider::Codex,
@@ -376,13 +354,7 @@ pub fn print() -> Result<i32, Error> {
             } else {
                 "builtin"
             };
-            print_row(
-                provider.as_str(),
-                tier,
-                &row.model,
-                row.effort.as_deref(),
-                source,
-            );
+            print_row(provider.as_str(), tier, &row.model, source);
         }
     }
     for (owner, rows) in &loaded.extras {
@@ -390,19 +362,35 @@ pub fn print() -> Result<i32, Error> {
             let Some(row) = rows.get(&tier) else {
                 continue;
             };
-            print_row(owner, tier, &row.model, row.effort.as_deref(), "config");
+            print_row(owner, tier, &row.model, "config");
         }
+    }
+    let mut any_effort = false;
+    for (owner, words) in &loaded.effort {
+        let mut parts = Vec::new();
+        for word in EFFORTS {
+            if let Some(wire) = words.get(word) {
+                parts.push(format!("{word} -> {wire}"));
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        if !any_effort {
+            println!("\neffort");
+            any_effort = true;
+        }
+        println!("{owner}  {}", parts.join("  "));
     }
     Ok(0)
 }
 
-fn print_row(owner: &str, tier: Tier, model: &str, effort: Option<&str>, source: &str) {
+fn print_row(owner: &str, tier: Tier, model: &str, source: &str) {
     println!(
-        "{:<10}  {:<8}  {:<25}  {:<6}  {source}",
+        "{:<10}  {:<8}  {:<25}  {source}",
         owner,
         tier.as_str(),
         model,
-        effort.unwrap_or("-"),
     );
 }
 
@@ -423,12 +411,8 @@ mod tests {
                 let row = table.provider(provider).get(tier);
                 let resolved = resolve_with(&table, provider, Some(tier), None, None).unwrap();
                 assert_eq!(resolved.model.as_deref(), Some(row.model.as_str()));
-                if provider == Provider::Grok {
-                    assert!(row.effort.is_none());
-                    assert_eq!(resolved.effort, DEFAULT_EFFORT);
-                } else {
-                    assert_eq!(Some(resolved.effort.as_str()), row.effort.as_deref());
-                }
+                // A tier used to carry its own effort. It must not anymore.
+                assert_eq!(resolved.effort, DEFAULT_EFFORT);
             }
         }
     }
@@ -438,7 +422,6 @@ mod tests {
         let text = r#"
             [claude.fast]
             model = "haiku"
-            effort = "medium"
             extra = true
         "#;
         let err = parse_table(text, "test").unwrap_err();
@@ -453,8 +436,8 @@ mod tests {
         assert_eq!(grok.effort, DEFAULT_EFFORT);
         let codex = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
         assert_eq!(codex.model.as_deref(), Some(CODEX_WRAPPER_MODEL));
-        // No tier and no -e is one effort for every provider, including
-        // codex, whose own wrapper defaults to low. Vladko asked for that.
+        // No tier and no effort word is one effort for every provider,
+        // including codex, whose own wrapper defaults to low. Vladko asked for that.
         assert_eq!(codex.effort, DEFAULT_EFFORT);
     }
 
@@ -471,6 +454,7 @@ mod tests {
         .unwrap();
         let row = table.provider(Provider::Claude).get(Tier::Fast);
         assert_eq!(resolved.model.as_deref(), Some("opus"));
-        assert_eq!(Some(resolved.effort.as_str()), row.effort.as_deref());
+        assert_ne!(resolved.model.as_deref(), Some(row.model.as_str()));
+        assert_eq!(resolved.effort, DEFAULT_EFFORT);
     }
 }

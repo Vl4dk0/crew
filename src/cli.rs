@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::error::Error;
-use crate::id::{Provider, parse_effort};
+use crate::id::{EFFORTS, Provider};
 use crate::job::{self, NewJob};
 use crate::tier::{self, Tier};
 
@@ -16,7 +16,9 @@ use crate::tier::{self, Tier};
     long_about = "crew is one binary over claude, gemini, grok, codex, and pi.\n\
         \n\
         Start with `crew models` for the tier table, then \
-        `crew <provider> --tier fast \"...\"`. Every run has full autonomy.\n\
+        `crew <provider> fast \"...\"`. A tier picks the model. An effort \
+        word after it (low, medium, high, max) is sent on its own. The \
+        default effort is medium. Every run has full autonomy.\n\
         \n\
         Run exit codes: 0 ok, 75 usage/quota/rate/credit limit, 124 timeout, \
         125 denied tool or incomplete run, 127 CLI missing.\n\
@@ -47,8 +49,8 @@ use crate::tier::{self, Tier};
         models    the tier table",
     after_long_help = "Examples:\n  \
         crew models\n  \
-        crew grok --tier fast \"Reply with the single word pong\"\n  \
-        crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+        crew grok fast \"Reply with the single word pong\"\n  \
+        crew job run demo grok fast high \"Reply with the single word pong\"\n  \
         crew job wait demo\n  \
         crew load\n  \
         crew usage\n  \
@@ -72,19 +74,21 @@ enum Command {
         long_about = "Run the claude CLI. Use this for a foreground task. \
             For a detached run, use `crew job run <name> claude ...` instead.",
         after_long_help = "Examples:\n  \
-            crew claude --tier fast \"Reply with the single word pong\"\n  \
-            crew claude -m fable -e max \"Read the plan and list the risks\"\n  \
+            crew claude fast \"Reply with the single word pong\"\n  \
+            crew claude fast max \"Read the plan and list the risks\"\n  \
             crew claude -C ~/Projects/crew \"What does src/tier.rs decide?\""
     )]
     Claude(ProviderArgs),
     #[command(
         about = "Run the Gemini CLI (agy)",
-        long_about = "Run agy. Aliases: antigravity, agy. Built-in tier models \
-            bake effort into the model slug (gemini-3.8-flash-low, etc.). A \
-            custom model or --agent with -e forwards --effort. A deadline kills \
-            the process group. The partial transcript is kept.",
+        long_about = "Run agy. Aliases: antigravity, agy. A tier names a base \
+            model (gemini-3.8-flash, gemini-4-argon) and the effort is appended \
+            to that slug. A user -m that already ends in -low, -medium, or \
+            -high is kept, and an effort word is warned and not applied. \
+            Any other model is passed --effort. A deadline kills the process \
+            group. The partial transcript is kept.",
         after_long_help = "Examples:\n  \
-            crew gemini --tier fast \"Reply with the single word pong\"\n  \
+            crew gemini fast \"Reply with the single word pong\"\n  \
             crew agy \"Summarize src/cli.rs\"\n  \
             crew gemini -m gemini-3.8-flash-high \"Look at the last commit\"",
         visible_alias = "antigravity",
@@ -94,22 +98,22 @@ enum Command {
     #[command(
         about = "Run the Grok CLI",
         long_about = "Run grok. A tier only selects the model (grok-4.7). \
-            It does not select effort. -e does, and the default is medium. \
-            `crew models` prints '-' in the grok effort column.",
+            Effort is its own word and is always sent. The default is medium. \
+            max is sent as xhigh, or high on grok-4.5.",
         after_long_help = "Examples:\n  \
-            crew grok --tier fast \"Reply with the single word pong\"\n  \
-            crew grok --tier max -e high \"Review the diff\"\n  \
+            crew grok fast \"Reply with the single word pong\"\n  \
+            crew grok fast high \"Review the diff\"\n  \
             crew grok -n 4 \"List the files in src/\""
     )]
     Grok(GrokArgs),
     #[command(
         about = "Run Codex",
-        long_about = "Run codex. Aliases: gpt, chatgpt. Default effort is \
-            medium. User-facing max is sent as ultra, except on gpt-6-luna, \
-            which stays max. --review with a scope (--uncommitted, --base, \
-            or --commit) does not take a prompt.",
+        long_about = "Run codex. Aliases: gpt, chatgpt. Effort is always sent. \
+            The default is medium. User-facing max is sent as ultra, except on \
+            gpt-6-luna, which stays max. --review with a scope (--uncommitted, \
+            --base, or --commit) does not take a prompt.",
         after_long_help = "Examples:\n  \
-            crew codex --tier fast \"Reply with the single word pong\"\n  \
+            crew codex fast \"Reply with the single word pong\"\n  \
             crew codex --review --uncommitted\n  \
             crew codex -m gpt-6-luna \"Explain src/tier.rs\"",
         visible_alias = "gpt",
@@ -119,14 +123,13 @@ enum Command {
     #[command(
         about = "Run the pi coding agent",
         long_about = "Run pi. There are no built-in pi tiers, because the \
-            models depend on the user's pi setup. --tier needs a \
-            [tiers.pi.<tier>] row in config.toml. -e maps onto the same pi \
-            --thinking level (low, medium, high, max). With no -e and no \
-            effort on the tier row, --thinking is omitted and pi keeps its \
-            own default. -r is pi --session. -C is the child's working directory.",
+            models depend on the user's pi setup. A tier needs a \
+            [tiers.pi.<tier>] row in config.toml. Effort maps onto pi \
+            --thinking (low, medium, high, max) and is always sent. The \
+            default is medium. -r is pi --session. -C is the child's working directory.",
         after_long_help = "Examples:\n  \
             crew pi \"Reply with the single word pong\"\n  \
-            crew pi -m provider/model -e high \"Look at the last commit\"\n  \
+            crew pi -m provider/model high \"Look at the last commit\"\n  \
             crew pi -C ~/Projects/crew \"What does src/tier.rs decide?\""
     )]
     Pi(PiArgs),
@@ -139,7 +142,7 @@ enum Command {
             The store is $CREW_HOME or ~/.local/share/crew. Status is derived \
             from the process and the recorded exit, not stored as a field.",
         after_long_help = "Examples:\n  \
-            crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+            crew job run demo grok fast \"Reply with the single word pong\"\n  \
             crew job ls\n  \
             crew job wait demo\n  \
             crew job result demo"
@@ -194,13 +197,13 @@ enum Command {
     Update,
     #[command(
         about = "Print the tier table",
-        long_about = "Print provider, tier, model, effort, and whether the \
-            row is built in or from config.toml. The file is \
+        long_about = "Print provider, tier, model, and whether the row is \
+            built in or from config.toml. The file is \
             $XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml. \
             A missing file changes nothing. A row under [tiers] overrides \
             that one built-in row. pi and custom agents have no built-in \
             rows; they are listed only when config.toml defines them. \
-            Grok effort is '-', because -e selects it.",
+            Effort remaps from [effort.<name>] are listed under the table.",
         after_long_help = "Examples:\n  crew models"
     )]
     Models,
@@ -293,15 +296,9 @@ pub const DEFAULT_TIMEOUT_SECS: f64 = 7200.0;
 
 #[derive(Debug, Args)]
 struct SharedArgs {
-    /// fast, balanced, smart, or max. See `crew models`. -m overrides the row's model. A grok tier does not set effort.
-    #[arg(long, value_enum)]
-    tier: Option<Tier>,
     /// Override the tier model. Passed through. Claude short names: haiku, sonnet, opus, fable.
     #[arg(short = 'm', long)]
     model: Option<String>,
-    /// low, medium, high, or max. Default medium. With a tier, the row's effort wins except on grok, which stays medium unless you pass -e. max is sent as max (claude, pi), ultra (codex, except gpt-6-luna stays max), high baked into the gemini slug, xhigh (grok; high on grok-4.5). pi omits --thinking when no -e and no tier effort are set.
-    #[arg(short = 'e', long)]
-    effort: Option<String>,
     /// Seconds before the process group is killed. Default 7200 (2 hours). Must be finite and > 0. Codex is SIGKILL immediately. The others get SIGTERM, then SIGKILL after 5 seconds. Output already produced is kept. The exit code is 124.
     #[arg(short = 't', long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     timeout: f64,
@@ -314,8 +311,9 @@ struct SharedArgs {
     /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
-    /// Prompt text, or `-` to read stdin. Omitted means the same as `-`. `-` on a terminal is an error. The prompt is an argument to the child CLI, not the child's stdin.
-    prompt: Option<String>,
+    /// Tier, then effort, then one prompt. Tier is fast, balanced, smart, or max. Effort is low, medium, high, or max. A word that is only an effort (low, medium, high) sets effort and leaves the model at the wrapper default. A single max is the tier, because the tier slot is checked first. Omit the prompt, or pass -, to read stdin.
+    #[arg(num_args = 0..=3, value_name = "[TIER] [EFFORT] [PROMPT]")]
+    words: Vec<String>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -365,7 +363,7 @@ enum JobCommand {
         long_about = "Start `crew <provider> ...` in the background and print the name. \
             The flags after the provider are the same flags as a foreground run.",
         after_long_help = "Examples:\n  \
-            crew job run demo grok --tier fast \"Reply with the single word pong\"\n  \
+            crew job run demo grok fast high \"Reply with the single word pong\"\n  \
             crew job run audit claude -C ~/Projects/crew \"List the risky spots\"\n  \
             crew job run --note \"nightly\" rev codex --review --uncommitted"
     )]
@@ -530,7 +528,7 @@ fn dispatch_external(args: Vec<String>) -> Result<i32, Error> {
     let trailing: Vec<String> = args.collect();
     if trailing.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "{name} is a custom agent from {}. It takes the same flags as `crew pi`.",
+            "{name} is a custom agent from {}. It takes the same arguments as `crew pi`.",
             crate::config::config_path().display()
         );
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -619,6 +617,50 @@ pub fn parse_trailing(provider: Provider, trailing: &[String]) -> Result<Invocat
     }
 }
 
+struct RunWords {
+    tier: Option<Tier>,
+    effort: Option<String>,
+    prompt: Option<String>,
+}
+
+/// Tier slot first, then effort, then one prompt.
+///
+/// `max` is both a tier and an effort. Checked as a tier first, so a lone
+/// `max` selects the max model. Max effort on the wrapper default is
+/// `<tier> max`, using a tier whose model is that default.
+fn split_run_words(words: &[String]) -> Result<RunWords, Error> {
+    let mut rest = words;
+    let mut tier = None;
+    if let Some((first, tail)) = rest.split_first()
+        && let Some(parsed) = tier::parse_name(first)
+    {
+        tier = Some(parsed);
+        rest = tail;
+    }
+    let mut effort = None;
+    if let Some((first, tail)) = rest.split_first()
+        && EFFORTS.contains(&first.as_str())
+    {
+        effort = Some(first.clone());
+        rest = tail;
+    }
+    let prompt = match rest {
+        [] => None,
+        [prompt] => Some(prompt.clone()),
+        _ => {
+            return Err(Error::new(
+                2,
+                "too many arguments; a tier and an effort come before one prompt",
+            ));
+        }
+    };
+    Ok(RunWords {
+        tier,
+        effort,
+        prompt,
+    })
+}
+
 fn finish(
     provider: Provider,
     shared: SharedArgs,
@@ -628,9 +670,11 @@ fn finish(
     if !shared.timeout.is_finite() || shared.timeout <= 0.0 {
         return Err(Error::new(2, "timeout must be a positive finite number"));
     }
-    if let Some(effort) = &shared.effort {
-        parse_effort(effort)?;
-    }
+    let RunWords {
+        tier,
+        effort,
+        prompt,
+    } = split_run_words(&shared.words)?;
     // Claude, codex, and pi reject both. Grok keeps -r and drops -c. Gemini forwards both.
     if shared.resume.is_some()
         && shared.continue_session
@@ -645,19 +689,19 @@ fn finish(
     if extra.review && (shared.resume.is_some() || shared.continue_session) {
         return Err(Error::new(2, "--review cannot be combined with -r or -c"));
     }
-    if extra.review && review_scope && shared.prompt.is_some() {
+    if extra.review && review_scope && prompt.is_some() {
         return Err(Error::new(2, "choose a review scope or a custom prompt"));
     }
     Ok(Invocation {
         provider,
-        tier: shared.tier,
+        tier,
         model: shared.model,
-        effort: shared.effort,
+        effort,
         timeout_secs: shared.timeout,
         cwd: shared.cwd,
         resume: shared.resume,
         continue_session: shared.continue_session,
-        prompt: shared.prompt,
+        prompt,
         add_dir,
         schema: extra.schema,
         raw: extra.raw,
@@ -805,6 +849,47 @@ mod tests {
     fn codex_review_scope_and_a_prompt_conflict() {
         let err = parse(&["codex", "--review", "--uncommitted", "hello"]).unwrap_err();
         assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn tier_and_effort_are_positional_words() {
+        let inv = parse(&["claude", "fast", "high", "ping"]).unwrap();
+        assert_eq!(inv.tier, Some(Tier::Fast));
+        assert_eq!(inv.effort.as_deref(), Some("high"));
+        assert_eq!(inv.prompt.as_deref(), Some("ping"));
+
+        let effort_only = parse(&["claude", "high", "ping"]).unwrap();
+        assert_eq!(effort_only.tier, None);
+        assert_eq!(effort_only.effort.as_deref(), Some("high"));
+
+        let plain = parse(&["claude", "ping"]).unwrap();
+        assert_eq!(plain.tier, None);
+        assert_eq!(plain.effort, None);
+        assert_eq!(plain.prompt.as_deref(), Some("ping"));
+
+        // max is a tier and an effort. The tier slot wins when it stands alone.
+        let max_tier = parse(&["claude", "max", "ping"]).unwrap();
+        assert_eq!(max_tier.tier, Some(Tier::Max));
+        assert_eq!(max_tier.effort, None);
+
+        let max_effort = parse(&["grok", "fast", "max", "ping"]).unwrap();
+        assert_eq!(max_effort.tier, Some(Tier::Fast));
+        assert_eq!(max_effort.effort.as_deref(), Some("max"));
+
+        let stdin_mark = parse(&["claude", "fast", "-"]).unwrap();
+        assert_eq!(stdin_mark.tier, Some(Tier::Fast));
+        assert_eq!(stdin_mark.prompt.as_deref(), Some("-"));
+
+        assert_eq!(
+            parse(&["claude", "--tier", "fast", "ping"])
+                .unwrap_err()
+                .code,
+            2
+        );
+        assert_eq!(
+            parse(&["claude", "-e", "high", "ping"]).unwrap_err().code,
+            2
+        );
     }
 
     #[test]

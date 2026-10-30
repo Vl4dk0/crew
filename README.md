@@ -2,7 +2,7 @@
 
 One binary over Claude, Gemini (`agy`), Grok, Codex (`gpt`), and pi.
 
-Start with `crew models` for the tier table, then `crew <provider> --tier fast "..."`. Every run has full autonomy.
+Start with `crew models` for the tier table, then `crew <provider> fast "..."`. A tier picks the model. An effort word after it is sent on its own. The default is medium. Every run has full autonomy.
 
 ## Install
 
@@ -21,7 +21,7 @@ cargo install --git https://github.com/Vl4dk0/crew --locked
 crew models
 
 # Run an agent in the foreground
-crew grok --tier fast "Reply with the single word pong"
+crew grok fast high "Reply with the single word pong"
 
 # Check system telemetry (CPU, RAM, GPU, running crew agents)
 crew load
@@ -46,10 +46,12 @@ command = ["~/dotfiles/scripts/pilocal", "--prover"]
 
 [tiers.piprover.smart]
 model = "..."
-effort = "high"
+
+[effort.claude]
+max = "high"
 ```
 
-`crew piprover --tier smart "..."` then runs that command with pi's print flags.
+`crew piprover smart high "..."` then runs that command with pi's print flags. The effort value is the word sent to the CLI.
 
 ## Contributing
 

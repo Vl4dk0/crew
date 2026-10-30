@@ -121,7 +121,10 @@ fn format_age(created_at: &str) -> String {
     "?".to_string()
 }
 
-/// Extract only flags from `trailing`, removing the single positional prompt.
+/// Drop the prompt. Tier and effort stay, because the supervisor re-execs them.
+///
+/// The prompt is stored in prompt.bin and passed as `-` on stdin. Treating the
+/// first bare word as the prompt would throw away `fast` or `high`.
 fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String> {
     if !prompt_is_positional {
         return trailing.to_vec();
@@ -129,6 +132,8 @@ fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String>
 
     let mut flags = Vec::new();
     let mut i = 0;
+    let mut tier_open = true;
+    let mut effort_open = true;
     let mut prompt_removed = false;
 
     while i < trailing.len() {
@@ -136,26 +141,19 @@ fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String>
         if token == "--" {
             if !prompt_removed && i + 1 < trailing.len() {
                 i += 2;
-                while i < trailing.len() {
-                    flags.push(trailing[i].clone());
-                    i += 1;
-                }
-                break;
-            } else {
-                flags.push(token.clone());
-                i += 1;
+                prompt_removed = true;
                 continue;
             }
+            flags.push(token.clone());
+            i += 1;
+            continue;
         }
 
-        if token.starts_with('-') {
+        if token.starts_with('-') && token != "-" {
             flags.push(token.clone());
             let takes_val = matches!(
                 token.as_str(),
                 "-m" | "--model"
-                    | "--tier"
-                    | "-e"
-                    | "--effort"
                     | "-t"
                     | "--timeout"
                     | "-C"
@@ -176,15 +174,29 @@ fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String>
                 }
             }
             i += 1;
-        } else {
-            if !prompt_removed {
-                prompt_removed = true;
-                i += 1;
-            } else {
-                flags.push(token.clone());
-                i += 1;
-            }
+            continue;
         }
+
+        if tier_open && crate::tier::parse_name(token).is_some() {
+            tier_open = false;
+            flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if effort_open && crate::id::EFFORTS.contains(&token.as_str()) {
+            tier_open = false;
+            effort_open = false;
+            flags.push(token.clone());
+            i += 1;
+            continue;
+        }
+        if !prompt_removed {
+            prompt_removed = true;
+            i += 1;
+            continue;
+        }
+        flags.push(token.clone());
+        i += 1;
     }
 
     flags
@@ -215,8 +227,8 @@ fn run_internal(
     }
 
     let invocation = parse_command(&job.provider, &job.trailing)?;
-    // Store the slug the child CLI is given, not the tier name. `ls` used to
-    // scan args for `-m`, which is absent when the user passed `--tier`.
+    // Store the slug the child CLI is given, not the tier word. `ls` used to
+    // scan args for `-m`, which is absent when the user passed a tier.
     let model = crate::providers::cli_model(&invocation)?;
 
     // Separate flags from prompt bytes
@@ -703,26 +715,21 @@ mod tests {
 
     #[test]
     fn recorded_model_is_the_cli_slug_not_the_tier_flag() {
-        let gemini = parse_trailing(
-            Provider::Gemini,
-            &[
-                "--tier".to_string(),
-                "smart".to_string(),
-                "ping".to_string(),
-            ],
-        )
-        .unwrap();
+        let gemini =
+            parse_trailing(Provider::Gemini, &["smart".to_string(), "ping".to_string()]).unwrap();
         let resolved = crate::providers::cli_model(&gemini).unwrap();
         let from_tier = tier::resolve(Provider::Gemini, Some(Tier::Smart), None, None).unwrap();
-        let slug = from_tier.model.clone().unwrap();
-        assert_eq!(resolved.as_deref(), Some(slug.as_str()));
+        let base = from_tier.model.clone().unwrap();
+        let slug = resolved.clone().unwrap();
+        // The stored name is the slug agy receives. Gemini appends the effort.
+        assert!(slug.starts_with(&base), "{slug} vs {base}");
         assert_ne!(slug, "smart");
         assert!(gemini.model.is_none());
 
         let json = r#"{
             "name": "readme-audit",
             "provider": "gemini",
-            "args": ["--tier", "smart"],
+            "args": ["smart"],
             "cwd": "/tmp",
             "created_at": "2026-10-24T12:38:24Z"
         }"#;
@@ -750,27 +757,22 @@ mod tests {
         assert_eq!(extract_flags(&trailing, true), Vec::<String>::new());
 
         let trailing = vec![
-            "--tier".to_string(),
             "fast".to_string(),
+            "high".to_string(),
             "-m".to_string(),
             "custom".to_string(),
             "hello world".to_string(),
         ];
         assert_eq!(
             extract_flags(&trailing, true),
-            vec!["--tier", "fast", "-m", "custom"]
+            vec!["fast", "high", "-m", "custom"]
         );
 
-        let trailing = vec![
-            "--tier".to_string(),
-            "fast".to_string(),
-            "--".to_string(),
-            "hello".to_string(),
-        ];
-        assert_eq!(extract_flags(&trailing, true), vec!["--tier", "fast"]);
+        let trailing = vec!["fast".to_string(), "--".to_string(), "hello".to_string()];
+        assert_eq!(extract_flags(&trailing, true), vec!["fast"]);
 
-        let trailing = vec!["--tier".to_string(), "fast".to_string()];
-        assert_eq!(extract_flags(&trailing, false), vec!["--tier", "fast"]);
+        let trailing = vec!["fast".to_string(), "high".to_string()];
+        assert_eq!(extract_flags(&trailing, false), vec!["fast", "high"]);
     }
 
     #[test]

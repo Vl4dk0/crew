@@ -74,12 +74,14 @@ fn plan(
     let model = resolved
         .model
         .ok_or_else(|| Error::new(2, "claude needs a model"))?;
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
     Ok(claude_argv(
         invocation,
         &model,
         &resolved.effort,
         prompt,
         schema,
+        verbatim.as_deref(),
     ))
 }
 
@@ -94,8 +96,9 @@ pub(super) fn claude_argv(
     effort: &str,
     prompt: &str,
     schema: Option<&str>,
+    verbatim: Option<&str>,
 ) -> (Vec<String>, Option<String>) {
-    let (wire, note) = map_effort(Provider::Claude, Some(model), effort);
+    let (wire, note) = map_effort(Provider::Claude, Some(model), effort, verbatim);
     // stream-json refuses to start without --verbose, so the init event
     // (and its session id) would never be printed.
     let mut argv = vec![
@@ -524,7 +527,7 @@ mod tests {
     #[test]
     fn argv_matches_the_wrapper() {
         let mut invocation = bare(Provider::Claude);
-        let (argv, note) = claude_argv(&invocation, "sonnet", "medium", "hello", None);
+        let (argv, note) = claude_argv(&invocation, "sonnet", "medium", "hello", None, None);
         assert!(note.is_none());
         assert_eq!(
             argv,
@@ -546,13 +549,13 @@ mod tests {
             ]
         );
 
-        let (argv, note) = claude_argv(&invocation, "opus", "max", "hello", None);
+        let (argv, note) = claude_argv(&invocation, "opus", "max", "hello", None, None);
         assert!(note.is_none());
         assert_eq!(flag(&argv, "--effort"), Some("max"));
 
         invocation.no_web = true;
         invocation.add_dir = vec!["~/extra".into()];
-        let (argv, _) = claude_argv(&invocation, "sonnet", "medium", "hello", None);
+        let (argv, _) = claude_argv(&invocation, "sonnet", "medium", "hello", None, None);
         assert_eq!(
             flag(&argv, "--disallowed-tools"),
             Some("WebSearch,WebFetch")

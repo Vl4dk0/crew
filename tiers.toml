@@ -1,56 +1,45 @@
 # Built-in tier map. A row in config.toml overrides that one row.
 # The file is $XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml.
-# Model strings are what the runner puts on the CLI.
+# A tier is only a model. Effort is a separate word on the command, so a row
+# that baked it in would make `crew models` lie about what the run does.
+# Gemini rows are family bases. The runner appends the effort slug itself.
 
 [claude.fast]
 model = "haiku"
-effort = "medium"
 
 [claude.balanced]
 model = "sonnet"
-effort = "medium"
 
 [claude.smart]
 model = "opus"
-effort = "high"
 
 [claude.max]
 model = "opus"
-effort = "max"
 
 [codex.fast]
 model = "gpt-6-luna"
-effort = "low"
 
 [codex.balanced]
 model = "gpt-6-luna"
-effort = "medium"
 
 [codex.smart]
 model = "gpt-6-luna"
-effort = "high"
 
 [codex.max]
 model = "gpt-6-luna"
-effort = "max"
 
 [gemini.fast]
-model = "gemini-3.8-flash-low"
-effort = "low"
+model = "gemini-3.8-flash"
 
 [gemini.balanced]
-model = "gemini-3.8-flash-medium"
-effort = "medium"
+model = "gemini-3.8-flash"
 
 [gemini.smart]
-model = "gemini-3.8-flash-high"
-effort = "high"
+model = "gemini-3.8-flash"
 
 [gemini.max]
-model = "gemini-4-argon-high"
-effort = "high"
+model = "gemini-4-argon"
 
-# Effort is not a grok tier. -e sets it, and the default is medium.
 [grok.fast]
 model = "grok-4.7"
 
