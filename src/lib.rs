@@ -10,6 +10,7 @@ pub mod id;
 pub mod job;
 pub mod load;
 pub mod providers;
+pub mod remote;
 pub mod tier;
 pub mod update;
 pub mod usage;

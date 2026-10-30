@@ -44,7 +44,14 @@ use crate::tier::{self, Tier};
         update    each CLI's own updater, then crew\n\
         \n\
         Config\n  \
-        models    the tier table",
+        models    the tier table\n\
+        \n\
+        Other machines\n  \
+        crew @<host> <args...> runs the command on another machine over SSH \
+        when configured in config.toml:\n  \
+        [hosts.home]\n  \
+        ssh = \"home\"\n  \
+        path = [\"~/.cargo/bin\", \"~/.local/bin\", \"~/.grok/bin\"]",
     after_long_help = "Examples:\n  \
         crew models\n  \
         crew grok --tier fast \"Reply with the single word pong\"\n  \
@@ -52,7 +59,8 @@ use crate::tier::{self, Tier};
         crew job wait demo\n  \
         crew load\n  \
         crew usage\n  \
-        crew update",
+        crew update\n  \
+        crew @home load",
     arg_required_else_help = true,
     disable_help_subcommand = false
 )]
@@ -488,6 +496,10 @@ struct JobRunArgs {
 }
 
 pub fn run_from_env() -> Result<i32, Error> {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = crate::remote::maybe_dispatch(&args)? {
+        return Ok(code);
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
