@@ -35,6 +35,10 @@ crew update
 
 Run `crew help <cmd>` or `<cmd> --help` for details.
 
+Prefix any command with `@<host>` (e.g. `crew @home load`) to run it on
+another machine over SSH. Configured via `[hosts.<name>]` in `config.toml`
+with `ssh` and optional `path` to prepend on the remote.
+
 ## Custom agents
 
 `~/.config/crew/config.toml` (or `$XDG_CONFIG_HOME/crew/config.toml`) can add a pi-based command without putting it in this repo. A row under `[tiers]` overrides that one built-in row.

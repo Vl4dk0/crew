@@ -50,12 +50,19 @@ pub struct AgentSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSpec {
+    pub ssh: String,
+    pub path: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserConfig {
     pub tiers: BTreeMap<String, BTreeMap<String, UserTier>>,
     pub agents: BTreeMap<String, AgentSpec>,
     /// Owner (canonical provider or custom agent) to user-word to wire word.
     /// The wire word is sent as written. It is not passed through the built-in map.
     pub effort: BTreeMap<String, BTreeMap<String, String>>,
+    pub hosts: BTreeMap<String, HostSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,10 +74,8 @@ struct File {
     agents: BTreeMap<String, AgentToml>,
     #[serde(default)]
     effort: BTreeMap<String, BTreeMap<String, String>>,
-    /// Already in the user file for a later SSH feature. This branch does not dial it.
-    /// Rejecting the key would make every command fail before that feature lands.
-    #[serde(default, rename = "hosts")]
-    _hosts: Option<toml::Value>,
+    #[serde(default)]
+    hosts: BTreeMap<String, HostToml>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +89,14 @@ struct UserRow {
 struct AgentToml {
     base: String,
     command: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostToml {
+    ssh: String,
+    #[serde(default)]
+    path: Vec<String>,
 }
 
 /// `$XDG_CONFIG_HOME/crew/config.toml`, or `~/.config/crew/config.toml`.
@@ -212,11 +225,46 @@ pub fn parse_user(text: &str, origin: &str) -> Result<UserConfig, Error> {
         }
         effort.insert(owner, parsed);
     }
+    let mut hosts = BTreeMap::new();
+    for (name, spec) in file.hosts {
+        let key = format!("hosts.{name}");
+        if !valid_host_name(&name) {
+            return Err(Error::new(
+                2,
+                format!("config {origin}: {key}: name must be a single word"),
+            ));
+        }
+        if spec.ssh.trim().is_empty() {
+            return Err(Error::new(
+                2,
+                format!("config {origin}: {key}.ssh: cannot be empty"),
+            ));
+        }
+        hosts.insert(
+            name,
+            HostSpec {
+                ssh: spec.ssh,
+                path: spec.path,
+            },
+        );
+    }
     Ok(UserConfig {
         tiers,
         agents,
         effort,
+        hosts,
     })
+}
+
+fn valid_host_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
 }
 
 fn valid_agent_name(name: &str) -> bool {
@@ -255,6 +303,10 @@ mod tests {
 
             [effort.piprover]
             low = "high"
+
+            [hosts.home]
+            ssh = "home"
+            path = ["~/.cargo/bin", "~/.local/bin", "~/.grok/bin"]
         "#;
         let parsed = parse_user(text, "fixture").unwrap();
         // Expectations come from the fixture text, so a fixture edit cannot
@@ -276,12 +328,25 @@ mod tests {
         for (owner, words) in &raw.effort {
             assert_eq!(&parsed.effort[owner], words);
         }
+        assert_eq!(parsed.hosts.len(), raw.hosts.len());
+        for (name, spec) in &raw.hosts {
+            assert_eq!(parsed.hosts[name].ssh, spec.ssh);
+            assert_eq!(parsed.hosts[name].path, spec.path);
+        }
 
         let extra = "[tiers.claude.fast]\nmodel = \"model-a\"\nextra = true\n";
         let err = parse_user(extra, "fixture").unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("fixture"), "{}", err.message);
         assert!(err.message.contains("extra"), "{}", err.message);
+
+        let bad_host_key = "[hosts.home]\nssh = \"home\"\nunknown = true\n";
+        let err = parse_user(bad_host_key, "fixture").unwrap_err();
+        assert!(err.message.contains("unknown"), "{}", err.message);
+
+        let empty_ssh = "[hosts.home]\nssh = \"\"\n";
+        let err = parse_user(empty_ssh, "fixture").unwrap_err();
+        assert!(err.message.contains("hosts.home.ssh"), "{}", err.message);
 
         let collision = "[agents.job]\nbase = \"pi\"\ncommand = [\"pi\"]\n";
         let err = parse_user(collision, "fixture").unwrap_err();
