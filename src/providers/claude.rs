@@ -195,11 +195,8 @@ fn claude_tick(state: &mut ClaudeSteer, tick: &mut proc::Tick<'_>) -> proc::Tick
         // and the supervisor resumes it, instead of starting another turn here.
         return proc::TickDone::Done { stop: false };
     }
-    if let Ok(pending) = crate::job::inbox::pending(&state.dir) {
+    if let Ok(pending) = crate::job::inbox::steers(&state.dir) {
         for item in pending {
-            if item.kind != crate::job::inbox::Kind::Steer {
-                continue;
-            }
             state.seq = state.seq.saturating_add(1);
             tick.send(&claude_interrupt(state.seq));
             tick.send(&claude_user(&item.text));

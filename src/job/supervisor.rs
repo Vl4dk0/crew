@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::id::Provider;
-use crate::job::inbox::{self, Kind};
+use crate::job::inbox;
 use crate::job::process::get_process_lstart;
 use crate::job::store::{load_record, run_dir, save_record};
 
@@ -75,27 +75,32 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
             resume_id.as_deref(),
             &STOP_REQUESTED,
         )? {
-            Turn::Stopped(code) => break code,
-            Turn::Failed(code) => break code,
-            Turn::Fallback(text) => {
+            Turn::Stopped(code) | Turn::Failed(code) => break code,
+            turn => {
+                let (text, deliver, missing) = match turn {
+                    Turn::Fallback(text) => {
+                        (text, None, "[crew] steer left pending: no session id")
+                    }
+                    Turn::Ok => {
+                        let Some(next) = inbox::pending(&dir)?.into_iter().next() else {
+                            break 0;
+                        };
+                        (
+                            next.text,
+                            Some(next.n),
+                            "[crew] inbox message left pending: no session id",
+                        )
+                    }
+                    Turn::Stopped(_) | Turn::Failed(_) => unreachable!(),
+                };
                 let Some(session) = record.session_id.clone() else {
-                    note_line(&dir, "[crew] steer left pending: no session id");
+                    note_line(&dir, missing);
                     break 0;
                 };
+                if let Some(n) = deliver {
+                    inbox::mark_delivered(&dir, n)?;
+                }
                 prompt = text.into_bytes();
-                resume_id = Some(session);
-            }
-            Turn::Ok => {
-                let pending = inbox::pending(&dir)?;
-                let Some(next) = pending.into_iter().next() else {
-                    break 0;
-                };
-                let Some(session) = record.session_id.clone() else {
-                    note_line(&dir, "[crew] inbox message left pending: no session id");
-                    break 0;
-                };
-                inbox::mark_delivered(&dir, next.n)?;
-                prompt = next.text.into_bytes();
                 resume_id = Some(session);
             }
         }
@@ -119,40 +124,31 @@ fn run_turn(
     let current_exe = std::env::current_exe()
         .map_err(|err| Error::new(127, format!("failed to find current exe: {err}")))?;
 
-    let stdout_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join("stdout"))
-        .map_err(|err| Error::new(127, format!("failed to open stdout: {err}")))?;
-    let stderr_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(dir.join("stderr"))
-        .map_err(|err| Error::new(127, format!("failed to open stderr: {err}")))?;
+    // Stdout is the last turn only. Stderr is appended: the session id and
+    // the lost-step note live there across turns.
+    let stdout_file = open_log(&dir.join("stdout"), true, "stdout")?;
+    let stderr_file = open_log(&dir.join("stderr"), false, "stderr")?;
 
     let mut child_cmd = Command::new(&current_exe);
-    child_cmd.arg(&record.provider);
-    child_cmd.args(turn_args(&record.args, resume_id));
-    if !prompt.is_empty() {
-        child_cmd.arg("-");
+    child_cmd
+        .arg(&record.provider)
+        .args(turn_args(&record.args, resume_id))
+        // The wrapper reads the inbox from this. proc::spawn strips it before
+        // the provider CLI, so a tool the model runs does not look like the job.
+        .env("CREW_JOB", name)
+        .process_group(0)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    // An empty prompt must not leave the write end open. The child would block
+    // on read until the deadline. A review scope does not read stdin.
+    if prompt.is_empty() {
+        child_cmd.stdin(Stdio::null());
+    } else {
+        child_cmd.arg("-").stdin(Stdio::piped());
     }
     if !record.cwd.is_empty() {
         child_cmd.current_dir(Path::new(&record.cwd));
     }
-    // The wrapper polls the inbox. The provider CLI must not see this, or a
-    // tool it runs would think it was the job.
-    child_cmd.env("CREW_JOB", name);
-    if prompt.is_empty() {
-        child_cmd.stdin(Stdio::null());
-    } else {
-        child_cmd.stdin(Stdio::piped());
-    }
-    child_cmd.stdout(Stdio::from(stdout_file));
-    child_cmd.stderr(Stdio::from(stderr_file));
-    child_cmd.process_group(0);
 
     if record.started_at.is_none() {
         record.started_at = Some(super::current_iso());
@@ -268,12 +264,21 @@ fn turn_args(args: &[String], resume_id: Option<&str>) -> Vec<String> {
     out
 }
 
+fn open_log(path: &Path, truncate: bool, what: &str) -> Result<File, Error> {
+    let mut opts = OpenOptions::new();
+    opts.create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    if truncate {
+        opts.write(true).truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(path)
+        .map_err(|err| Error::new(127, format!("failed to open {what}: {err}")))
+}
+
 fn take_fallback_steers(dir: &Path) -> Result<Option<String>, Error> {
-    let pending = inbox::pending(dir)?;
-    let steers: Vec<_> = pending
-        .into_iter()
-        .filter(|item| item.kind == Kind::Steer)
-        .collect();
+    let steers = inbox::steers(dir)?;
     if steers.is_empty() {
         return Ok(None);
     }
@@ -330,16 +335,11 @@ fn note_session(name: &str, record: &mut crate::job::models::RunRecord, dir: &Pa
     let Ok(stderr_content) = fs::read_to_string(dir.join("stderr")) else {
         return;
     };
-    let mut found = None;
-    for line in stderr_content.lines() {
-        if let Some(pos) = line.find("SESSION_ID=") {
-            let id = line[pos + "SESSION_ID=".len()..].trim();
-            if !id.is_empty() {
-                found = Some(id.to_string());
-            }
-        }
-    }
-    let Some(id) = found else {
+    // The last id wins: a later turn prints its own session line.
+    let Some(id) = stderr_content.lines().rev().find_map(|line| {
+        let id = line.split_once("SESSION_ID=")?.1.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }) else {
         return;
     };
     if record.session_id.as_deref() == Some(id.as_str()) {

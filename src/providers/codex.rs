@@ -51,7 +51,48 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    let parsed = parse_events(&captured.stdout);
+    Ok(emit_codex(
+        invocation,
+        &captured,
+        &parse_events(&captured.stdout),
+    ))
+}
+
+fn scope_count(invocation: &Invocation) -> usize {
+    usize::from(invocation.uncommitted)
+        + usize::from(invocation.base.is_some())
+        + usize::from(invocation.commit.is_some())
+}
+
+fn plan(
+    invocation: &Invocation,
+    prompt: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), Error> {
+    let (model, effort, verbatim) = model_effort(invocation)?;
+    Ok(codex_argv(
+        invocation,
+        &model,
+        &effort,
+        prompt,
+        verbatim.as_deref(),
+    ))
+}
+
+fn model_effort(invocation: &Invocation) -> Result<(String, String, Option<String>), Error> {
+    let resolved = tier::resolve(
+        invocation.provider,
+        invocation.tier,
+        invocation.model.as_deref(),
+        invocation.effort.as_deref(),
+    )?;
+    let model = resolved
+        .model
+        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
+    Ok((model, resolved.effort, verbatim))
+}
+
+fn emit_codex(invocation: &Invocation, captured: &proc::Captured, parsed: &CodexParse) -> i32 {
     let mut before = String::new();
     for line in &parsed.notices {
         before.push_str(&format!("[crew] {line}\n"));
@@ -95,36 +136,7 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         },
         captured.session_id.as_deref(),
     );
-    Ok(code)
-}
-
-fn scope_count(invocation: &Invocation) -> usize {
-    usize::from(invocation.uncommitted)
-        + usize::from(invocation.base.is_some())
-        + usize::from(invocation.commit.is_some())
-}
-
-fn plan(
-    invocation: &Invocation,
-    prompt: Option<&str>,
-) -> Result<(Vec<String>, Option<String>), Error> {
-    let resolved = tier::resolve(
-        invocation.provider,
-        invocation.tier,
-        invocation.model.as_deref(),
-        invocation.effort.as_deref(),
-    )?;
-    let model = resolved
-        .model
-        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
-    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
-    Ok(codex_argv(
-        invocation,
-        &model,
-        &resolved.effort,
-        prompt,
-        verbatim.as_deref(),
-    ))
+    code
 }
 
 pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
@@ -260,11 +272,21 @@ pub(super) fn parse_events(stdout: &str) -> CodexParse {
             _ => {}
         }
     }
-    let success = completed && !failed && !message.trim().is_empty();
+    finish_parse(message, thread_id, completed, failed, notices, usage_limit)
+}
+
+fn finish_parse(
+    message: String,
+    thread_id: Option<String>,
+    completed: bool,
+    failed: bool,
+    notices: Vec<String>,
+    usage_limit: Option<String>,
+) -> CodexParse {
     CodexParse {
+        success: completed && !failed && !message.trim().is_empty(),
         message,
         thread_id,
-        success,
         notices,
         usage_limit,
     }
@@ -277,22 +299,8 @@ fn run_app_server(invocation: &Invocation, prompt: Option<&str>) -> Result<i32, 
             "empty prompt (pass a prompt argument or pipe one via stdin)",
         )
     })?;
-    let resolved = tier::resolve(
-        invocation.provider,
-        invocation.tier,
-        invocation.model.as_deref(),
-        invocation.effort.as_deref(),
-    )?;
-    let model = resolved
-        .model
-        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
-    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
-    let (wire, note) = map_effort(
-        Provider::Codex,
-        Some(&model),
-        &resolved.effort,
-        verbatim.as_deref(),
-    );
+    let (model, effort, verbatim) = model_effort(invocation)?;
+    let (wire, note) = map_effort(Provider::Codex, Some(&model), &effort, verbatim.as_deref());
     proc::write_effort_note(&note);
     let schema = schema_value(invocation)?;
     let cwd = invocation
@@ -332,51 +340,11 @@ fn run_app_server(invocation: &Invocation, prompt: Option<&str>) -> Result<i32, 
         Ok(captured) => captured,
         Err(code) => return Ok(code),
     };
-    let parsed = parse_app(&captured.stdout);
-    let mut before = String::new();
-    for line in &parsed.notices {
-        before.push_str(&format!("[crew] {line}\n"));
-    }
-    if let Some(id) = parsed.thread_id.as_deref().filter(|id| !id.is_empty()) {
-        before.push_str(&format!("SESSION_ID={id}\n"));
-    }
-    let mut stdout = String::new();
-    if invocation.raw {
-        stdout.push_str(&captured.stdout);
-    } else if !parsed.message.is_empty() {
-        stdout.push_str(parsed.message.trim_end());
-        stdout.push('\n');
-    }
-    let mut after = String::new();
-    if !captured.stderr.is_empty() {
-        after.push_str(&captured.stderr);
-    }
-    let mut code = select_codex_exit(captured.code, parsed.success, captured.timed_out);
-    if let Some(message) = parsed
-        .usage_limit
-        .as_deref()
-        .filter(|_| !captured.timed_out && !parsed.success)
-    {
-        code = USAGE_LIMIT_EXIT;
-        after.push_str(&usage_limit_line("codex", message));
-    } else if captured.timed_out {
-        after.push_str(&format!(
-            "[crew] timed out after {}s\n",
-            format_secs(invocation.timeout_secs)
-        ));
-    } else if code == 125 {
-        after.push_str("[crew] failed or incomplete turn (missing completion or final answer)\n");
-    }
-    proc::emit_report(
-        &Report {
-            code,
-            before_stderr: before,
-            stdout,
-            after_stderr: after,
-        },
-        captured.session_id.as_deref(),
-    );
-    Ok(code)
+    Ok(emit_codex(
+        invocation,
+        &captured,
+        &parse_app(&captured.stdout),
+    ))
 }
 
 struct CodexRpc {
@@ -398,16 +366,11 @@ struct CodexRpc {
 fn codex_tick(state: &mut CodexRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone {
     if !state.sent_init {
         state.sent_init = true;
-        tick.send(
-            &json!({
-                "method": "initialize",
-                "id": 1000,
-                "params": {
-                    "clientInfo": {"name": "crew", "title": "crew", "version": "0.1.0"}
-                }
-            })
-            .to_string(),
-        );
+        tick.send(&rpc(
+            "initialize",
+            1000,
+            json!({"clientInfo": {"name": "crew", "title": "crew", "version": "0.1.0"}}),
+        ));
         tick.send(r#"{"method":"initialized","params":{}}"#);
     }
     let lines = tick.lines.clone();
@@ -432,13 +395,15 @@ fn codex_tick(state: &mut CodexRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone
                 tick.send(&turn_request(state, thread));
             }
         }
-        if event.get("method").and_then(Value::as_str) == Some("turn/started")
-            && let Some(turn) = event.pointer("/params/turn/id").and_then(Value::as_str)
-        {
-            state.turn_id = Some(turn.to_string());
-        }
-        if id == Some(1002)
-            && let Some(turn) = event.pointer("/result/turn/id").and_then(Value::as_str)
+        if let Some(turn) = event
+            .pointer("/params/turn/id")
+            .and_then(Value::as_str)
+            .filter(|_| event.get("method").and_then(Value::as_str) == Some("turn/started"))
+            .or_else(|| {
+                (id == Some(1002))
+                    .then(|| event.pointer("/result/turn/id").and_then(Value::as_str))
+                    .flatten()
+            })
         {
             state.turn_id = Some(turn.to_string());
         }
@@ -454,67 +419,65 @@ fn codex_tick(state: &mut CodexRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone
         }
     }
     if let (Some(thread), Some(turn)) = (state.thread_id.clone(), state.turn_id.clone())
-        && let Ok(pending) = crate::job::inbox::pending(&state.dir)
+        && let Ok(pending) = crate::job::inbox::steers(&state.dir)
     {
         for item in pending {
-            if item.kind != crate::job::inbox::Kind::Steer {
-                continue;
-            }
             if state.steers.iter().any(|(_, n)| *n == item.n) {
                 continue;
             }
             let rpc_id = state.next_id;
             state.next_id += 1;
             state.steers.push((rpc_id, item.n));
-            tick.send(
-                &json!({
-                    "method": "turn/steer",
-                    "id": rpc_id,
-                    "params": {
-                        "threadId": thread,
-                        "expectedTurnId": turn,
-                        "input": [{"type": "text", "text": item.text}]
-                    }
-                })
-                .to_string(),
-            );
+            tick.send(&rpc(
+                "turn/steer",
+                rpc_id,
+                json!({
+                    "threadId": thread,
+                    "expectedTurnId": turn,
+                    "input": [{"type": "text", "text": item.text}]
+                }),
+            ));
         }
     }
     proc::TickDone::Continue
 }
 
-fn thread_request(state: &CodexRpc) -> String {
+fn rpc(method: &str, id: i64, params: Value) -> String {
+    json!({"method": method, "id": id, "params": params}).to_string()
+}
+
+/// Same bypass as `codex exec`: never ask, and full access.
+fn policy(cwd: &Option<String>) -> Value {
     let mut params = json!({
-        "model": state.model,
         "approvalPolicy": "never",
         "sandboxPolicy": {"type": "dangerFullAccess"},
     });
-    if let Some(cwd) = &state.cwd {
+    if let Some(cwd) = cwd {
         params["cwd"] = json!(cwd);
     }
+    params
+}
+
+fn thread_request(state: &CodexRpc) -> String {
+    let mut params = policy(&state.cwd);
+    params["model"] = json!(state.model);
     if let Some(thread) = &state.resume {
         params["threadId"] = json!(thread);
-        return json!({"method": "thread/resume", "id": 1001, "params": params}).to_string();
+        return rpc("thread/resume", 1001, params);
     }
-    json!({"method": "thread/start", "id": 1001, "params": params}).to_string()
+    rpc("thread/start", 1001, params)
 }
 
 fn turn_request(state: &CodexRpc, thread: &str) -> String {
-    let mut params = json!({
-        "threadId": thread,
-        "input": [{"type": "text", "text": state.prompt}],
-        "model": state.model,
-        "effort": state.effort,
-        "approvalPolicy": "never",
-        "sandboxPolicy": {"type": "dangerFullAccess"},
-    });
-    if let Some(cwd) = &state.cwd {
-        params["cwd"] = json!(cwd);
-    }
+    let mut params = policy(&state.cwd);
+    params["threadId"] = json!(thread);
+    params["input"] = json!([{"type": "text", "text": state.prompt}]);
+    params["model"] = json!(state.model);
+    params["effort"] = json!(state.effort);
     if let Some(schema) = &state.schema {
         params["outputSchema"] = schema.clone();
     }
-    json!({"method": "turn/start", "id": 1002, "params": params}).to_string()
+    rpc("turn/start", 1002, params)
 }
 
 fn approval_reply(line: &str) -> Option<String> {
@@ -530,21 +493,21 @@ fn approval_reply(line: &str) -> Option<String> {
     Some(json!({"id": id, "result": {"decision": "accept", "action": "accept"}}).to_string())
 }
 
-fn app_session(line: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(line.trim()).ok()?;
-    if let Some(id) = value
-        .pointer("/result/thread/id")
+fn text_at(value: &Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-    {
-        return Some(id.to_string());
+        .map(str::to_string)
+}
+
+fn app_session(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    if let Some(id) = text_at(&value, "/result/thread/id") {
+        return Some(id);
     }
     if value.get("method").and_then(Value::as_str) == Some("thread/started") {
-        return value
-            .pointer("/params/thread/id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string);
+        return text_at(&value, "/params/thread/id");
     }
     None
 }
@@ -598,46 +561,38 @@ fn parse_app(stdout: &str) -> CodexParse {
                 let Some(item) = event.pointer("/params/item") else {
                     continue;
                 };
-                if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
-                    continue;
-                }
-                if item.get("phase").and_then(Value::as_str) == Some("commentary") {
-                    continue;
-                }
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                // Commentary is the model's aside, not the answer shown to the caller.
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item.get("phase").and_then(Value::as_str) != Some("commentary")
+                    && let Some(text) = item.get("text").and_then(Value::as_str)
+                {
                     message = text.to_string();
                 }
             }
             _ => {}
         }
     }
-    let success = completed && !failed && !message.trim().is_empty();
-    CodexParse {
-        message,
-        thread_id,
-        success,
-        notices,
-        usage_limit,
-    }
+    finish_parse(message, thread_id, completed, failed, notices, usage_limit)
 }
 
 fn app_limit(event: &Value) -> Option<String> {
     let blob = event.to_string();
-    let tagged = blob.contains("UsageLimit");
-    if !tagged && !looks_like_usage_limit(&blob) {
+    if !blob.contains("UsageLimit") && !looks_like_usage_limit(&blob) {
         return None;
     }
-    event
-        .pointer("/params/turn/error/message")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            event
-                .pointer("/params/error/message")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
-        .map(str::to_string)
-        .or(Some(blob))
+    [
+        "/params/turn/error/message",
+        "/params/error/message",
+        "/error/message",
+    ]
+    .into_iter()
+    .find_map(|pointer| {
+        event
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+    .or(Some(blob))
 }
 
 pub(super) fn select_codex_exit(child: i32, success: bool, timed_out: bool) -> i32 {

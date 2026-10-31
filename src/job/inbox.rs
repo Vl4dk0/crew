@@ -10,6 +10,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::error::Error;
 use crate::job::models::Status;
 
@@ -70,13 +72,15 @@ pub fn append(dir: &Path, kind: Kind, text: &str) -> Result<Item, Error> {
             .map(|item| item.n.saturating_add(1))
             .unwrap_or(1);
         let at = super::current_iso();
-        let line = serde_json::json!({
-            "n": n,
-            "kind": kind.as_str(),
-            "text": text,
-            "at": at,
-        });
-        writeln!(file, "{line}").map_err(|err| Error::new(2, format!("inbox write: {err}")))?;
+        write_line(
+            file,
+            &serde_json::json!({
+                "n": n,
+                "kind": kind.as_str(),
+                "text": text,
+                "at": at,
+            }),
+        )?;
         Ok(Item {
             n,
             kind,
@@ -88,36 +92,43 @@ pub fn append(dir: &Path, kind: Kind, text: &str) -> Result<Item, Error> {
 }
 
 pub fn pending(dir: &Path) -> Result<Vec<Item>, Error> {
-    if !inbox_path(dir).is_file() {
-        return Ok(Vec::new());
-    }
-    with_inbox(dir, |file| {
-        Ok(read_items(file)?
-            .into_iter()
-            .filter(|item| item.delivered_at.is_none())
-            .collect())
-    })
+    select(dir, false)
+}
+
+pub fn steers(dir: &Path) -> Result<Vec<Item>, Error> {
+    Ok(pending(dir)?
+        .into_iter()
+        .filter(|item| item.kind == Kind::Steer)
+        .collect())
 }
 
 pub fn delivered(dir: &Path) -> Result<Vec<Item>, Error> {
+    select(dir, true)
+}
+
+fn select(dir: &Path, delivered: bool) -> Result<Vec<Item>, Error> {
     if !inbox_path(dir).is_file() {
         return Ok(Vec::new());
     }
     with_inbox(dir, |file| {
         Ok(read_items(file)?
             .into_iter()
-            .filter(|item| item.delivered_at.is_some())
+            .filter(|item| item.delivered_at.is_some() == delivered)
             .collect())
     })
 }
 
 pub fn mark_delivered(dir: &Path, n: u64) -> Result<(), Error> {
     with_inbox(dir, |file| {
-        let at = super::current_iso();
-        let line = serde_json::json!({ "n": n, "delivered": at });
-        writeln!(file, "{line}").map_err(|err| Error::new(2, format!("inbox write: {err}")))?;
-        Ok(())
+        write_line(
+            file,
+            &serde_json::json!({ "n": n, "delivered": super::current_iso() }),
+        )
     })
+}
+
+fn write_line(file: &mut File, value: &serde_json::Value) -> Result<(), Error> {
+    writeln!(file, "{value}").map_err(|err| Error::new(2, format!("inbox write: {err}")))
 }
 
 fn inbox_path(dir: &Path) -> PathBuf {
@@ -163,47 +174,45 @@ impl Drop for LockGuard {
     }
 }
 
+#[derive(Deserialize)]
+struct Row {
+    n: u64,
+    kind: Option<String>,
+    text: Option<String>,
+    at: Option<String>,
+    delivered: Option<String>,
+}
+
 fn read_items(file: &mut File) -> Result<Vec<Item>, Error> {
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|err| Error::new(2, format!("inbox read: {err}")))?;
-    // The next append must stay at the end. read_to_string leaves the cursor there
-    // only on some platforms; seek so a later writeln cannot land in the middle.
+    // read_to_string does not leave the cursor at the end on every platform.
+    // A later writeln would then land in the middle of the log.
     use std::io::Seek;
     file.seek(std::io::SeekFrom::End(0))
         .map_err(|err| Error::new(2, format!("inbox seek: {err}")))?;
     let mut items: Vec<Item> = Vec::new();
     for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(row) = serde_json::from_str::<Row>(line) else {
             continue;
         };
-        let Some(n) = value.get("n").and_then(serde_json::Value::as_u64) else {
-            continue;
-        };
-        if let Some(at) = value.get("delivered").and_then(serde_json::Value::as_str) {
-            if let Some(item) = items.iter_mut().find(|item| item.n == n) {
-                item.delivered_at = Some(at.to_string());
+        if let Some(at) = row.delivered {
+            if let Some(item) = items.iter_mut().find(|item| item.n == row.n) {
+                item.delivered_at = Some(at);
             }
             continue;
         }
-        let Some(kind) = value
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .and_then(Kind::parse)
+        let (Some(kind), Some(body), Some(at)) =
+            (row.kind.as_deref().and_then(Kind::parse), row.text, row.at)
         else {
             continue;
         };
-        let Some(body) = value.get("text").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(at) = value.get("at").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
         items.push(Item {
-            n,
+            n: row.n,
             kind,
-            text: body.to_string(),
-            at: at.to_string(),
+            text: body,
+            at,
             delivered_at: None,
         });
     }

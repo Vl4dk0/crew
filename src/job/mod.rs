@@ -411,18 +411,12 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
     if json {
         let mut val = serde_json::to_value(&rec).unwrap();
         val["status"] = serde_json::Value::String(status.as_str().to_string());
-        let messages: Vec<serde_json::Value> = inbox::delivered(&run_dir(name))?
-            .into_iter()
-            .filter_map(|item| {
-                item.delivered_at.map(|at| {
-                    serde_json::json!({
-                        "kind": item.kind.as_str(),
-                        "at": at,
-                    })
-                })
-            })
-            .collect();
-        val["messages"] = serde_json::Value::Array(messages);
+        val["messages"] = serde_json::Value::Array(
+            delivered_messages(name)?
+                .into_iter()
+                .map(|(kind, at)| serde_json::json!({"kind": kind, "at": at}))
+                .collect(),
+        );
         println!("{}", serde_json::to_string_pretty(&val).unwrap());
     } else {
         println!("run: {}", rec.name);
@@ -453,14 +447,22 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         if let Some(ref sid) = rec.session_id {
             println!("session_id: {}", sid);
         }
-        for item in inbox::delivered(&run_dir(name))? {
-            if let Some(at) = item.delivered_at {
-                println!("message: {} {}", item.kind.as_str(), at);
-            }
+        for (kind, at) in delivered_messages(name)? {
+            println!("message: {kind} {at}");
         }
     }
 
     Ok(0)
+}
+
+fn delivered_messages(name: &str) -> Result<Vec<(String, String)>, Error> {
+    Ok(inbox::delivered(&run_dir(name))?
+        .into_iter()
+        .filter_map(|item| {
+            item.delivered_at
+                .map(|at| (item.kind.as_str().to_string(), at))
+        })
+        .collect())
 }
 
 /// `-` when the record has no model. Old records and grok-without-`-m` both qualify.

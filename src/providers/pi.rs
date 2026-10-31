@@ -129,20 +129,16 @@ pub(super) fn pi_tail(
 ) -> (Vec<String>, Option<String>) {
     // RPC stays up for `steer`. `-p` would exit after one prompt and could
     // not take a mid-turn message. `abort` is reserved for job stop.
-    let mut argv = if job {
-        vec![
-            "--mode".to_string(),
-            "rpc".to_string(),
-            "--approve".to_string(),
-        ]
+    let mut argv = vec![
+        "--mode".to_string(),
+        "json".to_string(),
+        "--approve".to_string(),
+    ];
+    if job {
+        argv[1] = "rpc".to_string();
     } else {
-        vec![
-            "-p".to_string(),
-            "--mode".to_string(),
-            "json".to_string(),
-            "--approve".to_string(),
-        ]
-    };
+        argv.insert(0, "-p".to_string());
+    }
     if let Some(model) = model {
         proc::push_pair(&mut argv, "--model", model);
     }
@@ -186,11 +182,8 @@ fn pi_tick(state: &mut PiRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone {
             return proc::TickDone::Done { stop: false };
         }
     }
-    if let Ok(pending) = crate::job::inbox::pending(&state.dir) {
+    if let Ok(pending) = crate::job::inbox::steers(&state.dir) {
         for item in pending {
-            if item.kind != crate::job::inbox::Kind::Steer {
-                continue;
-            }
             tick.send(&pi_steer(&item.text));
             let _ = crate::job::inbox::mark_delivered(&state.dir, item.n);
         }
