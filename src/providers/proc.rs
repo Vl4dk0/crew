@@ -434,7 +434,7 @@ pub(super) fn capture(
     let _lock = CAPTURE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     INTERRUPTED.store(0, Ordering::SeqCst);
 
-    let (mut child, readers) = spawn(argv, cwd, kind)?;
+    let (mut child, readers, _stdin) = spawn(argv, cwd, kind, false)?;
     let pid = child.id();
     // detach_session makes the provider a session leader, so it is not in this
     // process group. Without a handler, SIGTERM (job stop) takes the default
@@ -494,6 +494,147 @@ pub(super) fn capture(
     })
 }
 
+/// Job steer writes the provider's own protocol on stdin and must stop when
+/// the turn ends. Waiting for another prompt would hang the supervisor.
+pub(super) struct Tick<'a> {
+    pub lines: Vec<String>,
+    /// Job stop already asked this process to die. Pi uses it to `abort`
+    /// before the signal lands.
+    pub stopping: bool,
+    stdin: &'a mut Option<std::process::ChildStdin>,
+}
+
+impl Tick<'_> {
+    pub(super) fn send(&mut self, line: &str) {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return;
+        };
+        let _ = stdin.write_all(line.as_bytes());
+        if !line.ends_with('\n') {
+            let _ = stdin.write_all(b"\n");
+        }
+        let _ = stdin.flush();
+    }
+}
+
+pub(super) enum TickDone {
+    Continue,
+    /// `stop` kills a long-lived CLI (codex app-server) once the turn is done.
+    /// That kill is not a user interrupt and not a timeout.
+    Done {
+        stop: bool,
+    },
+}
+
+pub(super) fn capture_driven(
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    kill: KillStyle,
+    watch: &mut dyn FnMut(&str) -> Option<String>,
+    mut on_tick: impl FnMut(&mut Tick<'_>) -> TickDone,
+) -> io::Result<Captured> {
+    let _lock = CAPTURE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    INTERRUPTED.store(0, Ordering::SeqCst);
+
+    let (mut child, readers, mut stdin) = spawn(argv, cwd, StdioKind::Piped, true)?;
+    let pid = child.id();
+    let _guard = match InterruptGuard::install() {
+        Ok(guard) => guard,
+        Err(err) => {
+            kill_group(pid, libc::SIGKILL);
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+
+    let mut announced = None;
+    let mut scanned = 0usize;
+    let mut timed_out = false;
+    let mut self_stop = false;
+    let start = Instant::now();
+    let status = loop {
+        let lines = drain_new_lines(&readers.stdout, &mut scanned, &mut announced, watch);
+        let stopping = INTERRUPTED.load(Ordering::SeqCst) != 0;
+        if stdin.is_some() {
+            match on_tick(&mut Tick {
+                lines,
+                stopping,
+                stdin: &mut stdin,
+            }) {
+                TickDone::Continue => {}
+                TickDone::Done { stop } => {
+                    stdin.take();
+                    if stop {
+                        self_stop = true;
+                        break None;
+                    }
+                }
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            let _ = drain_new_lines(&readers.stdout, &mut scanned, &mut announced, watch);
+            break Some(status);
+        }
+        if stopping {
+            break None;
+        }
+        if start.elapsed() >= timeout {
+            timed_out = true;
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let status = if self_stop {
+        stop_group(
+            &mut child,
+            kill,
+            &readers.stdout,
+            &mut scanned,
+            &mut announced,
+            watch,
+        )?
+    } else {
+        match status {
+            Some(status) if INTERRUPTED.load(Ordering::SeqCst) == 0 && !timed_out => status,
+            _ => {
+                if status.is_none() && INTERRUPTED.load(Ordering::SeqCst) == 0 {
+                    timed_out = true;
+                }
+                stop_group(
+                    &mut child,
+                    kill,
+                    &readers.stdout,
+                    &mut scanned,
+                    &mut announced,
+                    watch,
+                )?
+            }
+        }
+    };
+    let (stdout, stderr) = finish_readers(readers);
+    let stdout_text = String::from_utf8_lossy(&stdout).into_owned();
+    publish_session(&stdout_text, &mut announced, watch);
+    let mut code = public_code(python_status(status));
+    let user_stop = INTERRUPTED.swap(0, Ordering::SeqCst);
+    if user_stop != 0 {
+        code = user_stop;
+        timed_out = false;
+    } else if self_stop {
+        // The turn already finished. Stopping the long-lived CLI is not a
+        // failed run; the caller's success check still decides 0 or 125.
+        timed_out = false;
+        code = 0;
+    }
+    Ok(Captured {
+        code,
+        stdout: stdout_text,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        timed_out,
+        session_id: announced,
+    })
+}
+
 /// Note a new session id on stderr the moment `watch` can see it.
 fn publish_session(
     text: &str,
@@ -532,9 +673,9 @@ fn reap_watching(
 ) -> io::Result<Option<ExitStatus>> {
     let start = Instant::now();
     loop {
-        drain_new_lines(stdout, scanned, announced, watch);
+        let _lines = drain_new_lines(stdout, scanned, announced, watch);
         if let Some(status) = child.try_wait()? {
-            drain_new_lines(stdout, scanned, announced, watch);
+            let _lines = drain_new_lines(stdout, scanned, announced, watch);
             return Ok(Some(status));
         }
         // SIGTERM is only recorded here. stop_group snapshots the descendant
@@ -572,7 +713,7 @@ fn stop_group(
     if grace {
         let start = Instant::now();
         loop {
-            drain_new_lines(stdout, scanned, announced, watch);
+            let _lines = drain_new_lines(stdout, scanned, announced, watch);
             let status = child.try_wait()?;
             if let Some(status) = status
                 && tree_dead(pid, &marked)
@@ -724,7 +865,7 @@ fn drain_new_lines(
     scanned: &mut usize,
     announced: &mut Option<String>,
     watch: &mut dyn FnMut(&str) -> Option<String>,
-) {
+) -> Vec<String> {
     let fresh = {
         let buf = stdout.lock().unwrap_or_else(|err| err.into_inner());
         if buf.len() <= *scanned {
@@ -733,16 +874,19 @@ fn drain_new_lines(
             buf[*scanned..].to_vec()
         }
     };
+    let mut lines = Vec::new();
     if let Some(end) = fresh.iter().rposition(|byte| *byte == b'\n') {
         let complete = String::from_utf8_lossy(&fresh[..=end]);
         *scanned += end + 1;
         for line in complete.lines() {
             note_session_line(line, announced, watch);
+            lines.push(line.to_string());
         }
     }
     // Providers that learn the id from outside the stream (agy's conversation
     // file) get a look even when the child is quiet.
     note_session_line("", announced, watch);
+    lines
 }
 
 /// Bound a version check or an updater the same way a provider run is bounded.
@@ -810,7 +954,12 @@ enum ReaderHandles {
     },
 }
 
-fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Child, Readers)> {
+fn spawn(
+    argv: &[String],
+    cwd: Option<&Path>,
+    kind: StdioKind,
+    pipe_stdin: bool,
+) -> io::Result<(Child, Readers, Option<std::process::ChildStdin>)> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty argv"));
     }
@@ -819,13 +968,21 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
+    // A job sets this so the wrapper can see the inbox. The provider CLI and
+    // any tool it spawns must not inherit it.
+    cmd.env_remove("CREW_JOB");
     detach_session(&mut cmd);
     match kind {
         StdioKind::Piped => {
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            cmd.stdin(if pipe_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
             let mut child = cmd.spawn()?;
+            let stdin = child.stdin.take();
             let stdout = match child.stdout.take() {
                 Some(pipe) => pipe,
                 None => {
@@ -859,6 +1016,7 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
                     stderr: stderr_buf,
                     handles: ReaderHandles::Pipes { out, err },
                 },
+                stdin,
             ))
         }
         StdioKind::Pty => {
@@ -887,6 +1045,7 @@ fn spawn(argv: &[String], cwd: Option<&Path>, kind: StdioKind) -> io::Result<(Ch
                     stderr: Arc::new(Mutex::new(Vec::new())),
                     handles: ReaderHandles::Pty { out, stop },
                 },
+                None,
             ))
         }
     }

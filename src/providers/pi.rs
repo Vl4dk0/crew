@@ -64,12 +64,14 @@ pub(super) fn execute(
     label: &str,
 ) -> Result<i32, Error> {
     let verbatim = proc::effort_verbatim(invocation, &settings.thinking)?;
+    let job = crate::job::inbox::job_name();
     let (tail, note) = pi_tail(
         invocation,
         settings.model.as_deref(),
         &settings.thinking,
         prompt,
         verbatim.as_deref(),
+        job.is_some(),
     );
     let mut argv = program.to_vec();
     argv.extend(tail);
@@ -80,14 +82,32 @@ pub(super) fn execute(
     let mut watch = |line: &str| session_from_line(line);
     let captured = match proc::launch_or_note(
         label,
-        proc::capture(
-            &argv,
-            invocation.cwd.as_deref(),
-            timeout,
-            StdioKind::Piped,
-            KillStyle::TermThenKill,
-            &mut watch,
-        ),
+        if let Some(job) = job {
+            let dir = crate::job::store::run_dir(&job);
+            let mut rpc = PiRpc {
+                dir,
+                prompt: prompt.to_string(),
+                opened: false,
+                aborted: false,
+            };
+            proc::capture_driven(
+                &argv,
+                invocation.cwd.as_deref(),
+                timeout,
+                KillStyle::TermThenKill,
+                &mut watch,
+                |tick| pi_tick(&mut rpc, tick),
+            )
+        } else {
+            proc::capture(
+                &argv,
+                invocation.cwd.as_deref(),
+                timeout,
+                StdioKind::Piped,
+                KillStyle::TermThenKill,
+                &mut watch,
+            )
+        },
     ) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
@@ -105,13 +125,24 @@ pub(super) fn pi_tail(
     thinking: &str,
     prompt: &str,
     verbatim: Option<&str>,
+    job: bool,
 ) -> (Vec<String>, Option<String>) {
-    let mut argv = vec![
-        "-p".to_string(),
-        "--mode".to_string(),
-        "json".to_string(),
-        "--approve".to_string(),
-    ];
+    // RPC stays up for `steer`. `-p` would exit after one prompt and could
+    // not take a mid-turn message. `abort` is reserved for job stop.
+    let mut argv = if job {
+        vec![
+            "--mode".to_string(),
+            "rpc".to_string(),
+            "--approve".to_string(),
+        ]
+    } else {
+        vec![
+            "-p".to_string(),
+            "--mode".to_string(),
+            "json".to_string(),
+            "--approve".to_string(),
+        ]
+    };
     if let Some(model) = model {
         proc::push_pair(&mut argv, "--model", model);
     }
@@ -123,22 +154,81 @@ pub(super) fn pi_tail(
     } else if invocation.continue_session {
         argv.push("--continue".to_string());
     }
-    argv.push(prompt.to_string());
+    if !job {
+        argv.push(prompt.to_string());
+    }
     (argv, note)
+}
+
+struct PiRpc {
+    dir: std::path::PathBuf,
+    prompt: String,
+    opened: bool,
+    aborted: bool,
+}
+
+fn pi_tick(state: &mut PiRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone {
+    if tick.stopping && !state.aborted {
+        state.aborted = true;
+        tick.send(r#"{"type":"abort"}"#);
+        return proc::TickDone::Continue;
+    }
+    if !state.opened {
+        state.opened = true;
+        tick.send(r#"{"type":"get_state","id":"crew-state"}"#);
+        tick.send(&pi_prompt(&state.prompt));
+    }
+    for line in &tick.lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) == Some("agent_settled") {
+            return proc::TickDone::Done { stop: false };
+        }
+    }
+    if let Ok(pending) = crate::job::inbox::pending(&state.dir) {
+        for item in pending {
+            if item.kind != crate::job::inbox::Kind::Steer {
+                continue;
+            }
+            tick.send(&pi_steer(&item.text));
+            let _ = crate::job::inbox::mark_delivered(&state.dir, item.n);
+        }
+    }
+    proc::TickDone::Continue
+}
+
+fn pi_prompt(text: &str) -> String {
+    serde_json::json!({"type": "prompt", "message": text, "id": "crew-prompt"}).to_string()
+}
+
+fn pi_steer(text: &str) -> String {
+    serde_json::json!({"type": "steer", "message": text}).to_string()
 }
 
 /// Session id on the header line. Later events also carry ids that are not
 /// the session, so this does not reuse the generic session-key scan.
 pub(super) fn session_from_line(line: &str) -> Option<String> {
     let value: Value = serde_json::from_str(line.trim()).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("session") {
-        return None;
+    if value.get("type").and_then(Value::as_str) == Some("session") {
+        return value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
     }
-    value
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
+    // RPC has no session header. get_state is how the id is known before the
+    // turn finishes, which is what a killed job needs in order to resume.
+    if value.get("type").and_then(Value::as_str) == Some("response")
+        && value.get("command").and_then(Value::as_str) == Some("get_state")
+    {
+        return value
+            .pointer("/data/sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+    }
+    None
 }
 
 struct Assistant {
@@ -348,7 +438,7 @@ mod tests {
         assert!(!report.after_stderr.contains("None"));
 
         let invocation = bare(Provider::Pi);
-        let (tail, note) = pi_tail(&invocation, None, "medium", "pong", None);
+        let (tail, note) = pi_tail(&invocation, None, "medium", "pong", None, false);
         assert!(note.is_none());
         assert_eq!(
             tail,
@@ -365,7 +455,14 @@ mod tests {
 
         let mut with_flags = invocation;
         with_flags.resume = Some("sess-1".to_string());
-        let (tail, note) = pi_tail(&with_flags, Some("provider/model"), "max", "pong", None);
+        let (tail, note) = pi_tail(
+            &with_flags,
+            Some("provider/model"),
+            "max",
+            "pong",
+            None,
+            false,
+        );
         assert!(note.is_none());
         assert_eq!(
             tail,
@@ -385,7 +482,14 @@ mod tests {
         );
 
         let mut agent = vec!["tool".to_string(), "--fixed".to_string()];
-        let (tail, _) = pi_tail(&bare(Provider::Pi), Some("model-c"), "high", "pong", None);
+        let (tail, _) = pi_tail(
+            &bare(Provider::Pi),
+            Some("model-c"),
+            "high",
+            "pong",
+            None,
+            false,
+        );
         agent.extend(tail);
         assert_eq!(
             agent,

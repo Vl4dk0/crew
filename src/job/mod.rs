@@ -1,5 +1,6 @@
 #![allow(clippy::collapsible_if)]
 
+pub mod inbox;
 pub mod models;
 pub mod process;
 pub mod store;
@@ -28,7 +29,7 @@ pub struct NewJob {
     pub trailing: Vec<String>,
 }
 
-fn current_iso() -> String {
+pub(crate) fn current_iso() -> String {
     let now = SystemTime::now();
     let duration = now
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -410,6 +411,18 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
     if json {
         let mut val = serde_json::to_value(&rec).unwrap();
         val["status"] = serde_json::Value::String(status.as_str().to_string());
+        let messages: Vec<serde_json::Value> = inbox::delivered(&run_dir(name))?
+            .into_iter()
+            .filter_map(|item| {
+                item.delivered_at.map(|at| {
+                    serde_json::json!({
+                        "kind": item.kind.as_str(),
+                        "at": at,
+                    })
+                })
+            })
+            .collect();
+        val["messages"] = serde_json::Value::Array(messages);
         println!("{}", serde_json::to_string_pretty(&val).unwrap());
     } else {
         println!("run: {}", rec.name);
@@ -439,6 +452,11 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         }
         if let Some(ref sid) = rec.session_id {
             println!("session_id: {}", sid);
+        }
+        for item in inbox::delivered(&run_dir(name))? {
+            if let Some(at) = item.delivered_at {
+                println!("message: {} {}", item.kind.as_str(), at);
+            }
         }
     }
 
@@ -698,6 +716,71 @@ pub fn stop(name: &str) -> Result<i32, Error> {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
         }
+    }
+    Ok(0)
+}
+
+/// One message argument, or stdin when the argument is omitted.
+fn read_message(words: &[String]) -> Result<String, Error> {
+    match words {
+        [] => {
+            if std::io::stdin().is_terminal() {
+                return Err(Error::new(2, "cannot read message from terminal stdin"));
+            }
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|err| Error::new(2, format!("cannot read message from stdin: {err}")))?;
+            if buf.trim().is_empty() {
+                return Err(Error::new(2, "empty message"));
+            }
+            Ok(buf)
+        }
+        [one] => {
+            if one.trim().is_empty() {
+                return Err(Error::new(2, "empty message"));
+            }
+            Ok(one.clone())
+        }
+        _ => Err(Error::new(2, "pass at most one message")),
+    }
+}
+
+fn running_job(name: &str) -> Result<RunRecord, Error> {
+    if !run_dir(name).join("run.json").is_file() {
+        return Err(Error::new(2, format!("run {name} does not exist")));
+    }
+    let rec = load_record(name)?;
+    let alive = is_process_alive(
+        rec.supervisor_pid.unwrap_or(0),
+        rec.supervisor_start.as_deref(),
+    );
+    let status = status_of(&rec, alive);
+    if let Err(err) = inbox::require_running(status) {
+        let message = match status {
+            Status::Lost => format!("run {name} is lost"),
+            _ => format!("run {name} is not running"),
+        };
+        return Err(Error::new(err.code, message));
+    }
+    Ok(rec)
+}
+
+pub fn queue(name: &str, words: &[String]) -> Result<i32, Error> {
+    let text = read_message(words)?;
+    let _rec = running_job(name)?;
+    inbox::append(&run_dir(name), inbox::Kind::Queue, &text)?;
+    Ok(0)
+}
+
+pub fn steer(name: &str, words: &[String]) -> Result<i32, Error> {
+    let text = read_message(words)?;
+    let rec = running_job(name)?;
+    inbox::append(&run_dir(name), inbox::Kind::Steer, &text)?;
+    // Native steer is picked up by the wrapper. Everyone else is stopped
+    // mid-step by the supervisor, which says so here before that happens.
+    if !supervisor::native_steer(&rec.provider, &rec.args) {
+        eprintln!("[crew] current step was lost");
     }
     Ok(0)
 }

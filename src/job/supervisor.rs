@@ -1,60 +1,42 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::error::Error;
+use crate::id::Provider;
+use crate::job::inbox::{self, Kind};
 use crate::job::process::get_process_lstart;
 use crate::job::store::{load_record, run_dir, save_record};
 
-fn current_iso_time() -> String {
-    let now = SystemTime::now();
-    chrono_free_iso(now)
+/// Claude, pi, and Codex speak steer on the child's stdin. Grok, Gemini, and
+/// a Codex review do not, so the supervisor cuts that step and resumes.
+pub fn native_steer(provider: &str, args: &[String]) -> bool {
+    match provider.parse::<Provider>() {
+        Ok(Provider::Claude | Provider::Pi) => true,
+        Ok(Provider::Codex) => !args.iter().any(|arg| arg == "--review"),
+        Ok(Provider::Grok | Provider::Gemini) => false,
+        Err(_) => crate::tier::agent(provider).ok().flatten().is_some(),
+    }
 }
 
-fn chrono_free_iso(now: SystemTime) -> String {
-    // Generate ISO 8601 UTC string using system time
-    let duration = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-    let nanos = duration.subsec_nanos();
-
-    // Convert epoch seconds to date-time
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    // Civil date algorithm (Howard Hinnant)
-    let z = days as i64 + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = (yoe as i64) + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mon = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if mon <= 2 { y + 1 } else { y };
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
-        year,
-        mon,
-        d,
-        h,
-        m,
-        s,
-        nanos / 1000
-    )
+enum Turn {
+    /// Child exited 0. Pending inbox lines become the next turn.
+    Ok,
+    /// Child failed on its own. Leave the inbox for a later look.
+    Failed(i32),
+    Stopped(i32),
+    /// Fallback steer killed the child. `text` is already wrapped.
+    Fallback(String),
 }
 
-/// Daemon supervisor that executes `crew <provider> <args...>` and monitors execution.
+/// Daemon supervisor that executes `crew <provider> <args...>` and, when the
+/// turn ends cleanly with mail still in the inbox, runs the next message in
+/// the same job and the same session.
 pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     // Create new session
     unsafe {
@@ -70,82 +52,9 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     save_record(name, &record)?;
 
     let dir = run_dir(name);
-    let prompt_file = dir.join("prompt.bin");
-    let prompt_bytes = fs::read(&prompt_file).unwrap_or_default();
+    let mut prompt = fs::read(dir.join("prompt.bin")).unwrap_or_default();
+    let mut resume_id: Option<String> = None;
 
-    // Prepare child process
-    let current_exe = std::env::current_exe()
-        .map_err(|e| Error::new(127, format!("failed to find current exe: {}", e)))?;
-
-    let stdout_path = dir.join("stdout");
-    let stderr_path = dir.join("stderr");
-
-    let stdout_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&stdout_path)
-        .map_err(|e| Error::new(127, format!("failed to open stdout: {}", e)))?;
-
-    let stderr_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&stderr_path)
-        .map_err(|e| Error::new(127, format!("failed to open stderr: {}", e)))?;
-
-    let mut child_cmd = Command::new(&current_exe);
-    child_cmd.arg(&record.provider);
-
-    child_cmd.args(&record.args);
-
-    // Pass `-` so prompt is read from stdin if prompt_bytes is not empty
-    if !prompt_bytes.is_empty() {
-        child_cmd.arg("-");
-    }
-
-    if !record.cwd.is_empty() {
-        child_cmd.current_dir(Path::new(&record.cwd));
-    }
-
-    // An empty prompt must not leave the write end open. The child would
-    // block on read until the deadline. A review scope does not read stdin.
-    if prompt_bytes.is_empty() {
-        child_cmd.stdin(Stdio::null());
-    } else {
-        child_cmd.stdin(Stdio::piped());
-    }
-    child_cmd.stdout(Stdio::from(stdout_file));
-    child_cmd.stderr(Stdio::from(stderr_file));
-
-    // Put wrapper in its own process group
-    child_cmd.process_group(0);
-
-    record.started_at = Some(current_iso_time());
-
-    let mut child = match child_cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            record.exit_code = Some(127);
-            record.finished_at = Some(current_iso_time());
-            let _ = save_record(name, &record);
-            return Err(Error::new(127, format!("failed to spawn wrapper: {}", e)));
-        }
-    };
-
-    let wrapper_pid = child.id();
-    record.wrapper_pid = Some(wrapper_pid);
-    save_record(name, &record)?;
-
-    // Deliver prompt if non-empty
-    if !prompt_bytes.is_empty() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(&prompt_bytes);
-            let _ = stdin.flush();
-        }
-    }
-
-    // Set up signal handler flag for SIGTERM
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
     unsafe {
         libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::size_t);
@@ -154,69 +63,265 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
         STOP_REQUESTED.store(true, Ordering::SeqCst);
     }
 
-    let mut exit_code = None;
+    let exit_code = loop {
+        if prompt.is_empty() && resume_id.is_some() {
+            break 0;
+        }
+        match run_turn(
+            name,
+            &mut record,
+            &dir,
+            &prompt,
+            resume_id.as_deref(),
+            &STOP_REQUESTED,
+        )? {
+            Turn::Stopped(code) => break code,
+            Turn::Failed(code) => break code,
+            Turn::Fallback(text) => {
+                let Some(session) = record.session_id.clone() else {
+                    note_line(&dir, "[crew] steer left pending: no session id");
+                    break 0;
+                };
+                prompt = text.into_bytes();
+                resume_id = Some(session);
+            }
+            Turn::Ok => {
+                let pending = inbox::pending(&dir)?;
+                let Some(next) = pending.into_iter().next() else {
+                    break 0;
+                };
+                let Some(session) = record.session_id.clone() else {
+                    note_line(&dir, "[crew] inbox message left pending: no session id");
+                    break 0;
+                };
+                inbox::mark_delivered(&dir, next.n)?;
+                prompt = next.text.into_bytes();
+                resume_id = Some(session);
+            }
+        }
+    };
 
-    // Poll loop waiting for child or SIGTERM
+    record.finished_at = Some(super::current_iso());
+    record.exit_code = Some(exit_code);
+    note_session(name, &mut record, &dir);
+    save_record(name, &record)?;
+    Ok(exit_code)
+}
+
+fn run_turn(
+    name: &str,
+    record: &mut crate::job::models::RunRecord,
+    dir: &Path,
+    prompt: &[u8],
+    resume_id: Option<&str>,
+    stop_requested: &AtomicBool,
+) -> Result<Turn, Error> {
+    let current_exe = std::env::current_exe()
+        .map_err(|err| Error::new(127, format!("failed to find current exe: {err}")))?;
+
+    let stdout_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("stdout"))
+        .map_err(|err| Error::new(127, format!("failed to open stdout: {err}")))?;
+    let stderr_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join("stderr"))
+        .map_err(|err| Error::new(127, format!("failed to open stderr: {err}")))?;
+
+    let mut child_cmd = Command::new(&current_exe);
+    child_cmd.arg(&record.provider);
+    child_cmd.args(turn_args(&record.args, resume_id));
+    if !prompt.is_empty() {
+        child_cmd.arg("-");
+    }
+    if !record.cwd.is_empty() {
+        child_cmd.current_dir(Path::new(&record.cwd));
+    }
+    // The wrapper polls the inbox. The provider CLI must not see this, or a
+    // tool it runs would think it was the job.
+    child_cmd.env("CREW_JOB", name);
+    if prompt.is_empty() {
+        child_cmd.stdin(Stdio::null());
+    } else {
+        child_cmd.stdin(Stdio::piped());
+    }
+    child_cmd.stdout(Stdio::from(stdout_file));
+    child_cmd.stderr(Stdio::from(stderr_file));
+    child_cmd.process_group(0);
+
+    if record.started_at.is_none() {
+        record.started_at = Some(super::current_iso());
+    }
+
+    let mut child = match child_cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            record.exit_code = Some(127);
+            record.finished_at = Some(super::current_iso());
+            let _ = save_record(name, record);
+            return Err(Error::new(127, format!("failed to spawn wrapper: {err}")));
+        }
+    };
+
+    let wrapper_pid = child.id();
+    record.wrapper_pid = Some(wrapper_pid);
+    // A previous turn's exit must not make this one look finished.
+    record.exit_code = None;
+    record.finished_at = None;
+    record.stopped = false;
+    save_record(name, record)?;
+
+    if !prompt.is_empty()
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        let _ = stdin.write_all(prompt);
+        let _ = stdin.flush();
+    }
+
+    let native = native_steer(&record.provider, &record.args);
+    let mut exit_code = None;
+    let mut fallback: Option<String> = None;
+
     loop {
-        if STOP_REQUESTED.load(Ordering::SeqCst) {
+        if stop_requested.load(Ordering::SeqCst) {
             record.stopped = true;
-            // The provider CLI is not in this group. It is a session leader
-            // (proc::detach_session), and the wrapper forwards SIGTERM there,
-            // then waits up to 5s before SIGKILL. This grace has to cover that.
-            unsafe {
-                libc::killpg(wrapper_pid as i32, libc::SIGTERM);
-            }
-            let kill_deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < kill_deadline {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status
-                            .code()
-                            .unwrap_or_else(|| 128 + status.signal().unwrap_or(15));
-                        exit_code = Some(code);
-                        break;
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                    Err(_) => break,
-                }
-            }
-            if exit_code.is_none() {
-                // Hard kill after 10s grace
-                unsafe {
-                    libc::killpg(wrapper_pid as i32, libc::SIGKILL);
-                }
-                let _ = child.wait();
-                exit_code = Some(137); // 128 + 9
-            }
+            exit_code = Some(stop_child(&mut child, wrapper_pid));
             break;
         }
 
-        note_session(name, &mut record, &dir);
+        note_session(name, record, dir);
+
+        // A native wrapper injects steer itself. Here a steer means the CLI
+        // has no mid-turn channel, so the step is discarded and resumed.
+        if !native
+            && record.session_id.is_some()
+            && let Some(text) = take_fallback_steers(dir)?
+        {
+            let _ = stop_child(&mut child, wrapper_pid);
+            fallback = Some(text);
+            break;
+        }
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                let code = status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
-                exit_code = Some(code);
+                exit_code = Some(
+                    status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                );
                 break;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-            Err(_e) => {
+            Err(_) => {
                 exit_code = Some(127);
                 break;
             }
         }
     }
 
-    record.finished_at = Some(current_iso_time());
-    record.exit_code = exit_code;
+    note_session(name, record, dir);
+    if let Some(text) = fallback {
+        return Ok(Turn::Fallback(text));
+    }
+    let code = exit_code.unwrap_or(0);
+    if record.stopped {
+        Ok(Turn::Stopped(code))
+    } else if code == 0 {
+        Ok(Turn::Ok)
+    } else {
+        Ok(Turn::Failed(code))
+    }
+}
 
-    // The id may have arrived while the child was being killed.
-    note_session(name, &mut record, &dir);
+/// Drop `-r` and `-c` from a later turn so the recorded session is the one
+/// we just watched, not the flag the user typed for the first turn.
+fn turn_args(args: &[String], resume_id: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if resume_id.is_some() {
+            match arg.as_str() {
+                "-r" | "--resume" => {
+                    skip = true;
+                    continue;
+                }
+                "-c" | "--continue" => continue,
+                _ if arg.starts_with("--resume=") => continue,
+                _ => {}
+            }
+        }
+        out.push(arg.clone());
+    }
+    if let Some(id) = resume_id {
+        out.push("-r".to_string());
+        out.push(id.to_string());
+    }
+    out
+}
 
-    save_record(name, &record)?;
-    Ok(exit_code.unwrap_or(0))
+fn take_fallback_steers(dir: &Path) -> Result<Option<String>, Error> {
+    let pending = inbox::pending(dir)?;
+    let steers: Vec<_> = pending
+        .into_iter()
+        .filter(|item| item.kind == Kind::Steer)
+        .collect();
+    if steers.is_empty() {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    for (index, item) in steers.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+        }
+        text.push_str(&item.text);
+        inbox::mark_delivered(dir, item.n)?;
+    }
+    Ok(Some(format!(
+        "You were interrupted mid-step by your orchestrator. New instruction: {text}"
+    )))
+}
+
+fn stop_child(child: &mut std::process::Child, wrapper_pid: u32) -> i32 {
+    unsafe {
+        libc::killpg(wrapper_pid as i32, libc::SIGTERM);
+    }
+    let kill_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < kill_deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(15));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => break,
+        }
+    }
+    unsafe {
+        libc::killpg(wrapper_pid as i32, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    137
+}
+
+fn note_line(dir: &Path, line: &str) {
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stderr"))
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
 }
 
 /// Persist the session id as soon as the wrapper prints it. A supervisor

@@ -32,16 +32,36 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
     let mut watch = |line: &str| proc::session_from_line(line);
+    let job = crate::job::inbox::job_name();
     let captured = match proc::launch_or_note(
         "claude",
-        proc::capture(
-            &argv,
-            invocation.cwd.as_deref(),
-            timeout,
-            StdioKind::Piped,
-            KillStyle::TermThenKill,
-            &mut watch,
-        ),
+        if let Some(job) = job {
+            let dir = crate::job::store::run_dir(&job);
+            let mut steer = ClaudeSteer {
+                dir,
+                prompt: prompt.clone(),
+                opened: false,
+                skip_abort: false,
+                seq: 0,
+            };
+            proc::capture_driven(
+                &job_argv(argv),
+                invocation.cwd.as_deref(),
+                timeout,
+                KillStyle::TermThenKill,
+                &mut watch,
+                |tick| claude_tick(&mut steer, tick),
+            )
+        } else {
+            proc::capture(
+                &argv,
+                invocation.cwd.as_deref(),
+                timeout,
+                StdioKind::Piped,
+                KillStyle::TermThenKill,
+                &mut watch,
+            )
+        },
     ) {
         Ok(captured) => captured,
         Err(code) => return Ok(code),
@@ -130,6 +150,89 @@ pub(super) fn claude_argv(
     }
     proc::push_pair(&mut argv, "-p", prompt);
     (argv, note)
+}
+
+/// Job runs speak stream-json on stdin so a steer can land mid-turn.
+/// The prompt is a user message, not an argv the CLI would treat as one shot.
+fn job_argv(mut argv: Vec<String>) -> Vec<String> {
+    if argv.len() >= 2 && argv[argv.len() - 2] == "-p" {
+        argv.pop();
+        argv.pop();
+    }
+    argv.push("-p".to_string());
+    argv.push("--input-format".to_string());
+    argv.push("stream-json".to_string());
+    argv
+}
+
+struct ClaudeSteer {
+    dir: std::path::PathBuf,
+    prompt: String,
+    opened: bool,
+    /// An interrupt ends the in-flight tool with its own result event.
+    /// That event is not the answer; the user message that follows is.
+    skip_abort: bool,
+    seq: u64,
+}
+
+fn claude_tick(state: &mut ClaudeSteer, tick: &mut proc::Tick<'_>) -> proc::TickDone {
+    if !state.opened {
+        state.opened = true;
+        tick.send(&claude_user(&state.prompt));
+    }
+    for line in &tick.lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("result") {
+            continue;
+        }
+        if state.skip_abort && claude_abort(&value) {
+            state.skip_abort = false;
+            continue;
+        }
+        // The turn is over. A steer that shows up now stays in the inbox
+        // and the supervisor resumes it, instead of starting another turn here.
+        return proc::TickDone::Done { stop: false };
+    }
+    if let Ok(pending) = crate::job::inbox::pending(&state.dir) {
+        for item in pending {
+            if item.kind != crate::job::inbox::Kind::Steer {
+                continue;
+            }
+            state.seq = state.seq.saturating_add(1);
+            tick.send(&claude_interrupt(state.seq));
+            tick.send(&claude_user(&item.text));
+            let _ = crate::job::inbox::mark_delivered(&state.dir, item.n);
+            state.skip_abort = true;
+        }
+    }
+    proc::TickDone::Continue
+}
+
+fn claude_user(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": text}]
+        }
+    })
+    .to_string()
+}
+
+fn claude_interrupt(n: u64) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": format!("crew-{n}"),
+        "request": {"subtype": "interrupt"}
+    })
+    .to_string()
+}
+
+fn claude_abort(value: &Value) -> bool {
+    let subtype = value.get("subtype").and_then(Value::as_str).unwrap_or("");
+    subtype == "error_during_execution" || subtype.contains("abort")
 }
 
 pub(super) fn assess_claude(raw: bool, schema: bool, child: i32, out: &str, err: &str) -> Report {

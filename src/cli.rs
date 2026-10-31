@@ -148,7 +148,8 @@ enum Command {
         about = "Run, list, and resume named background jobs",
         long_about = "Detach a provider run under a name and pick it up later. \
             The store is $CREW_HOME or ~/.local/share/crew. Status is derived \
-            from the process and the recorded exit, not stored as a field.",
+            from the process and the recorded exit, not stored as a field. \
+            `job queue` delivers after the current turn. `job steer` delivers now.",
         after_long_help = "Examples:\n  \
             crew job run demo grok fast \"Reply with the single word pong\"\n  \
             crew job ls\n  \
@@ -389,7 +390,8 @@ enum JobCommand {
     },
     #[command(
         about = "Show one job's record and derived status",
-        long_about = "Print the stored record. The status line is computed, not stored.",
+        long_about = "Print the stored record. The status line is computed, not stored. \
+            Delivered queue and steer messages are listed, one line each.",
         after_long_help = "Examples:\n  crew job show demo\n  crew job show demo --json"
     )]
     Show {
@@ -404,7 +406,8 @@ enum JobCommand {
         about = "Print a finished job's stdout",
         long_about = "Exit 2 while the job is running. Exit 3 when the supervisor \
             is gone without a recorded exit (a lost job). `job wait` returns 0 \
-            for that same job. Refuses a symlink.",
+            for that same job. Refuses a symlink. After queued messages, this is \
+            the last turn's answer.",
         after_long_help = "Examples:\n  crew job result demo"
     )]
     Result {
@@ -474,6 +477,41 @@ enum JobCommand {
         /// Job name.
         #[arg(value_name = "NAME")]
         name: String,
+    },
+    #[command(
+        about = "Deliver a message after the current turn",
+        long_about = "Append a message to a running job. The supervisor runs it \
+            in the same session after the current turn exits 0. The job name \
+            does not change. Pass the message, or omit it to read stdin.",
+        after_long_help = "Examples:\n  \
+            crew job queue demo \"Also check the tests\"\n  \
+            cat note.txt | crew job queue demo"
+    )]
+    Queue {
+        /// Job name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Message. Omit it to read stdin. At most one argument.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        message: Vec<String>,
+    },
+    #[command(
+        about = "Deliver a message into the current turn",
+        long_about = "Send a message into a running job now. Claude, pi, and Codex \
+            keep the current step. Grok, Gemini, and Codex --review stop that step \
+            and resume the session with the message. A message that arrives after \
+            the turn has ended is queued. Pass the message, or omit it to read stdin.",
+        after_long_help = "Examples:\n  \
+            crew job steer demo \"Stop and answer with the word done\"\n  \
+            cat note.txt | crew job steer demo"
+    )]
+    Steer {
+        /// Job name.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Message. Omit it to read stdin. At most one argument.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        message: Vec<String>,
     },
 }
 
@@ -592,6 +630,8 @@ fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
             job::resume(&name, prompt)
         }
         JobCommand::Stop { name } => job::stop(&name),
+        JobCommand::Queue { name, message } => job::queue(&name, &message),
+        JobCommand::Steer { name, message } => job::steer(&name, &message),
     }
 }
 

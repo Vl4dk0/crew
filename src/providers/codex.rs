@@ -4,9 +4,10 @@
 //! `ultra`. Any `turn.failed` fails the run, including one followed by
 //! `turn.completed`. The deadline SIGKILLs the process group immediately.
 
+use std::fs;
 use std::path::Path;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::cli::Invocation;
 use crate::error::Error;
@@ -26,6 +27,12 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         ));
     }
     let prompt = take_prompt(invocation)?;
+    // Review stays on `codex exec`: app-server steer does not cover it.
+    // `-c` has no thread id yet, so it stays on exec too.
+    if crate::job::inbox::job_name().is_some() && !invocation.review && !invocation.continue_session
+    {
+        return run_app_server(invocation, prompt.as_deref());
+    }
     let (argv, note) = plan(invocation, prompt.as_deref())?;
     proc::write_effort_note(&note);
     let timeout = proc::timeout_duration(invocation.timeout_secs)?;
@@ -261,6 +268,376 @@ pub(super) fn parse_events(stdout: &str) -> CodexParse {
         notices,
         usage_limit,
     }
+}
+
+fn run_app_server(invocation: &Invocation, prompt: Option<&str>) -> Result<i32, Error> {
+    let prompt = prompt.ok_or_else(|| {
+        Error::new(
+            2,
+            "empty prompt (pass a prompt argument or pipe one via stdin)",
+        )
+    })?;
+    let resolved = tier::resolve(
+        invocation.provider,
+        invocation.tier,
+        invocation.model.as_deref(),
+        invocation.effort.as_deref(),
+    )?;
+    let model = resolved
+        .model
+        .ok_or_else(|| Error::new(2, "codex needs a model"))?;
+    let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
+    let (wire, note) = map_effort(
+        Provider::Codex,
+        Some(&model),
+        &resolved.effort,
+        verbatim.as_deref(),
+    );
+    proc::write_effort_note(&note);
+    let schema = schema_value(invocation)?;
+    let cwd = invocation
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    let job = crate::job::inbox::job_name().unwrap_or_default();
+    let mut rpc = CodexRpc {
+        dir: crate::job::store::run_dir(&job),
+        prompt: prompt.to_string(),
+        model,
+        effort: wire,
+        cwd: cwd.as_ref().map(|path| path.to_string_lossy().into_owned()),
+        schema,
+        resume: invocation.resume.clone(),
+        thread_id: None,
+        turn_id: None,
+        sent_init: false,
+        sent_turn: false,
+        steers: Vec::new(),
+        next_id: 1003,
+    };
+    let argv = vec!["codex".to_string(), "app-server".to_string()];
+    let timeout = proc::timeout_duration(invocation.timeout_secs)?;
+    let mut watch = |line: &str| app_session(line);
+    let captured = match proc::launch_or_note(
+        "codex",
+        proc::capture_driven(
+            &argv,
+            invocation.cwd.as_deref(),
+            timeout,
+            KillStyle::ImmediateKill,
+            &mut watch,
+            |tick| codex_tick(&mut rpc, tick),
+        ),
+    ) {
+        Ok(captured) => captured,
+        Err(code) => return Ok(code),
+    };
+    let parsed = parse_app(&captured.stdout);
+    let mut before = String::new();
+    for line in &parsed.notices {
+        before.push_str(&format!("[crew] {line}\n"));
+    }
+    if let Some(id) = parsed.thread_id.as_deref().filter(|id| !id.is_empty()) {
+        before.push_str(&format!("SESSION_ID={id}\n"));
+    }
+    let mut stdout = String::new();
+    if invocation.raw {
+        stdout.push_str(&captured.stdout);
+    } else if !parsed.message.is_empty() {
+        stdout.push_str(parsed.message.trim_end());
+        stdout.push('\n');
+    }
+    let mut after = String::new();
+    if !captured.stderr.is_empty() {
+        after.push_str(&captured.stderr);
+    }
+    let mut code = select_codex_exit(captured.code, parsed.success, captured.timed_out);
+    if let Some(message) = parsed
+        .usage_limit
+        .as_deref()
+        .filter(|_| !captured.timed_out && !parsed.success)
+    {
+        code = USAGE_LIMIT_EXIT;
+        after.push_str(&usage_limit_line("codex", message));
+    } else if captured.timed_out {
+        after.push_str(&format!(
+            "[crew] timed out after {}s\n",
+            format_secs(invocation.timeout_secs)
+        ));
+    } else if code == 125 {
+        after.push_str("[crew] failed or incomplete turn (missing completion or final answer)\n");
+    }
+    proc::emit_report(
+        &Report {
+            code,
+            before_stderr: before,
+            stdout,
+            after_stderr: after,
+        },
+        captured.session_id.as_deref(),
+    );
+    Ok(code)
+}
+
+struct CodexRpc {
+    dir: std::path::PathBuf,
+    prompt: String,
+    model: String,
+    effort: String,
+    cwd: Option<String>,
+    schema: Option<Value>,
+    resume: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    sent_init: bool,
+    sent_turn: bool,
+    steers: Vec<(i64, u64)>,
+    next_id: i64,
+}
+
+fn codex_tick(state: &mut CodexRpc, tick: &mut proc::Tick<'_>) -> proc::TickDone {
+    if !state.sent_init {
+        state.sent_init = true;
+        tick.send(
+            &json!({
+                "method": "initialize",
+                "id": 1000,
+                "params": {
+                    "clientInfo": {"name": "crew", "title": "crew", "version": "0.1.0"}
+                }
+            })
+            .to_string(),
+        );
+        tick.send(r#"{"method":"initialized","params":{}}"#);
+    }
+    let lines = tick.lines.clone();
+    for line in &lines {
+        if let Some(reply) = approval_reply(line) {
+            tick.send(&reply);
+        }
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let id = event.get("id").and_then(Value::as_i64);
+        if id == Some(1000) && event.get("result").is_some() {
+            tick.send(&thread_request(state));
+        }
+        if id == Some(1001)
+            && event.get("error").is_none()
+            && let Some(thread) = event.pointer("/result/thread/id").and_then(Value::as_str)
+        {
+            state.thread_id = Some(thread.to_string());
+            if !state.sent_turn {
+                state.sent_turn = true;
+                tick.send(&turn_request(state, thread));
+            }
+        }
+        if event.get("method").and_then(Value::as_str) == Some("turn/started")
+            && let Some(turn) = event.pointer("/params/turn/id").and_then(Value::as_str)
+        {
+            state.turn_id = Some(turn.to_string());
+        }
+        if id == Some(1002)
+            && let Some(turn) = event.pointer("/result/turn/id").and_then(Value::as_str)
+        {
+            state.turn_id = Some(turn.to_string());
+        }
+        if let Some(rpc_id) = id
+            && event.get("error").is_none()
+            && let Some(pos) = state.steers.iter().position(|(rid, _)| *rid == rpc_id)
+        {
+            let (_, n) = state.steers.remove(pos);
+            let _ = crate::job::inbox::mark_delivered(&state.dir, n);
+        }
+        if event.get("method").and_then(Value::as_str) == Some("turn/completed") {
+            return proc::TickDone::Done { stop: true };
+        }
+    }
+    if let (Some(thread), Some(turn)) = (state.thread_id.clone(), state.turn_id.clone())
+        && let Ok(pending) = crate::job::inbox::pending(&state.dir)
+    {
+        for item in pending {
+            if item.kind != crate::job::inbox::Kind::Steer {
+                continue;
+            }
+            if state.steers.iter().any(|(_, n)| *n == item.n) {
+                continue;
+            }
+            let rpc_id = state.next_id;
+            state.next_id += 1;
+            state.steers.push((rpc_id, item.n));
+            tick.send(
+                &json!({
+                    "method": "turn/steer",
+                    "id": rpc_id,
+                    "params": {
+                        "threadId": thread,
+                        "expectedTurnId": turn,
+                        "input": [{"type": "text", "text": item.text}]
+                    }
+                })
+                .to_string(),
+            );
+        }
+    }
+    proc::TickDone::Continue
+}
+
+fn thread_request(state: &CodexRpc) -> String {
+    let mut params = json!({
+        "model": state.model,
+        "approvalPolicy": "never",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+    });
+    if let Some(cwd) = &state.cwd {
+        params["cwd"] = json!(cwd);
+    }
+    if let Some(thread) = &state.resume {
+        params["threadId"] = json!(thread);
+        return json!({"method": "thread/resume", "id": 1001, "params": params}).to_string();
+    }
+    json!({"method": "thread/start", "id": 1001, "params": params}).to_string()
+}
+
+fn turn_request(state: &CodexRpc, thread: &str) -> String {
+    let mut params = json!({
+        "threadId": thread,
+        "input": [{"type": "text", "text": state.prompt}],
+        "model": state.model,
+        "effort": state.effort,
+        "approvalPolicy": "never",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+    });
+    if let Some(cwd) = &state.cwd {
+        params["cwd"] = json!(cwd);
+    }
+    if let Some(schema) = &state.schema {
+        params["outputSchema"] = schema.clone();
+    }
+    json!({"method": "turn/start", "id": 1002, "params": params}).to_string()
+}
+
+fn approval_reply(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let method = value.get("method").and_then(Value::as_str)?;
+    if !(method.contains("requestApproval")
+        || method.contains("requestUserInput")
+        || method.contains("elicitation"))
+    {
+        return None;
+    }
+    let id = value.get("id")?;
+    Some(json!({"id": id, "result": {"decision": "accept", "action": "accept"}}).to_string())
+}
+
+fn app_session(line: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(line.trim()).ok()?;
+    if let Some(id) = value
+        .pointer("/result/thread/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        return Some(id.to_string());
+    }
+    if value.get("method").and_then(Value::as_str) == Some("thread/started") {
+        return value
+            .pointer("/params/thread/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+    }
+    None
+}
+
+fn schema_value(invocation: &Invocation) -> Result<Option<Value>, Error> {
+    let Some(schema) = &invocation.schema else {
+        return Ok(None);
+    };
+    let path = proc::resolve_no_tilde(Path::new(schema));
+    let text =
+        fs::read_to_string(&path).map_err(|err| Error::new(2, format!("--schema: {err}")))?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| Error::new(2, format!("--schema: {err}")))
+}
+
+fn parse_app(stdout: &str) -> CodexParse {
+    let mut message = String::new();
+    let mut thread_id = None;
+    let mut completed = false;
+    let mut failed = false;
+    let mut notices = Vec::new();
+    let mut usage_limit = None;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(id) = app_session(line) {
+            thread_id = Some(id);
+        }
+        if let Some(limit) = app_limit(&event) {
+            usage_limit = Some(limit);
+        }
+        match event.get("method").and_then(Value::as_str) {
+            Some("turn/completed") => {
+                match event
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "completed" => completed = true,
+                    "failed" => {
+                        failed = true;
+                        notices.push(line.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            Some("error") => notices.push(line.to_string()),
+            Some("item/completed") => {
+                let Some(item) = event.pointer("/params/item") else {
+                    continue;
+                };
+                if item.get("type").and_then(Value::as_str) != Some("agentMessage") {
+                    continue;
+                }
+                if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                    continue;
+                }
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    message = text.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    let success = completed && !failed && !message.trim().is_empty();
+    CodexParse {
+        message,
+        thread_id,
+        success,
+        notices,
+        usage_limit,
+    }
+}
+
+fn app_limit(event: &Value) -> Option<String> {
+    let blob = event.to_string();
+    let tagged = blob.contains("UsageLimit");
+    if !tagged && !looks_like_usage_limit(&blob) {
+        return None;
+    }
+    event
+        .pointer("/params/turn/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .pointer("/params/error/message")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| event.pointer("/error/message").and_then(Value::as_str))
+        .map(str::to_string)
+        .or(Some(blob))
 }
 
 pub(super) fn select_codex_exit(child: i32, success: bool, timed_out: bool) -> i32 {
