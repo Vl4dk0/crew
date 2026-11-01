@@ -20,17 +20,9 @@ use super::proc::{
 };
 
 pub fn run(invocation: &Invocation) -> Result<i32, Error> {
-    if scope_count(invocation) > 1 {
-        return Err(Error::new(
-            2,
-            "pass only one of --uncommitted, --base, --commit",
-        ));
-    }
     let prompt = take_prompt(invocation)?;
-    // Review stays on `codex exec`: app-server steer does not cover it.
-    // `-c` has no thread id yet, so it stays on exec too.
-    if crate::job::inbox::job_name().is_some() && !invocation.review && !invocation.continue_session
-    {
+    // `-c` has no thread id yet, so it stays on `codex exec`.
+    if crate::job::inbox::job_name().is_some() && !invocation.continue_session {
         return run_app_server(invocation, prompt.as_deref());
     }
     let (argv, note) = plan(invocation, prompt.as_deref())?;
@@ -56,12 +48,6 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
         &captured,
         &parse_events(&captured.stdout),
     ))
-}
-
-fn scope_count(invocation: &Invocation) -> usize {
-    usize::from(invocation.uncommitted)
-        + usize::from(invocation.base.is_some())
-        + usize::from(invocation.commit.is_some())
 }
 
 fn plan(
@@ -166,8 +152,6 @@ pub(super) fn codex_argv(
     }
     if invocation.resume.is_some() || invocation.continue_session {
         argv.push("resume".to_string());
-    } else if invocation.review {
-        argv.push("review".to_string());
     }
     argv.push("--json".to_string());
     argv.push("--skip-git-repo-check".to_string());
@@ -186,13 +170,6 @@ pub(super) fn codex_argv(
         argv.push("--last".to_string());
     } else if let Some(resume) = &invocation.resume {
         argv.push(resume.clone());
-    }
-    if invocation.uncommitted {
-        argv.push("--uncommitted".to_string());
-    } else if let Some(base) = &invocation.base {
-        proc::push_pair(&mut argv, "--base", base);
-    } else if let Some(commit) = &invocation.commit {
-        proc::push_pair(&mut argv, "--commit", commit);
     }
     if let Some(prompt) = prompt {
         argv.push("--".to_string());
@@ -609,7 +586,7 @@ pub(super) fn select_codex_exit(child: i32, success: bool, timed_out: bool) -> i
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::proc::{LAUNCH_EXIT, bare, codex_scope, flag, has};
+    use crate::providers::proc::{LAUNCH_EXIT, bare, flag, has};
 
     #[test]
     fn turn_failed_is_not_saved_by_a_later_completion() {
@@ -719,15 +696,6 @@ mod tests {
         assert!(has(&argv, "--last"));
 
         invocation.continue_session = false;
-        invocation.review = true;
-        invocation.uncommitted = true;
-        assert!(codex_scope(&invocation));
-        let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", None, None);
-        assert!(has(&argv, "review"));
-        assert!(has(&argv, "--uncommitted"));
-        assert!(!has(&argv, "--"));
-
-        invocation.uncommitted = false;
         invocation.schema = Some("{".to_string());
         invocation.add_dir = vec!["~/nope".into()];
         let (argv, _) = codex_argv(&invocation, "gpt-6.1-sol", "low", Some("hello"), None);

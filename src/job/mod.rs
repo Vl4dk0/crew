@@ -165,8 +165,6 @@ fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String>
                     | "--schema"
                     | "--max-turns"
                     | "--agent"
-                    | "--base"
-                    | "--commit"
             );
             if takes_val && !token.contains('=') {
                 i += 1;
@@ -251,10 +249,6 @@ fn run_internal(
             }
             (extract_flags(&job.trailing, true), buf)
         }
-    } else if review_scope(&invocation) {
-        // A scope (--uncommitted, --base, --commit) is the prompt. Bare
-        // `--review` still needs one, from argv or stdin.
-        (job.trailing.clone(), Vec::new())
     } else {
         if std::io::stdin().is_terminal() {
             return Err(Error::new(2, "cannot read prompt from terminal stdin"));
@@ -468,12 +462,6 @@ fn delivered_messages(name: &str) -> Result<Vec<(String, String)>, Error> {
 /// `-` when the record has no model. Old records and grok-without-`-m` both qualify.
 fn listed_model(record: &RunRecord) -> &str {
     record.model.as_deref().unwrap_or("-")
-}
-
-/// A Codex review scope stands in for the prompt. Bare `--review` does not.
-fn review_scope(invocation: &crate::cli::Invocation) -> bool {
-    invocation.review
-        && (invocation.uncommitted || invocation.base.is_some() || invocation.commit.is_some())
 }
 
 pub fn result(name: &str) -> Result<i32, Error> {
@@ -781,7 +769,7 @@ pub fn steer(name: &str, words: &[String]) -> Result<i32, Error> {
     inbox::append(&run_dir(name), inbox::Kind::Steer, &text)?;
     // Native steer is picked up by the wrapper. Everyone else is stopped
     // mid-step by the supervisor, which says so here before that happens.
-    if !supervisor::native_steer(&rec.provider, &rec.args) {
+    if !supervisor::native_steer(&rec.provider) {
         eprintln!("[crew] current step was lost");
     }
     Ok(0)
@@ -884,16 +872,5 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err.code, 2);
-    }
-
-    #[test]
-    fn review_scope_without_prompt_parses_without_prompt() {
-        let trailing = vec!["--review".to_string(), "--uncommitted".to_string()];
-        let inv = parse_trailing(Provider::Codex, &trailing).unwrap();
-        assert!(review_scope(&inv));
-        assert!(inv.prompt.is_none());
-
-        let bare = parse_trailing(Provider::Codex, &["--review".to_string()]).unwrap();
-        assert!(!review_scope(&bare));
     }
 }

@@ -118,11 +118,9 @@ enum Command {
         about = "Run Codex",
         long_about = "Run codex. Aliases: gpt, chatgpt. Effort is always sent. \
             The default is medium. User-facing max is sent as ultra, except on \
-            gpt-6-luna, which stays max. --review with a scope (--uncommitted, \
-            --base, or --commit) does not take a prompt.",
+            gpt-6-luna, which stays max.",
         after_long_help = "Examples:\n  \
             crew codex fast \"Reply with the single word pong\"\n  \
-            crew codex --review --uncommitted\n  \
             crew codex -m gpt-6-luna \"Explain src/tier.rs\"",
         visible_alias = "gpt",
         visible_alias = "chatgpt"
@@ -285,18 +283,6 @@ struct CodexArgs {
     /// Print codex's own raw output instead of extracting the final message. Does not skip crew's success checks.
     #[arg(long)]
     raw: bool,
-    /// Run `codex review` instead of a normal turn.
-    #[arg(long)]
-    review: bool,
-    /// Review scope: uncommitted changes. Does not take a prompt. Requires --review.
-    #[arg(long)]
-    uncommitted: bool,
-    /// Review scope: changes against this base branch. Requires --review.
-    #[arg(long)]
-    base: Option<String>,
-    /// Review scope: this commit. Requires --review.
-    #[arg(long)]
-    commit: Option<String>,
 }
 
 /// Run deadline when the user does not pass `--timeout`.
@@ -351,10 +337,6 @@ pub struct Invocation {
     pub max_turns: Option<u32>,
     pub agent: Option<String>,
     pub sandbox: bool,
-    pub review: bool,
-    pub uncommitted: bool,
-    pub base: Option<String>,
-    pub commit: Option<String>,
     /// Set when the command name is a config.toml agent rather than `pi`.
     pub user_agent: Option<String>,
 }
@@ -373,8 +355,7 @@ enum JobCommand {
             The flags after the provider are the same flags as a foreground run.",
         after_long_help = "Examples:\n  \
             crew job run demo grok fast high \"Reply with the single word pong\"\n  \
-            crew job run audit claude -C ~/Projects/crew \"List the risky spots\"\n  \
-            crew job run --note \"nightly\" rev codex --review --uncommitted"
+            crew job run audit claude -C ~/Projects/crew \"List the risky spots\""
     )]
     Run(JobRunArgs),
     #[command(
@@ -498,7 +479,7 @@ enum JobCommand {
     #[command(
         about = "Deliver a message into the current turn",
         long_about = "Send a message into a running job now. Claude, pi, and Codex \
-            keep the current step. Grok, Gemini, and Codex --review stop that step \
+            keep the current step. Grok and Gemini stop that step \
             and resume the session with the message. A message that arrives after \
             the turn has ended is queued. Pass the message, or omit it to read stdin.",
         after_long_help = "Examples:\n  \
@@ -734,16 +715,6 @@ fn finish(
     {
         return Err(Error::new(2, "pass -r or -c, not both"));
     }
-    let review_scope = extra.uncommitted || extra.base.is_some() || extra.commit.is_some();
-    if review_scope && !extra.review {
-        return Err(Error::new(2, "review scope requires --review"));
-    }
-    if extra.review && (shared.resume.is_some() || shared.continue_session) {
-        return Err(Error::new(2, "--review cannot be combined with -r or -c"));
-    }
-    if extra.review && review_scope && prompt.is_some() {
-        return Err(Error::new(2, "choose a review scope or a custom prompt"));
-    }
     Ok(Invocation {
         provider,
         tier,
@@ -761,10 +732,6 @@ fn finish(
         max_turns: extra.max_turns,
         agent: extra.agent,
         sandbox: extra.sandbox,
-        review: extra.review,
-        uncommitted: extra.uncommitted,
-        base: extra.base,
-        commit: extra.commit,
         user_agent: None,
     })
 }
@@ -777,10 +744,6 @@ struct Extra {
     max_turns: Option<u32>,
     agent: Option<String>,
     sandbox: bool,
-    review: bool,
-    uncommitted: bool,
-    base: Option<String>,
-    commit: Option<String>,
 }
 
 fn invocation_from_claude(args: ProviderArgs) -> Result<Invocation, Error> {
@@ -840,10 +803,6 @@ fn invocation_from_codex(args: CodexArgs) -> Result<Invocation, Error> {
         Extra {
             schema: args.schema,
             raw: args.raw,
-            review: args.review,
-            uncommitted: args.uncommitted,
-            base: args.base,
-            commit: args.commit,
             ..Extra::default()
         },
     )
@@ -887,20 +846,6 @@ mod tests {
         let inv = parse(&["gemini", "-r", "abc", "-c", "hi"]).unwrap();
         assert!(inv.continue_session);
         assert_eq!(inv.resume.as_deref(), Some("abc"));
-    }
-
-    #[test]
-    fn codex_review_scope_without_a_prompt_parses() {
-        let inv = parse(&["codex", "--review", "--uncommitted"]).unwrap();
-        assert!(inv.review);
-        assert!(inv.uncommitted);
-        assert_eq!(inv.prompt, None);
-    }
-
-    #[test]
-    fn codex_review_scope_and_a_prompt_conflict() {
-        let err = parse(&["codex", "--review", "--uncommitted", "hello"]).unwrap_err();
-        assert_eq!(err.code, 2);
     }
 
     #[test]

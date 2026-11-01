@@ -113,16 +113,7 @@ pub(super) fn reads_process_stdin(prompt: Option<&str>) -> bool {
     matches!(prompt, None | Some("-"))
 }
 
-pub(super) fn codex_scope(invocation: &Invocation) -> bool {
-    invocation.uncommitted || invocation.base.is_some() || invocation.commit.is_some()
-}
-
 pub(super) fn take_prompt(invocation: &Invocation) -> Result<Option<String>, Error> {
-    // A codex review scope is the prompt. Reading stdin there would swallow
-    // whatever the caller had piped for an unrelated reason.
-    if invocation.provider == Provider::Codex && codex_scope(invocation) {
-        return Ok(None);
-    }
     match invocation.prompt.as_deref() {
         Some(text) if !reads_process_stdin(Some(text)) => {
             if text.trim().is_empty() {
@@ -1247,10 +1238,6 @@ pub(super) fn bare(provider: Provider) -> Invocation {
         max_turns: None,
         agent: None,
         sandbox: false,
-        review: false,
-        uncommitted: false,
-        base: None,
-        commit: None,
         user_agent: None,
     }
 }
@@ -1290,12 +1277,6 @@ mod tests {
         assert_eq!(take_prompt(&invocation).unwrap().as_deref(), Some("hello"));
         invocation.prompt = Some("   ".to_string());
         assert_eq!(take_prompt(&invocation).unwrap_err().code, 2);
-
-        let mut codex = bare(Provider::Codex);
-        codex.review = true;
-        codex.uncommitted = true;
-        codex.prompt = None;
-        assert_eq!(take_prompt(&codex).unwrap(), None);
     }
 
     #[test]

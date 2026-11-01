@@ -13,12 +13,11 @@ use crate::job::inbox;
 use crate::job::process::get_process_lstart;
 use crate::job::store::{load_record, run_dir, save_record};
 
-/// Claude, pi, and Codex speak steer on the child's stdin. Grok, Gemini, and
-/// a Codex review do not, so the supervisor cuts that step and resumes.
-pub fn native_steer(provider: &str, args: &[String]) -> bool {
+/// Claude, pi, and Codex speak steer on the child's stdin. Grok and Gemini
+/// do not, so the supervisor cuts that step and resumes.
+pub fn native_steer(provider: &str) -> bool {
     match provider.parse::<Provider>() {
-        Ok(Provider::Claude | Provider::Pi) => true,
-        Ok(Provider::Codex) => !args.iter().any(|arg| arg == "--review"),
+        Ok(Provider::Claude | Provider::Pi | Provider::Codex) => true,
         Ok(Provider::Grok | Provider::Gemini) => false,
         Err(_) => crate::tier::agent(provider).ok().flatten().is_some(),
     }
@@ -140,7 +139,7 @@ fn run_turn(
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     // An empty prompt must not leave the write end open. The child would block
-    // on read until the deadline. A review scope does not read stdin.
+    // on read until the deadline.
     if prompt.is_empty() {
         child_cmd.stdin(Stdio::null());
     } else {
@@ -179,7 +178,7 @@ fn run_turn(
         let _ = stdin.flush();
     }
 
-    let native = native_steer(&record.provider, &record.args);
+    let native = native_steer(&record.provider);
     let mut exit_code = None;
     let mut fallback: Option<String> = None;
 
