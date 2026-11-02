@@ -43,7 +43,8 @@ pub fn parse_name(name: &str) -> Option<Tier> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// `None` means the runner omits `-m`. Only the grok wrapper default does that.
+    /// `None` means the runner omits the model flag. Grok does that when no
+    /// tier was given. A pi agent does it when no model and no balanced row.
     pub model: Option<String>,
     pub effort: String,
 }
@@ -204,9 +205,10 @@ pub fn effort_override(owner: &str, effort: &str) -> Result<Option<String>, Erro
 
 /// What the runner should put on the CLI.
 ///
-/// No tier and no `-m` keeps the wrapper's model default. Effort is the word
-/// the user typed, or `medium`. A tier never changes it. Grok's wrapper still
-/// omits `-m` when both are absent, so this does not apply `balanced`.
+/// No tier and no `-m` uses the balanced row, so a config override of that
+/// row is also the model. Effort is the word the user typed, or `medium`.
+/// A tier never changes it. Grok still omits the model flag when both are
+/// absent, so the account default stands.
 pub fn resolve(
     provider: Provider,
     tier: Option<Tier>,
@@ -225,7 +227,8 @@ pub fn resolve(
 
 /// Model and thinking for `pi` or a pi-based agent.
 ///
-/// `thinking` is always set. Pi has no separate default once crew owns the run.
+/// `thinking` is always set. With no tier and no `-m`, the balanced row is
+/// the model when the file has one. Otherwise no model is sent.
 pub struct PiSettings {
     pub model: Option<String>,
     pub thinking: String,
@@ -255,7 +258,6 @@ pub fn pi_settings(
     }
     let loaded = load()?;
     let row = match tier {
-        None => None,
         Some(tier) => Some(
             loaded
                 .extras
@@ -273,6 +275,10 @@ pub fn pi_settings(
                     )
                 })?,
         ),
+        None => loaded
+            .extras
+            .get(name)
+            .and_then(|rows| rows.get(&Tier::Balanced)),
     };
     let model = match model {
         Some(model) => Some(model.to_string()),
@@ -299,12 +305,14 @@ fn resolve_with(
             format!("effort must be one of {}", EFFORTS.join(", ")),
         ));
     }
+    // No tier uses balanced, except grok, which sends no model at all.
     let model = if let Some(model) = model {
         Some(model.to_string())
-    } else if let Some(tier) = tier {
-        Some(table.provider(provider).get(tier).model.clone())
+    } else if provider == Provider::Grok && tier.is_none() {
+        None
     } else {
-        return Ok(wrapper_default(provider, effort));
+        let tier = tier.unwrap_or(Tier::Balanced);
+        Some(table.provider(provider).get(tier).model.clone())
     };
     Ok(Resolved {
         model,
@@ -312,28 +320,8 @@ fn resolve_with(
     })
 }
 
-/// Model a wrapper gets when the user passed no tier and no `-m`.
-/// Grok has none: the wrapper omits `-m` and the account default stands.
-const CLAUDE_WRAPPER_MODEL: &str = "sonnet";
-const CODEX_WRAPPER_MODEL: &str = "gpt-6-luna";
-const GEMINI_WRAPPER_MODEL: &str = "gemini-3.8-flash-medium";
-
 /// Effort when the command names none. Every provider sends this.
 pub const DEFAULT_EFFORT: &str = "medium";
-
-fn wrapper_default(provider: Provider, effort: Option<&str>) -> Resolved {
-    let model = match provider {
-        Provider::Claude => Some(CLAUDE_WRAPPER_MODEL.to_string()),
-        Provider::Codex => Some(CODEX_WRAPPER_MODEL.to_string()),
-        Provider::Gemini => Some(GEMINI_WRAPPER_MODEL.to_string()),
-        Provider::Grok => None,
-        Provider::Pi => None,
-    };
-    Resolved {
-        model,
-        effort: effort.unwrap_or(DEFAULT_EFFORT).to_string(),
-    }
-}
 
 pub fn print() -> Result<i32, Error> {
     let loaded = load()?;
@@ -429,16 +417,32 @@ mod tests {
     }
 
     #[test]
-    fn omitted_tier_keeps_wrapper_defaults() {
+    fn omitted_tier_uses_the_balanced_row() {
         let table = parse_table(BUILTIN, "builtin").unwrap();
         let grok = resolve_with(&table, Provider::Grok, None, None, None).unwrap();
         assert_eq!(grok.model, None);
         assert_eq!(grok.effort, DEFAULT_EFFORT);
-        let codex = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
-        assert_eq!(codex.model.as_deref(), Some(CODEX_WRAPPER_MODEL));
-        // No tier and no effort word is one effort for every provider,
-        // including codex, whose own wrapper defaults to low. Vladko asked for that.
-        assert_eq!(codex.effort, DEFAULT_EFFORT);
+        for provider in [Provider::Claude, Provider::Codex, Provider::Gemini] {
+            let resolved = resolve_with(&table, provider, None, None, None).unwrap();
+            let balanced = table.provider(provider).get(Tier::Balanced);
+            assert_eq!(resolved.model.as_deref(), Some(balanced.model.as_str()));
+            // No tier and no effort word is one effort for every provider,
+            // including codex, whose own CLI would have used low.
+            assert_eq!(resolved.effort, DEFAULT_EFFORT);
+        }
+
+        let balanced = table.provider(Provider::Codex).get(Tier::Balanced);
+        let fast = table.provider(Provider::Codex).get(Tier::Fast);
+        let overridden = BUILTIN.replace(
+            &format!("[codex.balanced]\nmodel = \"{}\"", balanced.model),
+            "[codex.balanced]\nmodel = \"sentinel-model\"",
+        );
+        let table = parse_table(&overridden, "test").unwrap();
+        let resolved = resolve_with(&table, Provider::Codex, None, None, None).unwrap();
+        assert_eq!(resolved.model.as_deref(), Some("sentinel-model"));
+        let still_fast =
+            resolve_with(&table, Provider::Codex, Some(Tier::Fast), None, None).unwrap();
+        assert_eq!(still_fast.model.as_deref(), Some(fast.model.as_str()));
     }
 
     #[test]

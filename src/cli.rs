@@ -306,7 +306,7 @@ struct SharedArgs {
     /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
-    /// Tier, then effort, then one prompt. Tier is fast, balanced, smart, or max. Effort is low, medium, high, or max. A word that is only an effort (low, medium, high) sets effort and leaves the model at the wrapper default. A single max is the tier, because the tier slot is checked first. Omit the prompt, or pass -, to read stdin.
+    /// Tier, then effort, then one prompt. Tier is fast, balanced, smart, or max. Effort is low, medium, high, or max. A word that is only an effort (low, medium, high) sets effort and leaves the model at the balanced tier. A single max is the tier, because the tier slot is checked first. Omit the prompt, or pass -, to read stdin.
     #[arg(num_args = 0..=3, value_name = "[TIER] [EFFORT] [PROMPT]")]
     words: Vec<String>,
 }
@@ -659,8 +659,8 @@ struct RunWords {
 /// Tier slot first, then effort, then one prompt.
 ///
 /// `max` is both a tier and an effort. Checked as a tier first, so a lone
-/// `max` selects the max model. Max effort on the wrapper default is
-/// `<tier> max`, using a tier whose model is that default.
+/// `max` selects the max model. Max effort on the balanced model is
+/// `<tier> max`.
 fn split_run_words(words: &[String]) -> Result<RunWords, Error> {
     let mut rest = words;
     let mut tier = None;
