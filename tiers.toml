@@ -34,7 +34,7 @@ model = "gpt-6-astra"
 model = "gemini-3.8-flash"
 
 [gemini.balanced]
-model = "gemini-4-argon"
+model = "gemini-3.8-flash"
 
 [gemini.smart]
 model = "gemini-4-argon"
@@ -43,10 +43,10 @@ model = "gemini-4-argon"
 model = "gemini-4-argon"
 
 [grok.fast]
-model = "grok-4.5"
+model = "grok-4.7"
 
 [grok.balanced]
-model = "grok-4.6"
+model = "grok-4.7"
 
 [grok.smart]
 model = "grok-4.7"
