@@ -105,7 +105,8 @@ enum Command {
     Gemini(GeminiArgs),
     #[command(
         about = "Run the Grok CLI",
-        long_about = "Run grok. A tier only selects the model (grok-4.7). \
+        long_about = "Run grok. A tier only selects the model \
+            (grok-4.5, grok-4.6, grok-4.7). \
             Effort is its own word and is always sent. The default is medium. \
             max is sent as xhigh, or high on grok-4.5.",
         after_long_help = "Examples:\n  \

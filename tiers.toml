@@ -16,7 +16,7 @@ model = "sonnet"
 model = "opus"
 
 [claude.max]
-model = "opus"
+model = "fable"
 
 [codex.fast]
 model = "gpt-6-luna"
@@ -34,19 +34,19 @@ model = "gpt-6-astra"
 model = "gemini-3.8-flash"
 
 [gemini.balanced]
-model = "gemini-3.8-flash"
+model = "gemini-4-argon"
 
 [gemini.smart]
-model = "gemini-3.8-flash"
+model = "gemini-4-argon"
 
 [gemini.max]
 model = "gemini-4-argon"
 
 [grok.fast]
-model = "grok-4.7"
+model = "grok-4.5"
 
 [grok.balanced]
-model = "grok-4.7"
+model = "grok-4.6"
 
 [grok.smart]
 model = "grok-4.7"
