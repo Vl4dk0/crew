@@ -25,7 +25,7 @@ model = "gpt-6-luna"
 model = "gpt-6.1-sol"
 
 [codex.smart]
-model = "gpt-6-astra"
+model = "gpt-6.1-sol"
 
 [codex.max]
 model = "gpt-6-astra"
