@@ -3,6 +3,7 @@
 pub mod inbox;
 pub mod models;
 pub mod process;
+pub mod steps;
 pub mod store;
 pub mod supervisor;
 
@@ -527,6 +528,27 @@ pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
         && !kept.trim().is_empty()
     {
         print!("{kept}");
+    }
+    Ok(0)
+}
+
+pub fn peek(name: &str) -> Result<i32, Error> {
+    if !run_dir(name).join("run.json").is_file() {
+        return Err(Error::new(2, format!("run {name} does not exist")));
+    }
+    let rec = load_record(name)?;
+    if matches!(rec.provider.as_str(), "gemini" | "agy" | "antigravity") {
+        println!("agy writes no live steps; see the answer when the job ends");
+    } else {
+        print!("{}", tail_lines(&run_dir(name).join("steps"), 15)?);
+    }
+    let alive = is_process_alive(
+        rec.supervisor_pid.unwrap_or(0),
+        rec.supervisor_start.as_deref(),
+    );
+    let status = status_of(&rec, alive);
+    if status != Status::Running {
+        println!("status: {}", status.as_str());
     }
     Ok(0)
 }

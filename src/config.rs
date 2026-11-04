@@ -35,7 +35,7 @@ const RESERVED: &[&str] = &[
 
 const PROVIDER_KEYS: &[&str] = &["claude", "codex", "gemini", "grok", "pi"];
 
-const TIER_KEYS: &[&str] = &["fast", "balanced", "smart", "max"];
+const TIER_KEYS: &[&str] = &["fast", "medium", "smart", "max"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTier {

@@ -2,14 +2,14 @@
 # The file is $XDG_CONFIG_HOME/crew/config.toml, or ~/.config/crew/config.toml.
 # A tier is only a model. Effort is a separate word on the command, so a row
 # that baked it in would make `crew models` lie about what the run does.
-# With no tier, a run uses the balanced row (a config override of that row
+# With no tier, a run uses the medium row (a config override of that row
 # included). Grok is the exception: no tier sends no model.
 # Gemini rows are family bases. The runner appends the effort slug itself.
 
 [claude.fast]
 model = "haiku"
 
-[claude.balanced]
+[claude.medium]
 model = "sonnet"
 
 [claude.smart]
@@ -21,7 +21,7 @@ model = "fable"
 [codex.fast]
 model = "gpt-6-luna"
 
-[codex.balanced]
+[codex.medium]
 model = "gpt-6.1-sol"
 
 [codex.smart]
@@ -33,7 +33,7 @@ model = "gpt-6-astra"
 [gemini.fast]
 model = "gemini-3.8-flash"
 
-[gemini.balanced]
+[gemini.medium]
 model = "gemini-3.8-flash"
 
 [gemini.smart]
@@ -45,7 +45,7 @@ model = "gemini-4-argon"
 [grok.fast]
 model = "grok-4.7"
 
-[grok.balanced]
+[grok.medium]
 model = "grok-4.7"
 
 [grok.smart]

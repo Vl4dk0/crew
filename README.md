@@ -27,6 +27,7 @@ crew grok fast high "Reply with the single word pong"
 crew job run demo grok fast "Count the files in /usr/bin slowly"
 crew job queue demo "Then reply with the single word done"
 crew job steer demo "Stop and reply with the single word done"
+crew job peek demo
 crew job result demo
 
 # Check system telemetry (CPU, RAM, GPU, running crew agents)

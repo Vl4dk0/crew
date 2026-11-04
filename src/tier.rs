@@ -11,7 +11,7 @@ const BUILTIN: &str = include_str!("../tiers.toml");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Fast,
-    Balanced,
+    Medium,
     Smart,
     Max,
 }
@@ -20,21 +20,21 @@ impl Tier {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Fast => "fast",
-            Self::Balanced => "balanced",
+            Self::Medium => "medium",
             Self::Smart => "smart",
             Self::Max => "max",
         }
     }
 
     pub fn all() -> [Self; 4] {
-        [Self::Fast, Self::Balanced, Self::Smart, Self::Max]
+        [Self::Fast, Self::Medium, Self::Smart, Self::Max]
     }
 }
 
 pub fn parse_name(name: &str) -> Option<Tier> {
     match name {
         "fast" => Some(Tier::Fast),
-        "balanced" => Some(Tier::Balanced),
+        "medium" => Some(Tier::Medium),
         "smart" => Some(Tier::Smart),
         "max" => Some(Tier::Max),
         _ => None,
@@ -44,7 +44,7 @@ pub fn parse_name(name: &str) -> Option<Tier> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     /// `None` means the runner omits the model flag. Grok does that when no
-    /// tier was given. A pi agent does it when no model and no balanced row.
+    /// tier was given. A pi agent does it when no model and no medium row.
     pub model: Option<String>,
     pub effort: String,
 }
@@ -59,7 +59,7 @@ struct Row {
 #[serde(deny_unknown_fields)]
 struct ProviderRows {
     fast: Row,
-    balanced: Row,
+    medium: Row,
     smart: Row,
     max: Row,
 }
@@ -68,7 +68,7 @@ impl ProviderRows {
     fn get(&self, tier: Tier) -> &Row {
         match tier {
             Tier::Fast => &self.fast,
-            Tier::Balanced => &self.balanced,
+            Tier::Medium => &self.medium,
             Tier::Smart => &self.smart,
             Tier::Max => &self.max,
         }
@@ -77,7 +77,7 @@ impl ProviderRows {
     fn get_mut(&mut self, tier: Tier) -> &mut Row {
         match tier {
             Tier::Fast => &mut self.fast,
-            Tier::Balanced => &mut self.balanced,
+            Tier::Medium => &mut self.medium,
             Tier::Smart => &mut self.smart,
             Tier::Max => &mut self.max,
         }
@@ -205,7 +205,7 @@ pub fn effort_override(owner: &str, effort: &str) -> Result<Option<String>, Erro
 
 /// What the runner should put on the CLI.
 ///
-/// No tier and no `-m` uses the balanced row, so a config override of that
+/// No tier and no `-m` uses the medium row, so a config override of that
 /// row is also the model. Effort is the word the user typed, or `medium`.
 /// A tier never changes it. Grok still omits the model flag when both are
 /// absent, so the account default stands.
@@ -227,7 +227,7 @@ pub fn resolve(
 
 /// Model and thinking for `pi` or a pi-based agent.
 ///
-/// `thinking` is always set. With no tier and no `-m`, the balanced row is
+/// `thinking` is always set. With no tier and no `-m`, the medium row is
 /// the model when the file has one. Otherwise no model is sent.
 pub struct PiSettings {
     pub model: Option<String>,
@@ -278,7 +278,7 @@ pub fn pi_settings(
         None => loaded
             .extras
             .get(name)
-            .and_then(|rows| rows.get(&Tier::Balanced)),
+            .and_then(|rows| rows.get(&Tier::Medium)),
     };
     let model = match model {
         Some(model) => Some(model.to_string()),
@@ -305,13 +305,13 @@ fn resolve_with(
             format!("effort must be one of {}", EFFORTS.join(", ")),
         ));
     }
-    // No tier uses balanced, except grok, which sends no model at all.
+    // No tier uses medium, except grok, which sends no model at all.
     let model = if let Some(model) = model {
         Some(model.to_string())
     } else if provider == Provider::Grok && tier.is_none() {
         None
     } else {
-        let tier = tier.unwrap_or(Tier::Balanced);
+        let tier = tier.unwrap_or(Tier::Medium);
         Some(table.provider(provider).get(tier).model.clone())
     };
     Ok(Resolved {
@@ -417,25 +417,25 @@ mod tests {
     }
 
     #[test]
-    fn omitted_tier_uses_the_balanced_row() {
+    fn omitted_tier_uses_the_medium_row() {
         let table = parse_table(BUILTIN, "builtin").unwrap();
         let grok = resolve_with(&table, Provider::Grok, None, None, None).unwrap();
         assert_eq!(grok.model, None);
         assert_eq!(grok.effort, DEFAULT_EFFORT);
         for provider in [Provider::Claude, Provider::Codex, Provider::Gemini] {
             let resolved = resolve_with(&table, provider, None, None, None).unwrap();
-            let balanced = table.provider(provider).get(Tier::Balanced);
-            assert_eq!(resolved.model.as_deref(), Some(balanced.model.as_str()));
+            let medium = table.provider(provider).get(Tier::Medium);
+            assert_eq!(resolved.model.as_deref(), Some(medium.model.as_str()));
             // No tier and no effort word is one effort for every provider,
             // including codex, whose own CLI would have used low.
             assert_eq!(resolved.effort, DEFAULT_EFFORT);
         }
 
-        let balanced = table.provider(Provider::Codex).get(Tier::Balanced);
+        let medium = table.provider(Provider::Codex).get(Tier::Medium);
         let fast = table.provider(Provider::Codex).get(Tier::Fast);
         let overridden = BUILTIN.replace(
-            &format!("[codex.balanced]\nmodel = \"{}\"", balanced.model),
-            "[codex.balanced]\nmodel = \"sentinel-model\"",
+            &format!("[codex.medium]\nmodel = \"{}\"", medium.model),
+            "[codex.medium]\nmodel = \"sentinel-model\"",
         );
         let table = parse_table(&overridden, "test").unwrap();
         let resolved = resolve_with(&table, Provider::Codex, None, None, None).unwrap();

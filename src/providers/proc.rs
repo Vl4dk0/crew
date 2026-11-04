@@ -822,6 +822,9 @@ fn drain_new_lines(
     // Providers that learn the id from outside the stream (agy's conversation
     // file) get a look even when the child is quiet.
     note_session_line("", announced, watch);
+    if !lines.is_empty() {
+        crate::job::steps::record(&lines);
+    }
     lines
 }
 

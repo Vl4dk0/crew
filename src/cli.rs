@@ -307,7 +307,7 @@ struct SharedArgs {
     /// Resume the most recent session. Claude and Codex reject this together with -r. Grok ignores it when -r is set. Gemini forwards it.
     #[arg(short = 'c', long = "continue")]
     continue_session: bool,
-    /// Tier, then effort, then one prompt. Tier is fast, balanced, smart, or max. Effort is low, medium, high, or max. A word that is only an effort (low, medium, high) sets effort and leaves the model at the balanced tier. A single max is the tier, because the tier slot is checked first. Omit the prompt, or pass -, to read stdin.
+    /// Tier, then effort, then one prompt. Tier is fast, medium, smart, or max. Effort is low, medium, high, or max. A word that is only an effort (low, high) sets effort and leaves the model at the medium tier. A single medium or max is the tier, because the tier slot is checked first. The old word balanced is an error. Omit the prompt, or pass -, to read stdin.
     #[arg(num_args = 0..=3, value_name = "[TIER] [EFFORT] [PROMPT]")]
     words: Vec<String>,
 }
@@ -409,6 +409,18 @@ enum JobCommand {
         /// How many lines from the end. Default 20.
         #[arg(short = 'n', default_value_t = 20)]
         lines: usize,
+    },
+    #[command(
+        about = "Print the live steps of a job",
+        long_about = "Print the last 15 lines written while the job runs. \
+            A line appears when a tool starts and when the answer is ready. \
+            A finished job also prints its status. Gemini writes none.",
+        after_long_help = "Examples:\n  crew job peek demo"
+    )]
+    Peek {
+        /// Job name.
+        #[arg(value_name = "NAME")]
+        name: String,
     },
     #[command(
         about = "Block until the named jobs finish",
@@ -591,6 +603,7 @@ fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
         JobCommand::Show { name, json } => job::show(&name, json),
         JobCommand::Result { name } => job::result(&name),
         JobCommand::Log { name, lines } => job::log(&name, lines),
+        JobCommand::Peek { name } => job::peek(&name),
         JobCommand::Wait {
             names,
             any,
@@ -659,24 +672,28 @@ struct RunWords {
 
 /// Tier slot first, then effort, then one prompt.
 ///
-/// `max` is both a tier and an effort. Checked as a tier first, so a lone
-/// `max` selects the max model. Max effort on the balanced model is
-/// `<tier> max`.
+/// `max` and `medium` are both a tier and an effort. The tier slot is
+/// checked first, so a lone `medium` is the medium model and a lone `max`
+/// is the max model. Max effort on the medium model is `medium max`.
 fn split_run_words(words: &[String]) -> Result<RunWords, Error> {
     let mut rest = words;
     let mut tier = None;
-    if let Some((first, tail)) = rest.split_first()
-        && let Some(parsed) = tier::parse_name(first)
-    {
-        tier = Some(parsed);
-        rest = tail;
+    if let Some((first, tail)) = rest.split_first() {
+        // The old tier word is not a prompt. Scripts that still say it
+        // should fail here instead of running the medium model silently.
+        reject_retired_tier(first)?;
+        if let Some(parsed) = tier::parse_name(first) {
+            tier = Some(parsed);
+            rest = tail;
+        }
     }
     let mut effort = None;
-    if let Some((first, tail)) = rest.split_first()
-        && EFFORTS.contains(&first.as_str())
-    {
-        effort = Some(first.clone());
-        rest = tail;
+    if let Some((first, tail)) = rest.split_first() {
+        reject_retired_tier(first)?;
+        if EFFORTS.contains(&first.as_str()) {
+            effort = Some(first.clone());
+            rest = tail;
+        }
     }
     let prompt = match rest {
         [] => None,
@@ -693,6 +710,21 @@ fn split_run_words(words: &[String]) -> Result<RunWords, Error> {
         effort,
         prompt,
     })
+}
+
+fn reject_retired_tier(word: &str) -> Result<(), Error> {
+    if word != "balanced" {
+        return Ok(());
+    }
+    let words = Tier::all()
+        .iter()
+        .map(|tier| tier.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::new(
+        2,
+        format!("unknown tier \"balanced\" ({words})"),
+    ))
 }
 
 fn finish(
@@ -873,6 +905,22 @@ mod tests {
         let max_effort = parse(&["grok", "fast", "max", "ping"]).unwrap();
         assert_eq!(max_effort.tier, Some(Tier::Fast));
         assert_eq!(max_effort.effort.as_deref(), Some("max"));
+
+        // medium is a tier and an effort. Alone it is the tier, same model as the default.
+        let medium_tier = parse(&["claude", "medium", "ping"]).unwrap();
+        assert_eq!(medium_tier.tier, Some(Tier::Medium));
+        assert_eq!(medium_tier.effort, None);
+
+        let medium_effort = parse(&["claude", "fast", "medium", "ping"]).unwrap();
+        assert_eq!(medium_effort.tier, Some(Tier::Fast));
+        assert_eq!(medium_effort.effort.as_deref(), Some("medium"));
+
+        let retired = parse(&["claude", "balanced", "ping"]).unwrap_err();
+        assert_eq!(retired.code, 2);
+        for word in Tier::all() {
+            assert!(retired.message.contains(word.as_str()));
+        }
+        assert_eq!(parse(&["claude", "fast", "balanced"]).unwrap_err().code, 2);
 
         let stdin_mark = parse(&["claude", "fast", "-"]).unwrap();
         assert_eq!(stdin_mark.tier, Some(Tier::Fast));
