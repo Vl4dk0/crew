@@ -209,10 +209,9 @@ enum Command {
         about = "Print the crew skill, or install it for one harness",
         long_about = "With no harness, print the skill on stdout. With \
             claude, codex, grok, gemini, or pi, ask on the terminal before \
-            writing SKILL.md into that harness's user skills folder. Enter \
-            accepts. A symlink is confirmed as its resolved path, and the \
-            write uses that path. If stdin is not a terminal, exit 2. A \
-            missing skills folder exits 2. The folder is not created.",
+            writing SKILL.md at that harness's default skills path. Enter \
+            accepts. The skills folder is created if it is missing. If stdin \
+            is not a terminal, exit 2.",
         after_long_help = "Examples:\n  \
             crew skill\n  \
             crew skill claude\n  \
