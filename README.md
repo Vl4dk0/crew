@@ -64,6 +64,10 @@ max = "high"
 
 `crew piprover smart high "..."` then runs that command with pi's print flags. The effort value is the word sent to the CLI.
 
+## Skill
+
+`crew skill` prints the skill. `crew skill claude` (also `codex`, `grok`, `gemini`, `pi`) asks before writing it into that harness's user skills folder. A pipe does not prompt: use `crew skill > path`.
+
 ## Contributing
 
 Enable the format-on-commit hook: `git config core.hooksPath .githooks`

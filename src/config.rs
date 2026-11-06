@@ -30,6 +30,7 @@ const RESERVED: &[&str] = &[
     "usage",
     "update",
     "models",
+    "skill",
     "help",
 ];
 

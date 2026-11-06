@@ -11,6 +11,7 @@ pub mod job;
 pub mod load;
 pub mod providers;
 pub mod remote;
+pub mod skill;
 pub mod tier;
 pub mod update;
 pub mod usage;

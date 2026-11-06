@@ -46,7 +46,8 @@ use crate::tier::{self, Tier};
         update    each CLI's own updater, then crew\n\
         \n\
         Config\n  \
-        models    the tier table\n\
+        models    the tier table\n  \
+        skill     print the bundled skill, or install it for one harness\n\
         \n\
         Other machines\n  \
         crew @<host> <args...> runs the command on another machine over SSH \
@@ -62,6 +63,7 @@ use crate::tier::{self, Tier};
         crew load\n  \
         crew usage\n  \
         crew update\n  \
+        crew skill\n  \
         crew @home load",
     arg_required_else_help = true,
     disable_help_subcommand = false
@@ -203,6 +205,24 @@ enum Command {
         after_long_help = "Examples:\n  crew update"
     )]
     Update,
+    #[command(
+        about = "Print the crew skill, or install it for one harness",
+        long_about = "With no harness, print the skill on stdout. With \
+            claude, codex, grok, gemini, or pi, ask on the terminal before \
+            writing SKILL.md into that harness's user skills folder. Enter \
+            accepts. A symlink is confirmed as its resolved path, and the \
+            write uses that path. If stdin is not a terminal, exit 2. A \
+            missing skills folder exits 2. The folder is not created.",
+        after_long_help = "Examples:\n  \
+            crew skill\n  \
+            crew skill claude\n  \
+            crew skill > skill.md"
+    )]
+    Skill {
+        /// claude, codex, grok, gemini, or pi. Omit it to print the skill.
+        #[arg(value_name = "HARNESS")]
+        harness: Option<String>,
+    },
     #[command(
         about = "Print the tier table",
         long_about = "Print provider, tier, model, and whether the row is \
@@ -554,6 +574,7 @@ fn dispatch(cli: Cli) -> Result<i32, Error> {
         Some(Command::Usage) => crate::usage::print_usage(),
         Some(Command::Update) => crate::update::run(),
         Some(Command::Models) => tier::print(),
+        Some(Command::Skill { harness }) => crate::skill::run(harness.as_deref()),
         Some(Command::Job(args)) => dispatch_job(args),
         Some(Command::Claude(args)) => crate::providers::execute(&invocation_from_claude(args)?),
         Some(Command::Gemini(args)) => crate::providers::execute(&invocation_from_gemini(args)?),
