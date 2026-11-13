@@ -31,13 +31,13 @@ model = "gpt-6.1-sol"
 model = "gpt-6-astra"
 
 [gemini.fast]
-model = "gemini-3.8-flash"
+model = "gemini-4-hydrogen"
 
 [gemini.medium]
-model = "gemini-3.8-flash"
+model = "gemini-4-hydrogen"
 
 [gemini.smart]
-model = "gemini-4-argon"
+model = "gemini-4-hydrogen"
 
 [gemini.max]
 model = "gemini-4-argon"

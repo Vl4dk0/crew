@@ -17,7 +17,7 @@ crew <claude|gemini|grok|codex|pi|agent> [fast|medium|smart|max] [low|medium|hig
 - A long prompt goes on stdin: `crew grok -C <dir> - < brief.md`.
 - `-t` defaults to 7200 seconds. A timeout kills the run and exits 124.
 - crew prints `SESSION_ID=<id>` on stderr once the id is known. Resume it with `-r <id>`. `-c` is the most recent session.
-- `--add-dir` is repeatable on claude, gemini, and codex. grok and pi reject it. `--schema` forces JSON on claude, grok, and codex. `--no-web` drops web tools on claude and grok.
+- `--add-dir` is repeatable on claude, gemini, and codex. grok and pi reject it. `--schema` forces JSON on claude, gemini, grok, and codex. `--no-web` drops web tools on claude and grok.
 
 `agy` and `antigravity` are gemini. `gpt` and `chatgpt` are codex.
 

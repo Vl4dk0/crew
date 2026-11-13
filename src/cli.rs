@@ -92,9 +92,9 @@ enum Command {
     #[command(
         about = "Run the Gemini CLI (agy)",
         long_about = "Run agy. Aliases: antigravity, agy. A tier names a base \
-            model (gemini-3.8-flash, gemini-4-argon) and the effort is appended \
-            to that slug. A user -m that already ends in -low, -medium, or \
-            -high is kept, and an effort word is warned and not applied. \
+            model (gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash) and the effort is appended \
+            to that slug. A user -m that already ends in -low, -medium, \
+            -high, or -xhigh is kept, and an effort word is warned and not applied. \
             Any other model is passed --effort. A deadline kills the process \
             group. The partial transcript is kept.",
         after_long_help = "Examples:\n  \
@@ -265,6 +265,9 @@ struct GeminiArgs {
     /// Pass agy's --sandbox.
     #[arg(long)]
     sandbox: bool,
+    /// JSON schema. `{...}` is the schema text. Anything else is a file path, with `~` expanded.
+    #[arg(long)]
+    schema: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -823,6 +826,7 @@ fn invocation_from_gemini(args: GeminiArgs) -> Result<Invocation, Error> {
         Extra {
             agent: args.agent,
             sandbox: args.sandbox,
+            schema: args.schema,
             ..Extra::default()
         },
     )

@@ -31,7 +31,11 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
             "empty prompt (pass a prompt argument or pipe one via stdin)",
         )
     })?;
-    let (argv, note) = plan(invocation, &prompt)?;
+    let schema = match &invocation.schema {
+        Some(schema) => Some(proc::load_schema_literal(schema)?),
+        None => None,
+    };
+    let (argv, note) = plan(invocation, &prompt, schema.as_deref())?;
     proc::write_effort_note(&note);
     let home = cli_home();
     let track_files = invocation
@@ -116,7 +120,11 @@ pub fn run(invocation: &Invocation) -> Result<i32, Error> {
     Ok(presented.code)
 }
 
-fn plan(invocation: &Invocation, prompt: &str) -> Result<(Vec<String>, Option<String>), Error> {
+fn plan(
+    invocation: &Invocation,
+    prompt: &str,
+    schema: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), Error> {
     let resolved = tier::resolve(
         invocation.provider,
         invocation.tier,
@@ -124,17 +132,23 @@ fn plan(invocation: &Invocation, prompt: &str) -> Result<(Vec<String>, Option<St
         invocation.effort.as_deref(),
     )?;
     let verbatim = proc::effort_verbatim(invocation, &resolved.effort)?;
-    Ok(gemini_argv(
+    let (mut argv, note) = gemini_argv(
         invocation,
         resolved.model.as_deref(),
         &resolved.effort,
         prompt,
         verbatim.as_deref(),
-    ))
+    );
+    // agy accepts --json-schema only with a JSON output format.
+    if let Some(schema) = schema {
+        proc::push_pair(&mut argv, "--output-format", "json");
+        proc::push_pair(&mut argv, "--json-schema", schema);
+    }
+    Ok((argv, note))
 }
 
 pub(crate) fn cli_model(invocation: &Invocation) -> Result<Option<String>, Error> {
-    let (argv, _) = plan(invocation, "")?;
+    let (argv, _) = plan(invocation, "", None)?;
     Ok(proc::model_arg(&argv))
 }
 
@@ -233,12 +247,13 @@ fn family_base(model: &str) -> Option<&'static str> {
     match model {
         "flash" | "gemini-3.8-flash" => Some("gemini-3.8-flash"),
         "argon" | "gemini-4-argon" => Some("gemini-4-argon"),
+        "hydrogen" | "gemini-4-hydrogen" => Some("gemini-4-hydrogen"),
         _ => None,
     }
 }
 
 fn baked_base(model: &str) -> Option<&str> {
-    for suffix in ["-low", "-medium", "-high"] {
+    for suffix in ["-low", "-medium", "-high", "-xhigh"] {
         if let Some(base) = model.strip_suffix(suffix)
             && !base.is_empty()
         {
@@ -264,14 +279,32 @@ fn print_timeout(secs: f64) -> String {
     )
 }
 
+/// `--output-format json` prints one object. Its `response` is what the
+/// failure checks read. The answer is `structured_output` when a schema
+/// produced one, else `response`. Any other text is not agy's JSON.
+fn agy_json_answer(clean: &str) -> Option<(String, String)> {
+    let object = clean.lines().rev().find_map(|line| {
+        let value: Value = serde_json::from_str(line.trim()).ok()?;
+        (value.get("status").and_then(Value::as_str) == Some("SUCCESS")).then_some(value)
+    })?;
+    let response = object.get("response")?.as_str()?.trim().to_string();
+    let answer = match object.get("structured_output").filter(|v| !v.is_null()) {
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => serde_json::to_string_pretty(value).ok()?,
+        None => response.clone(),
+    };
+    Some((response, answer))
+}
+
 pub(super) fn present_gemini(raw: &str, rc: i32) -> Report {
     let clean = strip_ansi(raw).replace('\r', "");
     let clean = clean.trim().to_string();
-    let (code, before) = judge_gemini(&clean, rc);
+    let (judged, shown) = agy_json_answer(&clean).unwrap_or_else(|| (clean.clone(), clean));
+    let (code, before) = judge_gemini(&judged, rc);
     Report {
         code,
         before_stderr: before,
-        stdout: format!("{clean}\n"),
+        stdout: format!("{shown}\n"),
         after_stderr: String::new(),
     }
 }
@@ -462,6 +495,31 @@ mod tests {
         assert!(note.is_none());
         assert!(!has(&argv, "--effort"));
 
+        invocation.model = Some("hydrogen".to_string());
+        invocation.effort = None;
+        let (argv, _) = gemini_argv(&invocation, Some("hydrogen"), "medium", "hello", None);
+        assert_eq!(flag(&argv, "--model"), Some("gemini-4-hydrogen-medium"));
+        assert!(!has(&argv, "--effort"));
+
+        invocation.model = Some("gemini-4-hydrogen-xhigh".to_string());
+        invocation.effort = Some("max".to_string());
+        let (argv, note) = gemini_argv(
+            &invocation,
+            Some("gemini-4-hydrogen-xhigh"),
+            "max",
+            "hello",
+            None,
+        );
+        assert_eq!(flag(&argv, "--model"), Some("gemini-4-hydrogen-xhigh"));
+        assert!(!has(&argv, "--effort"));
+        assert!(note.unwrap().contains("already sets it"));
+
+        let (argv, _) = plan(&invocation, "hello", Some("{\"type\":\"object\"}")).unwrap();
+        assert_eq!(flag(&argv, "--output-format"), Some("json"));
+        assert_eq!(flag(&argv, "--json-schema"), Some("{\"type\":\"object\"}"));
+        let (argv, _) = plan(&invocation, "hello", None).unwrap();
+        assert!(!has(&argv, "--output-format"));
+
         let baked = "gemini-3.8-flash-high";
         invocation.model = Some(baked.to_string());
         invocation.effort = Some("max".to_string());
@@ -530,6 +588,20 @@ mod tests {
         assert!(has(&argv, "--sandbox"));
         assert_eq!(flag(&argv, "--add-dir"), Some("~/notes"));
         assert_eq!(argv[2], "hello");
+    }
+
+    #[test]
+    fn json_output_yields_the_structured_answer() {
+        let structured = "\u{1b}[?25l{\"status\":\"SUCCESS\",\"response\":\"{\\\"n\\\":7}\",\"structured_output\":{\"n\":7}}\r\n";
+        let report = present_gemini(structured, 0);
+        assert_eq!(report.code, 0);
+        assert_eq!(report.stdout, "{\n  \"n\": 7\n}\n");
+
+        let plain = r#"{"status":"SUCCESS","response":"hi","structured_output":null}"#;
+        assert_eq!(present_gemini(plain, 0).stdout, "hi\n");
+
+        let denied = r#"{"status":"SUCCESS","response":"no output produced \u2014 a tool required the \"read_file\" permission"}"#;
+        assert_eq!(present_gemini(denied, 0).code, 125);
     }
 
     #[test]
