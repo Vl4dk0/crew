@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
@@ -37,18 +37,29 @@ enum Turn {
 /// turn ends cleanly with mail still in the inbox, runs the next message in
 /// the same job and the same session.
 pub fn run_supervisor(name: &str) -> Result<i32, Error> {
+    // Wait for the parent to commit supervisor_pid/lstart to run.json before
+    // reading or writing it, or exit without starting if the parent aborted.
+    if std::env::var_os("CREW_SUPERVISE_SYNC").is_some() {
+        let mut gate = [0u8; 1];
+        match std::io::stdin().read_exact(&mut gate) {
+            Ok(()) if gate[0] == b'G' => {}
+            _ => return Ok(1),
+        }
+    }
+
     // Create new session
     unsafe {
         libc::setsid();
     }
 
-    let my_pid = std::process::id();
-    let my_start = get_process_lstart(my_pid).unwrap_or_default();
-
     let mut record = load_record(name)?;
-    record.supervisor_pid = Some(my_pid);
-    record.supervisor_start = Some(my_start);
-    save_record(name, &record)?;
+    if record.supervisor_pid.is_none() {
+        let my_pid = std::process::id();
+        let my_start = get_process_lstart(my_pid).unwrap_or_default();
+        record.supervisor_pid = Some(my_pid);
+        record.supervisor_start = Some(my_start);
+        save_record(name, &record)?;
+    }
 
     let dir = run_dir(name);
     let mut prompt = fs::read(dir.join("prompt.bin")).unwrap_or_default();
@@ -135,6 +146,7 @@ fn run_turn(
         // The wrapper reads the inbox from this. proc::spawn strips it before
         // the provider CLI, so a tool the model runs does not look like the job.
         .env("CREW_JOB", name)
+        .env_remove("CREW_SUPERVISE_SYNC")
         .process_group(0)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));

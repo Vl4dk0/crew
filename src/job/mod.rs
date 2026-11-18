@@ -8,7 +8,7 @@ pub mod store;
 pub mod supervisor;
 
 use std::fs;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -268,8 +268,32 @@ fn run_internal(
         .to_string_lossy()
         .to_string();
 
-    fs::create_dir_all(&dir)
-        .map_err(|e| Error::new(2, format!("failed to create dir {}: {}", dir.display(), e)))?;
+    let dir = store::create_run_dir(&job.name)?;
+    struct StartGuard {
+        dir: Option<PathBuf>,
+        child: Option<std::process::Child>,
+    }
+    impl StartGuard {
+        fn disarm(&mut self) {
+            self.dir = None;
+            self.child = None;
+        }
+    }
+    impl Drop for StartGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(dir) = self.dir.take() {
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+    }
+    let mut guard = StartGuard {
+        dir: Some(dir.clone()),
+        child: None,
+    };
 
     // Write prompt.bin
     fs::write(dir.join("prompt.bin"), &prompt_bytes)
@@ -297,15 +321,17 @@ fn run_internal(
 
     save_record(&job.name, &record)?;
 
-    // Spawn detached supervisor daemon with setsid in pre_exec
+    // Spawn detached supervisor daemon with setsid in pre_exec.
+    // Keep it gated on stdin until run.json is committed with its pid/start time.
     let current_exe = std::env::current_exe()
         .map_err(|e| Error::new(127, format!("failed to find current exe: {}", e)))?;
 
-    let child = unsafe {
+    let mut child = unsafe {
         Command::new(current_exe)
             .arg("--supervise")
             .arg(&job.name)
-            .stdin(Stdio::null())
+            .env("CREW_SUPERVISE_SYNC", "1")
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .pre_exec(|| {
@@ -319,12 +345,41 @@ fn run_internal(
     };
 
     let sup_pid = child.id();
+    let sup_stdin = child.stdin.take();
+    guard.child = Some(child);
+
     record.supervisor_pid = Some(sup_pid);
     record.supervisor_start = process::get_process_lstart(sup_pid);
     save_record(&job.name, &record)?;
 
+    let mut stdin = sup_stdin.ok_or_else(|| Error::new(127, "missing supervisor sync pipe"))?;
+    stdin
+        .write_all(b"G")
+        .and_then(|()| stdin.flush())
+        .map_err(|e| Error::new(127, format!("supervisor failed before starting: {e}")))?;
+    drop(stdin);
+    guard.disarm();
+
     crate::outln!("{}", job.name);
     Ok(0)
+}
+
+pub(crate) fn status_of_job(name: &str, rec: &mut RunRecord) -> Status {
+    if rec.exit_code.is_some() {
+        return status_of(rec, false);
+    }
+    let alive = is_process_alive(
+        rec.supervisor_pid.unwrap_or(0),
+        rec.supervisor_start.as_deref(),
+    );
+    if !alive
+        && let Ok(fresh) = load_record(name)
+        && fresh.exit_code.is_some()
+    {
+        *rec = fresh;
+        return status_of(rec, false);
+    }
+    status_of(rec, alive)
 }
 
 pub fn ls(json: bool) -> Result<i32, Error> {
@@ -343,12 +398,8 @@ pub fn ls(json: bool) -> Result<i32, Error> {
         for entry in entries.flatten() {
             if entry.path().is_dir() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if let Ok(rec) = load_record(&name) {
-                    let alive = is_process_alive(
-                        rec.supervisor_pid.unwrap_or(0),
-                        rec.supervisor_start.as_deref(),
-                    );
-                    let status = status_of(&rec, alive);
+                if let Ok(mut rec) = load_record(&name) {
+                    let status = status_of_job(&name, &mut rec);
                     records.push((rec, status));
                 }
             }
@@ -404,12 +455,8 @@ pub fn ls(json: bool) -> Result<i32, Error> {
 }
 
 pub fn show(name: &str, json: bool) -> Result<i32, Error> {
-    let rec = load_record(name)?;
-    let alive = is_process_alive(
-        rec.supervisor_pid.unwrap_or(0),
-        rec.supervisor_start.as_deref(),
-    );
-    let status = status_of(&rec, alive);
+    let mut rec = load_record(name)?;
+    let status = status_of_job(name, &mut rec);
 
     if json {
         let mut val = serde_json::to_value(&rec).unwrap();
@@ -476,12 +523,8 @@ fn listed_model(record: &RunRecord) -> &str {
 }
 
 pub fn result(name: &str) -> Result<i32, Error> {
-    let rec = load_record(name)?;
-    let alive = is_process_alive(
-        rec.supervisor_pid.unwrap_or(0),
-        rec.supervisor_start.as_deref(),
-    );
-    let status = status_of(&rec, alive);
+    let mut rec = load_record(name)?;
+    let status = status_of_job(name, &mut rec);
 
     if status == Status::Running {
         return Err(Error::new(2, format!("run {} is still running", name)));
@@ -507,12 +550,8 @@ pub fn result(name: &str) -> Result<i32, Error> {
 }
 
 pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
-    let rec = load_record(name)?;
-    let alive = is_process_alive(
-        rec.supervisor_pid.unwrap_or(0),
-        rec.supervisor_start.as_deref(),
-    );
-    let status = status_of(&rec, alive);
+    let mut rec = load_record(name)?;
+    let status = status_of_job(name, &mut rec);
 
     let stderr_path = run_dir(name).join("stderr");
     if !stderr_path.is_file() {
@@ -548,7 +587,7 @@ pub fn peek(name: &str) -> Result<i32, Error> {
     if !run_dir(name).join("run.json").is_file() {
         return Err(Error::new(2, format!("run {name} does not exist")));
     }
-    let rec = load_record(name)?;
+    let mut rec = load_record(name)?;
     let ok = if matches!(rec.provider.as_str(), "gemini" | "agy" | "antigravity") {
         crate::outln!("agy writes no live steps; see the answer when the job ends")
     } else {
@@ -557,11 +596,7 @@ pub fn peek(name: &str) -> Result<i32, Error> {
     if !ok {
         return Ok(0);
     }
-    let alive = is_process_alive(
-        rec.supervisor_pid.unwrap_or(0),
-        rec.supervisor_start.as_deref(),
-    );
-    let status = status_of(&rec, alive);
+    let status = status_of_job(name, &mut rec);
     if status != Status::Running {
         crate::outln!("status: {}", status.as_str());
     }
@@ -589,12 +624,8 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
         let mut i = 0;
         while i < pending.len() {
             let name = &pending[i];
-            if let Ok(rec) = load_record(name) {
-                let alive = is_process_alive(
-                    rec.supervisor_pid.unwrap_or(0),
-                    rec.supervisor_start.as_deref(),
-                );
-                let status = status_of(&rec, alive);
+            if let Ok(mut rec) = load_record(name) {
+                let status = status_of_job(name, &mut rec);
                 if status != Status::Running {
                     let code = if status == Status::Stopped {
                         130
@@ -777,12 +808,8 @@ fn running_job(name: &str) -> Result<RunRecord, Error> {
     if !run_dir(name).join("run.json").is_file() {
         return Err(Error::new(2, format!("run {name} does not exist")));
     }
-    let rec = load_record(name)?;
-    let alive = is_process_alive(
-        rec.supervisor_pid.unwrap_or(0),
-        rec.supervisor_start.as_deref(),
-    );
-    let status = status_of(&rec, alive);
+    let mut rec = load_record(name)?;
+    let status = status_of_job(name, &mut rec);
     if let Err(err) = inbox::require_running(status) {
         let message = match status {
             Status::Lost => format!("run {name} is lost"),

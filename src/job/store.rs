@@ -2,9 +2,12 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
 use crate::job::models::RunRecord;
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn base_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CREW_HOME") {
@@ -62,23 +65,49 @@ pub fn load_record(name: &str) -> Result<RunRecord, Error> {
         .map_err(|e| Error::new(2, format!("corrupt run.json for {}: {}", name, e)))
 }
 
-/// Save `run.json` atomically via write + rename.
+/// Atomically claim `runs/<name>/`. Rejects an already-existing job without a check-then-create race.
+pub fn create_run_dir(name: &str) -> Result<PathBuf, Error> {
+    let runs = runs_dir();
+    fs::create_dir_all(&runs)
+        .map_err(|e| Error::new(2, format!("failed to create dir {}: {}", runs.display(), e)))?;
+    let dir = run_dir(name);
+    match fs::create_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Error::new(2, format!("run {} already exists", name)))
+        }
+        Err(e) => Err(Error::new(
+            2,
+            format!("failed to create dir {}: {}", dir.display(), e),
+        )),
+    }
+}
+
+/// Save `run.json` atomically via unique temp file + rename.
 pub fn save_record(name: &str, record: &RunRecord) -> Result<(), Error> {
     let dir = run_dir(name);
     fs::create_dir_all(&dir)
         .map_err(|e| Error::new(2, format!("failed to create dir {}: {}", dir.display(), e)))?;
 
-    let tmp_path = dir.join("run.json.tmp");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!("run.json.tmp.{}.{}", std::process::id(), seq));
     let final_path = dir.join("run.json");
 
     let json_bytes = serde_json::to_vec_pretty(record)
         .map_err(|e| Error::new(2, format!("serialize error: {}", e)))?;
 
-    fs::write(&tmp_path, json_bytes)
-        .map_err(|e| Error::new(2, format!("failed to write tmp run.json: {}", e)))?;
+    if let Err(e) = fs::write(&tmp_path, json_bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Error::new(
+            2,
+            format!("failed to write tmp run.json: {}", e),
+        ));
+    }
 
-    fs::rename(&tmp_path, &final_path)
-        .map_err(|e| Error::new(2, format!("failed to commit run.json: {}", e)))?;
+    if let Err(e) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Error::new(2, format!("failed to commit run.json: {}", e)));
+    }
 
     Ok(())
 }
