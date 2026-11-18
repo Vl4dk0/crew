@@ -29,6 +29,7 @@ Exit codes: 0 ok · 75 usage, quota, rate, or credit limit · 124 timeout · 125
 
 ```bash
 crew job run <name> <provider> [tier] [effort] [flags] "<prompt>"
+crew job run <next> <provider> --after <name> "<prompt>"  # waits for <name> ok; else skipped
 crew job wait <name>...
 crew job result <name>       # stdout of the last turn
 crew job log <name>          # stderr tail, then stdout

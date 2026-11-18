@@ -375,16 +375,20 @@ enum JobCommand {
     #[command(
         about = "Detach a provider run under a name",
         long_about = "Start `crew <provider> ...` in the background and print the name. \
-            The flags after the provider are the same flags as a foreground run.",
+            The flags after the provider are the same flags as a foreground run. \
+            Pass --after <job> (before or after the provider) to wait in state `waiting` \
+            until <job> ends `ok` (exit 0, after any queued/steered turns); otherwise the \
+            job ends as `skipped` (exit 1). Timeout `-t` counts from when the agent starts.",
         after_long_help = "Examples:\n  \
             crew job run demo grok fast high \"Reply with the single word pong\"\n  \
-            crew job run audit claude -C ~/Projects/crew \"List the risky spots\""
+            crew job run audit claude -C ~/Projects/crew \"List the risky spots\"\n  \
+            crew job run review grok -C ~/Projects/crew --after audit \"Review the findings\""
     )]
     Run(JobRunArgs),
     #[command(
         about = "List jobs, oldest first",
         long_about = "Print name, derived status, wrapper (provider), model, and age. \
-            Status is running, lost, stopped, ok, timeout, unclean, or failed.",
+            Status is waiting, running, lost, stopped, skipped, ok, timeout, unclean, or failed.",
         after_long_help = "Examples:\n  crew job ls\n  crew job ls --json"
     )]
     Ls {
@@ -447,8 +451,8 @@ enum JobCommand {
     #[command(
         about = "Block until the named jobs finish",
         long_about = "Exit with the job's code. A stopped job returns 130. \
-            A lost job has no recorded exit and returns 0 (`job result` exits 3). \
-            An unknown name is exit 2. --timeout expiring is exit 4.",
+            A skipped job returns 1. A lost job has no recorded exit and returns 0 \
+            (`job result` exits 3). An unknown name is exit 2. --timeout expiring is exit 4.",
         after_long_help = "Examples:\n  \
             crew job wait demo\n  \
             crew job wait one two --any\n  \
