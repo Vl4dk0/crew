@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
+    Waiting,
     Running,
     Lost,
     Stopped,
+    Skipped,
     Ok,
     Timeout,
     Unclean,
@@ -14,9 +16,11 @@ pub enum Status {
 impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Waiting => "waiting",
             Self::Running => "running",
             Self::Lost => "lost",
             Self::Stopped => "stopped",
+            Self::Skipped => "skipped",
             Self::Ok => "ok",
             Self::Timeout => "timeout",
             Self::Unclean => "unclean",
@@ -44,6 +48,10 @@ pub struct RunRecord {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +90,10 @@ struct RunRecordWire {
     #[serde(default)]
     note: Option<String>,
     #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    skip_reason: Option<String>,
+    #[serde(default)]
     parent: Option<String>,
     #[serde(default)]
     resume_session: Option<String>,
@@ -115,6 +127,8 @@ impl From<RunRecordWire> for RunRecord {
             args: wire.args,
             cwd: wire.cwd,
             note: wire.note,
+            after: wire.after,
+            skip_reason: wire.skip_reason,
             parent: wire.parent,
             resume_session: wire.resume_session,
             created_at: wire.created_at,
@@ -132,12 +146,20 @@ impl From<RunRecordWire> for RunRecord {
 
 /// Derive dynamic status from record state and supervisor liveness.
 pub fn status_of(record: &RunRecord, is_supervisor_alive: bool) -> Status {
+    if record.stopped && record.exit_code.is_some() {
+        return Status::Stopped;
+    }
+    if record.skip_reason.is_some() {
+        return Status::Skipped;
+    }
     match record.exit_code {
         None => {
-            if is_supervisor_alive {
-                Status::Running
-            } else {
+            if !is_supervisor_alive {
                 Status::Lost
+            } else if record.after.is_some() && record.started_at.is_none() {
+                Status::Waiting
+            } else {
+                Status::Running
             }
         }
         Some(code) => {
@@ -201,6 +223,8 @@ mod tests {
             args: vec![],
             cwd: "/tmp".to_string(),
             note: None,
+            after: None,
+            skip_reason: None,
             parent: None,
             resume_session: None,
             created_at: "2026-10-20T20:00:00Z".to_string(),
@@ -232,6 +256,26 @@ mod tests {
         rec.stopped = true;
         rec.exit_code = Some(143);
         assert_eq!(status_of(&rec, false), Status::Stopped);
+
+        let mut waiting = rec.clone();
+        waiting.stopped = false;
+        waiting.exit_code = None;
+        waiting.after = Some("prev".to_string());
+        waiting.started_at = None;
+        assert_eq!(status_of(&waiting, true), Status::Waiting);
+        assert_eq!(status_of(&waiting, false), Status::Lost);
+
+        waiting.started_at = Some("2026-10-20T20:00:01Z".to_string());
+        assert_eq!(status_of(&waiting, true), Status::Running);
+
+        waiting.skip_reason = Some("prev failed".to_string());
+        waiting.exit_code = Some(1);
+        assert_eq!(status_of(&waiting, false), Status::Skipped);
+
+        waiting.skip_reason = None;
+        waiting.stopped = true;
+        waiting.exit_code = Some(143);
+        assert_eq!(status_of(&waiting, false), Status::Stopped);
     }
 
     #[test]

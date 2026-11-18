@@ -27,6 +27,7 @@ pub struct NewJob {
     /// Built-in provider or custom agent. The supervisor re-execs `crew` with this word.
     pub provider: String,
     pub note: Option<String>,
+    pub after: Option<String>,
     pub trailing: Vec<String>,
 }
 
@@ -153,20 +154,7 @@ fn extract_flags(trailing: &[String], prompt_is_positional: bool) -> Vec<String>
 
         if token.starts_with('-') && token != "-" {
             flags.push(token.clone());
-            let takes_val = matches!(
-                token.as_str(),
-                "-m" | "--model"
-                    | "-t"
-                    | "--timeout"
-                    | "-C"
-                    | "--cwd"
-                    | "-r"
-                    | "--resume"
-                    | "--add-dir"
-                    | "--schema"
-                    | "--max-turns"
-                    | "--agent"
-            );
+            let takes_val = crate::cli::takes_flag_value(token);
             if takes_val && !token.contains('=') {
                 i += 1;
                 if i < trailing.len() {
@@ -224,6 +212,19 @@ fn run_internal(
     let dir = run_dir(&job.name);
     if dir.exists() {
         return Err(Error::new(2, format!("run {} already exists", job.name)));
+    }
+
+    if let Some(ref after_name) = job.after {
+        if after_name == &job.name {
+            return Err(Error::new(
+                2,
+                format!("job {} cannot wait for itself", job.name),
+            ));
+        }
+        if !validate_run_name(after_name) || !run_dir(after_name).join("run.json").is_file() {
+            return Err(Error::new(2, format!("unknown --after job {}", after_name)));
+        }
+        let _ = load_record(after_name)?;
     }
 
     let invocation = parse_command(&job.provider, &job.trailing)?;
@@ -306,6 +307,8 @@ fn run_internal(
         args: flags,
         cwd,
         note: job.note,
+        after: job.after,
+        skip_reason: None,
         parent,
         resume_session,
         created_at: current_iso(),
@@ -478,6 +481,12 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
         if let Some(ref note) = rec.note {
             crate::outln!("note: {}", note);
         }
+        if let Some(ref after) = rec.after {
+            crate::outln!("after: {}", after);
+        }
+        if let Some(ref reason) = rec.skip_reason {
+            crate::outln!("skip_reason: {}", reason);
+        }
         if let Some(ref parent) = rec.parent {
             crate::outln!("parent: {}", parent);
         }
@@ -529,6 +538,9 @@ pub fn result(name: &str) -> Result<i32, Error> {
     if status == Status::Running {
         return Err(Error::new(2, format!("run {} is still running", name)));
     }
+    if status == Status::Waiting {
+        return Err(Error::new(2, format!("run {} is waiting", name)));
+    }
     if status == Status::Lost {
         return Err(Error::new(3, format!("run {} is lost", name)));
     }
@@ -545,6 +557,9 @@ pub fn result(name: &str) -> Result<i32, Error> {
     if status == Status::Stopped {
         return Ok(130);
     }
+    if status == Status::Skipped {
+        return Ok(rec.exit_code.unwrap_or(1));
+    }
 
     Ok(rec.exit_code.unwrap_or(0))
 }
@@ -559,6 +574,12 @@ pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
             return Err(Error::new(
                 2,
                 format!("{} is running and stderr missing", name),
+            ));
+        }
+        if status == Status::Waiting {
+            return Err(Error::new(
+                2,
+                format!("{} is waiting and stderr missing", name),
             ));
         }
         if status == Status::Lost {
@@ -626,11 +647,11 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
             let name = &pending[i];
             if let Ok(mut rec) = load_record(name) {
                 let status = status_of_job(name, &mut rec);
-                if status != Status::Running {
-                    let code = if status == Status::Stopped {
-                        130
-                    } else {
-                        rec.exit_code.unwrap_or(0)
+                if !matches!(status, Status::Running | Status::Waiting) {
+                    let code = match status {
+                        Status::Stopped => 130,
+                        Status::Skipped => rec.exit_code.unwrap_or(1),
+                        _ => rec.exit_code.unwrap_or(0),
                     };
 
                     if any {
@@ -760,6 +781,7 @@ pub fn resume(name: &str, prompt: Option<String>) -> Result<i32, Error> {
         name: next_name,
         provider,
         note: parent.note.clone(),
+        after: None,
         trailing: new_args,
     };
 
@@ -813,6 +835,7 @@ fn running_job(name: &str) -> Result<RunRecord, Error> {
     if let Err(err) = inbox::require_running(status) {
         let message = match status {
             Status::Lost => format!("run {name} is lost"),
+            Status::Waiting => format!("run {name} is waiting (not started yet)"),
             _ => format!("run {name} is not running"),
         };
         return Err(Error::new(err.code, message));

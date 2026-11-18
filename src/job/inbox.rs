@@ -55,11 +55,12 @@ pub fn job_name() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Running accepts a message. Lost is exit 3. Anything finished is exit 2.
+/// Running accepts a message. Lost is exit 3. Waiting or finished is exit 2.
 pub fn require_running(status: Status) -> Result<(), Error> {
     match status {
         Status::Running => Ok(()),
         Status::Lost => Err(Error::new(3, "lost job")),
+        Status::Waiting => Err(Error::new(2, "job is waiting")),
         _ => Err(Error::new(2, "job is not running")),
     }
 }
@@ -243,6 +244,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         assert!(require_running(Status::Running).is_ok());
+        assert_eq!(require_running(Status::Waiting).unwrap_err().code, 2);
         assert_eq!(require_running(Status::Lost).unwrap_err().code, 3);
         assert_eq!(require_running(Status::Ok).unwrap_err().code, 2);
         assert_eq!(require_running(Status::Stopped).unwrap_err().code, 2);

@@ -536,6 +536,9 @@ struct JobRunArgs {
     /// Free-text note stored on the job. Not sent to the provider.
     #[arg(long)]
     note: Option<String>,
+    /// Wait for this job to finish with status ok before starting the agent.
+    #[arg(long, value_name = "JOB")]
+    after: Option<String>,
     /// Job name. Must match ^[a-z0-9][a-z0-9._-]{0,63}$.
     #[arg(value_name = "NAME")]
     name: String,
@@ -616,13 +619,15 @@ fn dispatch_external(args: Vec<String>) -> Result<i32, Error> {
 fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
     match args.command {
         JobCommand::Run(args) => {
+            let (after, trailing) = split_after_flag(args.after, &args.trailing)?;
             // Reject a trailing command that is not a legal invocation.
-            let _ = parse_command(&args.provider, &args.trailing)?;
+            let _ = parse_command(&args.provider, &trailing)?;
             job::run(NewJob {
                 name: args.name,
                 provider: args.provider,
                 note: args.note,
-                trailing: args.trailing,
+                after,
+                trailing,
             })
         }
         JobCommand::Ls { json } => job::ls(json),
@@ -654,6 +659,72 @@ fn dispatch_job(args: JobArgs) -> Result<i32, Error> {
         JobCommand::Queue { name, message } => job::queue(&name, &message),
         JobCommand::Steer { name, message } => job::steer(&name, &message),
     }
+}
+
+/// Flags on provider invocations that consume the following token as a value.
+pub(crate) fn takes_flag_value(token: &str) -> bool {
+    matches!(
+        token,
+        "-m" | "--model"
+            | "-t"
+            | "--timeout"
+            | "-C"
+            | "--cwd"
+            | "-r"
+            | "--resume"
+            | "--add-dir"
+            | "--schema"
+            | "-n"
+            | "--max-turns"
+            | "--agent"
+    )
+}
+
+/// Extract `--after <job>` / `--after=<job>` when placed after `<name> <provider>`.
+fn split_after_flag(
+    initial: Option<String>,
+    trailing: &[String],
+) -> Result<(Option<String>, Vec<String>), Error> {
+    let mut after = initial;
+    let mut out = Vec::with_capacity(trailing.len());
+    let mut i = 0;
+    while i < trailing.len() {
+        let token = &trailing[i];
+        if token == "--" {
+            out.extend(trailing[i..].iter().cloned());
+            break;
+        }
+        if token == "--after" {
+            if after.is_some() {
+                return Err(Error::new(2, "--after cannot be passed more than once"));
+            }
+            let Some(val) = trailing.get(i + 1) else {
+                return Err(Error::new(2, "--after requires a job name"));
+            };
+            after = Some(val.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(val) = token.strip_prefix("--after=") {
+            if after.is_some() {
+                return Err(Error::new(2, "--after cannot be passed more than once"));
+            }
+            after = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        out.push(token.clone());
+        if takes_flag_value(token)
+            && !token.contains('=')
+            && let Some(val) = trailing.get(i + 1)
+        {
+            out.push(val.clone());
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    Ok((after, out))
 }
 
 /// Parse `crew job run <name> <command> ...` for a built-in provider or a custom agent.
@@ -1007,5 +1078,59 @@ mod tests {
         }
 
         assert_documented(&Cli::command());
+    }
+
+    #[test]
+    fn after_flag_parses_before_or_after_provider() {
+        let parsed = Cli::try_parse_from([
+            "crew", "job", "run", "review", "--after", "impl", "grok", "-C", "repo", "check",
+        ])
+        .unwrap();
+        let Some(Command::Job(job)) = parsed.command else {
+            panic!("expected job");
+        };
+        let JobCommand::Run(run) = job.command else {
+            panic!("expected job run");
+        };
+        let (after, trailing) = split_after_flag(run.after, &run.trailing).unwrap();
+        assert_eq!(after.as_deref(), Some("impl"));
+        assert_eq!(trailing, vec!["-C", "repo", "check"]);
+
+        let (after2, trailing2) = split_after_flag(
+            None,
+            &[
+                "-C".into(),
+                "repo".into(),
+                "--after".into(),
+                "impl".into(),
+                "check".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(after2.as_deref(), Some("impl"));
+        assert_eq!(trailing2, vec!["-C", "repo", "check"]);
+
+        let (after3, trailing3) =
+            split_after_flag(None, &["--after=impl".into(), "check".into()]).unwrap();
+        assert_eq!(after3.as_deref(), Some("impl"));
+        assert_eq!(trailing3, vec!["check"]);
+
+        // `--` stops flag extraction so `--after` as a prompt is kept verbatim.
+        let (after4, trailing4) = split_after_flag(None, &["--".into(), "--after".into()]).unwrap();
+        assert_eq!(after4, None);
+        assert_eq!(trailing4, vec!["--", "--after"]);
+
+        assert_eq!(
+            split_after_flag(Some("a".into()), &["--after".into(), "b".into()])
+                .unwrap_err()
+                .code,
+            2
+        );
+        assert_eq!(
+            split_after_flag(None, &["--after".into()])
+                .unwrap_err()
+                .code,
+            2
+        );
     }
 }

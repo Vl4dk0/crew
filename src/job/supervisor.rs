@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use crate::error::Error;
 use crate::id::Provider;
 use crate::job::inbox;
+use crate::job::models::Status;
 use crate::job::process::get_process_lstart;
 use crate::job::store::{load_record, run_dir, save_record};
 
@@ -52,6 +53,14 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
         libc::setsid();
     }
 
+    static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::size_t);
+    }
+    extern "C" fn handle_sigterm(_sig: libc::c_int) {
+        STOP_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
     let mut record = load_record(name)?;
     if record.supervisor_pid.is_none() {
         let my_pid = std::process::id();
@@ -62,16 +71,29 @@ pub fn run_supervisor(name: &str) -> Result<i32, Error> {
     }
 
     let dir = run_dir(name);
+    if let Some(after_name) = record.after.clone() {
+        match wait_for_predecessor(&after_name, &STOP_REQUESTED) {
+            WaitOutcome::Ready => {}
+            WaitOutcome::Stopped => {
+                record.stopped = true;
+                record.finished_at = Some(super::current_iso());
+                record.exit_code = Some(143);
+                save_record(name, &record)?;
+                return Ok(143);
+            }
+            WaitOutcome::Skip(reason) => {
+                record.skip_reason = Some(reason.clone());
+                record.finished_at = Some(super::current_iso());
+                record.exit_code = Some(1);
+                note_line(&dir, &format!("[crew] skipped: {reason}"));
+                save_record(name, &record)?;
+                return Ok(1);
+            }
+        }
+    }
+
     let mut prompt = fs::read(dir.join("prompt.bin")).unwrap_or_default();
     let mut resume_id: Option<String> = None;
-
-    static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-    unsafe {
-        libc::signal(libc::SIGTERM, handle_sigterm as *const () as libc::size_t);
-    }
-    extern "C" fn handle_sigterm(_sig: libc::c_int) {
-        STOP_REQUESTED.store(true, Ordering::SeqCst);
-    }
 
     let exit_code = loop {
         if prompt.is_empty() && resume_id.is_some() {
@@ -338,6 +360,58 @@ fn note_line(dir: &Path, line: &str) {
         return;
     };
     let _ = writeln!(file, "{line}");
+}
+
+enum WaitOutcome {
+    Ready,
+    Stopped,
+    Skip(String),
+}
+
+enum PredState {
+    Pending,
+    Ok,
+    Skip(String),
+}
+
+fn wait_for_predecessor(after_name: &str, stop_requested: &AtomicBool) -> WaitOutcome {
+    loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            return WaitOutcome::Stopped;
+        }
+        match check_predecessor(after_name) {
+            PredState::Pending => {}
+            PredState::Ok => return WaitOutcome::Ready,
+            PredState::Skip(reason) => return WaitOutcome::Skip(reason),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn check_predecessor(after_name: &str) -> PredState {
+    let path = run_dir(after_name).join("run.json");
+    if !path.is_file() {
+        return PredState::Skip(format!("{after_name} missing"));
+    }
+    let Ok(mut rec) = load_record(after_name) else {
+        return PredState::Skip(format!("{after_name} record unreadable"));
+    };
+    let status = super::status_of_job(after_name, &mut rec);
+    match status {
+        Status::Running | Status::Waiting => PredState::Pending,
+        Status::Ok => PredState::Ok,
+        Status::Failed => {
+            let reason = match rec.exit_code {
+                Some(75) => format!("{after_name} failed (limit, exit 75)"),
+                Some(code) => format!("{after_name} failed (exit {code})"),
+                None => format!("{after_name} failed"),
+            };
+            PredState::Skip(reason)
+        }
+        Status::Stopped | Status::Lost | Status::Unclean | Status::Skipped | Status::Timeout => {
+            PredState::Skip(format!("{after_name} {}", status.as_str()))
+        }
+    }
 }
 
 /// Persist the session id as soon as the wrapper prints it. A supervisor
