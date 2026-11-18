@@ -35,39 +35,50 @@ pub fn run() -> Result<i32, Error> {
     let mut failed = false;
     for (bin, update_args) in HARNESSES {
         if !providers::binary_on_path(bin) {
-            println!("{bin}: not found");
+            if !crate::outln!("{bin}: not found") {
+                return Ok(if failed { 1 } else { 0 });
+            }
             continue;
         }
         let before = match read_version(bin) {
             Ok(version) => version,
             Err(reason) => {
-                println!("{bin} update failed: {reason}");
                 failed = true;
+                if !crate::outln!("{bin} update failed: {reason}") {
+                    return Ok(1);
+                }
                 continue;
             }
         };
         if let Err(reason) = run_update(bin, update_args) {
-            println!("{bin} update failed: {reason}");
             failed = true;
+            if !crate::outln!("{bin} update failed: {reason}") {
+                return Ok(1);
+            }
             continue;
         }
         let after = match read_version(bin) {
             Ok(version) => version,
             Err(reason) => {
-                println!("{bin} update failed: {reason}");
                 failed = true;
+                if !crate::outln!("{bin} update failed: {reason}") {
+                    return Ok(1);
+                }
                 continue;
             }
         };
-        if before == after {
-            println!("{bin} {before} (up to date)");
+        let printed = if before == after {
+            crate::outln!("{bin} {before} (up to date)")
         } else {
-            println!("{bin} {before} -> {after}");
+            crate::outln!("{bin} {before} -> {after}")
+        };
+        if !printed {
+            return Ok(if failed { 1 } else { 0 });
         }
     }
     // After the harnesses. A failure there still tries crew; either one fails the run.
     if let Err(reason) = update_self() {
-        println!("crew update failed: {reason}");
+        crate::outln!("crew update failed: {reason}");
         failed = true;
     }
     Ok(if failed { 1 } else { 0 })
@@ -98,25 +109,25 @@ fn update_self() -> Result<(), String> {
     // If cargo is missing, crew cannot have been installed via cargo here and
     // cannot update itself. Skip rather than failing the run.
     if !providers::binary_on_path("cargo") {
-        println!("crew: cargo not found, skipped");
+        crate::outln!("crew: cargo not found, skipped");
         return Ok(());
     }
     let list = read_install_list()?;
     match parse_install_list(&list) {
         CrewInstall::Missing => {
-            println!("crew: not installed via cargo");
+            crate::outln!("crew: not installed via cargo");
             Ok(())
         }
         CrewInstall::Path(path) => {
-            println!("crew: installed from {path}, skipped");
+            crate::outln!("crew: installed from {path}, skipped");
             Ok(())
         }
         CrewInstall::Other(source) => {
-            println!("crew: installed from {source}, skipped");
+            crate::outln!("crew: installed from {source}, skipped");
             Ok(())
         }
         CrewInstall::Pinned { kind, value } => {
-            println!("crew: installed from git {kind} {value}, skipped");
+            crate::outln!("crew: installed from git {kind} {value}, skipped");
             Ok(())
         }
         CrewInstall::Git { url, branch, sha } => install_if_moved(&url, branch.as_deref(), &sha),
@@ -149,7 +160,7 @@ fn read_install_list() -> Result<String, String> {
 fn install_if_moved(url: &str, branch: Option<&str>, installed: &str) -> Result<(), String> {
     let remote = remote_sha(url, branch)?;
     if shas_match(installed, &remote) {
-        println!("crew {} (up to date)", short_sha(installed));
+        crate::outln!("crew {} (up to date)", short_sha(installed));
         return Ok(());
     }
     // `--branch` only when the install recorded one. Without it, cargo would
@@ -178,7 +189,7 @@ fn install_if_moved(url: &str, branch: Option<&str>, installed: &str) -> Result<
             captured.code,
         ));
     }
-    println!("crew {} -> {}", short_sha(installed), short_sha(&remote));
+    crate::outln!("crew {} -> {}", short_sha(installed), short_sha(&remote));
     Ok(())
 }
 

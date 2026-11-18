@@ -830,7 +830,7 @@ pub fn print_usage() -> Result<i32, Error> {
         view.plan = plan::show(&view.key, signal);
     }
 
-    print!("{}", render_blocks(&views, std::io::stdout().is_terminal()));
+    crate::out!("{}", render_blocks(&views, std::io::stdout().is_terminal()));
     Ok(0)
 }
 

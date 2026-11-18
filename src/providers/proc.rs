@@ -1417,4 +1417,31 @@ mod tests {
         assert_eq!(res.unwrap_err(), LAUNCH_EXIT);
         assert!(!binary_on_path("missing_binary_xyz"));
     }
+
+    #[test]
+    fn capture_driven_survives_closed_child_stdin() {
+        let mut sent = 0usize;
+        let captured = capture_driven(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "exec 0<&-; sleep 0.15; echo ok".to_string(),
+            ],
+            None,
+            Duration::from_secs(5),
+            KillStyle::TermThenKill,
+            &mut |_| None,
+            |tick| {
+                if sent < 3 {
+                    tick.send("{\"type\":\"steer\"}");
+                    sent += 1;
+                }
+                TickDone::Continue
+            },
+        )
+        .expect("capture_driven");
+        assert_eq!(captured.code, 0);
+        assert_eq!(captured.stdout.trim(), "ok");
+        assert!(sent >= 1);
+    }
 }

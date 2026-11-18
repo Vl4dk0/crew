@@ -325,7 +325,9 @@ pub const DEFAULT_EFFORT: &str = "medium";
 
 pub fn print() -> Result<i32, Error> {
     let loaded = load()?;
-    println!("provider    tier      model                      source");
+    if !crate::outln!("provider    tier      model                      source") {
+        return Ok(0);
+    }
     for provider in [
         Provider::Claude,
         Provider::Codex,
@@ -342,7 +344,9 @@ pub fn print() -> Result<i32, Error> {
             } else {
                 "builtin"
             };
-            print_row(provider.as_str(), tier, &row.model, source);
+            if !print_row(provider.as_str(), tier, &row.model, source) {
+                return Ok(0);
+            }
         }
     }
     for (owner, rows) in &loaded.extras {
@@ -350,7 +354,9 @@ pub fn print() -> Result<i32, Error> {
             let Some(row) = rows.get(&tier) else {
                 continue;
             };
-            print_row(owner, tier, &row.model, "config");
+            if !print_row(owner, tier, &row.model, "config") {
+                return Ok(0);
+            }
         }
     }
     let mut any_effort = false;
@@ -365,21 +371,25 @@ pub fn print() -> Result<i32, Error> {
             continue;
         }
         if !any_effort {
-            println!("\neffort");
+            if !crate::outln!("\neffort") {
+                return Ok(0);
+            }
             any_effort = true;
         }
-        println!("{owner}  {}", parts.join("  "));
+        if !crate::outln!("{owner}  {}", parts.join("  ")) {
+            return Ok(0);
+        }
     }
     Ok(0)
 }
 
-fn print_row(owner: &str, tier: Tier, model: &str, source: &str) {
-    println!(
+fn print_row(owner: &str, tier: Tier, model: &str, source: &str) -> bool {
+    crate::outln!(
         "{:<10}  {:<8}  {:<25}  {source}",
         owner,
         tier.as_str(),
         model,
-    );
+    )
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ pub mod store;
 pub mod supervisor;
 
 use std::fs;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -323,7 +323,7 @@ fn run_internal(
     record.supervisor_start = process::get_process_lstart(sup_pid);
     save_record(&job.name, &record)?;
 
-    println!("{}", job.name);
+    crate::outln!("{}", job.name);
     Ok(0)
 }
 
@@ -331,9 +331,9 @@ pub fn ls(json: bool) -> Result<i32, Error> {
     let r_dir = runs_dir();
     if !r_dir.is_dir() {
         if json {
-            println!("[]");
+            crate::outln!("[]");
         } else {
-            println!("No runs yet.");
+            crate::outln!("No runs yet.");
         }
         return Ok(0);
     }
@@ -357,9 +357,9 @@ pub fn ls(json: bool) -> Result<i32, Error> {
 
     if records.is_empty() {
         if json {
-            println!("[]");
+            crate::outln!("[]");
         } else {
-            println!("No runs yet.");
+            crate::outln!("No runs yet.");
         }
         return Ok(0);
     }
@@ -374,21 +374,29 @@ pub fn ls(json: bool) -> Result<i32, Error> {
             val["status"] = serde_json::Value::String(status.as_str().to_string());
             json_arr.push(val);
         }
-        println!("{}", serde_json::to_string_pretty(&json_arr).unwrap());
+        crate::outln!("{}", serde_json::to_string_pretty(&json_arr).unwrap());
     } else {
-        println!(
+        if !crate::outln!(
             "{:<14}  {:<8}  {:<10}  {:<24}  {:<5}",
-            "NAME", "STATUS", "WRAPPER", "MODEL", "AGE"
-        );
+            "NAME",
+            "STATUS",
+            "WRAPPER",
+            "MODEL",
+            "AGE"
+        ) {
+            return Ok(0);
+        }
         for (rec, status) in records {
-            println!(
+            if !crate::outln!(
                 "{:<14}  {:<8}  {:<10}  {:<24}  {:<5}",
                 rec.name,
                 status.as_str(),
                 rec.provider,
                 listed_model(&rec),
                 format_age(&rec.created_at)
-            );
+            ) {
+                return Ok(0);
+            }
         }
     }
 
@@ -412,38 +420,40 @@ pub fn show(name: &str, json: bool) -> Result<i32, Error> {
                 .map(|(kind, at)| serde_json::json!({"kind": kind, "at": at}))
                 .collect(),
         );
-        println!("{}", serde_json::to_string_pretty(&val).unwrap());
+        crate::outln!("{}", serde_json::to_string_pretty(&val).unwrap());
     } else {
-        println!("run: {}", rec.name);
-        println!("status: {}", status.as_str());
-        println!("provider: {}", rec.provider);
-        println!("model: {}", listed_model(&rec));
-        println!("args: {:?}", rec.args);
-        println!("cwd: {}", rec.cwd);
+        crate::outln!("run: {}", rec.name);
+        crate::outln!("status: {}", status.as_str());
+        crate::outln!("provider: {}", rec.provider);
+        crate::outln!("model: {}", listed_model(&rec));
+        crate::outln!("args: {:?}", rec.args);
+        crate::outln!("cwd: {}", rec.cwd);
         if let Some(ref note) = rec.note {
-            println!("note: {}", note);
+            crate::outln!("note: {}", note);
         }
         if let Some(ref parent) = rec.parent {
-            println!("parent: {}", parent);
+            crate::outln!("parent: {}", parent);
         }
         if let Some(ref res) = rec.resume_session {
-            println!("resume_session: {}", res);
+            crate::outln!("resume_session: {}", res);
         }
-        println!("created_at: {}", rec.created_at);
+        crate::outln!("created_at: {}", rec.created_at);
         if let Some(ref s) = rec.started_at {
-            println!("started_at: {}", s);
+            crate::outln!("started_at: {}", s);
         }
         if let Some(ref f) = rec.finished_at {
-            println!("finished_at: {}", f);
+            crate::outln!("finished_at: {}", f);
         }
         if let Some(code) = rec.exit_code {
-            println!("exit_code: {}", code);
+            crate::outln!("exit_code: {}", code);
         }
         if let Some(ref sid) = rec.session_id {
-            println!("session_id: {}", sid);
+            crate::outln!("session_id: {}", sid);
         }
         for (kind, at) in delivered_messages(name)? {
-            println!("message: {kind} {at}");
+            if !crate::outln!("message: {kind} {at}") {
+                return Ok(0);
+            }
         }
     }
 
@@ -486,7 +496,7 @@ pub fn result(name: &str) -> Result<i32, Error> {
         let mut out = Vec::new();
         file.read_to_end(&mut out)
             .map_err(|e| Error::new(2, format!("failed to read stdout: {}", e)))?;
-        let _ = std::io::stdout().write_all(&out);
+        crate::out::write_stdout(&out);
     }
 
     if status == Status::Stopped {
@@ -521,13 +531,15 @@ pub fn log(name: &str, lines: usize) -> Result<i32, Error> {
     }
 
     let output = tail_lines(&stderr_path, lines)?;
-    print!("{}", output);
+    if !crate::out!("{}", output) {
+        return Ok(0);
+    }
     let stdout_path = run_dir(name).join("stdout");
     if stdout_path.is_file()
         && let Ok(kept) = tail_lines(&stdout_path, lines)
         && !kept.trim().is_empty()
     {
-        print!("{kept}");
+        crate::out!("{kept}");
     }
     Ok(0)
 }
@@ -537,10 +549,13 @@ pub fn peek(name: &str) -> Result<i32, Error> {
         return Err(Error::new(2, format!("run {name} does not exist")));
     }
     let rec = load_record(name)?;
-    if matches!(rec.provider.as_str(), "gemini" | "agy" | "antigravity") {
-        println!("agy writes no live steps; see the answer when the job ends");
+    let ok = if matches!(rec.provider.as_str(), "gemini" | "agy" | "antigravity") {
+        crate::outln!("agy writes no live steps; see the answer when the job ends")
     } else {
-        print!("{}", tail_lines(&run_dir(name).join("steps"), 15)?);
+        crate::out!("{}", tail_lines(&run_dir(name).join("steps"), 15)?)
+    };
+    if !ok {
+        return Ok(0);
     }
     let alive = is_process_alive(
         rec.supervisor_pid.unwrap_or(0),
@@ -548,7 +563,7 @@ pub fn peek(name: &str) -> Result<i32, Error> {
     );
     let status = status_of(&rec, alive);
     if status != Status::Running {
-        println!("status: {}", status.as_str());
+        crate::outln!("status: {}", status.as_str());
     }
     Ok(0)
 }
@@ -588,7 +603,7 @@ pub fn wait(names: &[String], any: bool, timeout_secs: Option<u64>) -> Result<i3
                     };
 
                     if any {
-                        println!("{}", name);
+                        crate::outln!("{}", name);
                         return Ok(code);
                     }
 
@@ -792,7 +807,7 @@ pub fn steer(name: &str, words: &[String]) -> Result<i32, Error> {
     // Native steer is picked up by the wrapper. Everyone else is stopped
     // mid-step by the supervisor, which says so here before that happens.
     if !supervisor::native_steer(&rec.provider) {
-        eprintln!("[crew] current step was lost");
+        crate::errln!("[crew] current step was lost");
     }
     Ok(0)
 }

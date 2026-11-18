@@ -594,7 +594,7 @@ fn dispatch_external(args: Vec<String>) -> Result<i32, Error> {
     };
     let trailing: Vec<String> = args.collect();
     if trailing.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!(
+        crate::outln!(
             "{name} is a custom agent from {}. It takes the same arguments as `crew pi`.",
             crate::config::config_path().display()
         );
@@ -602,8 +602,11 @@ fn dispatch_external(args: Vec<String>) -> Result<i32, Error> {
         let pi = command
             .find_subcommand_mut("pi")
             .ok_or_else(|| Error::new(2, "pi help is missing"))?;
-        pi.print_long_help()
-            .map_err(|err| Error::new(2, format!("cannot print help: {err}")))?;
+        if let Err(err) = pi.print_long_help()
+            && err.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(Error::new(2, format!("cannot print help: {err}")));
+        }
         return Ok(0);
     }
     let invocation = parse_command(&name, &trailing)?;

@@ -4,7 +4,7 @@
 //! folder is created with the `crew` directory.
 
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
 use crate::error::Error;
@@ -17,7 +17,7 @@ const HARNESSES: &[&str] = &["claude", "codex", "grok", "gemini", "pi"];
 pub fn run(harness: Option<&str>) -> Result<i32, Error> {
     match harness {
         None => {
-            print!("{TEXT}");
+            crate::out!("{TEXT}");
             Ok(0)
         }
         Some(name) => install(name),
@@ -34,8 +34,7 @@ fn install(name: &str) -> Result<i32, Error> {
     }
     let skills = skills_dir(name)?;
     let path = skills.join("crew").join("SKILL.md");
-    eprint!("Write {}? [Y/n] ", path.display());
-    io::stderr().flush().ok();
+    crate::err!("Write {}? [Y/n] ", path.display());
     let mut line = String::new();
     if io::stdin().read_line(&mut line).unwrap_or(0) == 0 || !accepted(&line) {
         return Ok(0);
@@ -46,7 +45,7 @@ fn install(name: &str) -> Result<i32, Error> {
     }
     fs::write(&path, TEXT)
         .map_err(|err| Error::new(2, format!("cannot write {}: {err}", path.display())))?;
-    println!("{}", path.display());
+    crate::outln!("{}", path.display());
     Ok(0)
 }
 

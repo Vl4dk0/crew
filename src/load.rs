@@ -693,10 +693,14 @@ pub fn print_load() -> Result<i32, Error> {
     let ps_output = run_cmd("ps", &["-axww", "-o", "pid=,ppid=,%cpu=,command="]);
     let (processes, cpu_sum) = parse_ps_snapshot(&ps_output);
     let metrics = collect_metrics(cpu_sum, !processes.is_empty());
-    println!("{}", format_load_line(&metrics));
+    if !crate::outln!("{}", format_load_line(&metrics)) {
+        return Ok(0);
+    }
     let agents = crate::tier::agent_names()?;
     for line in format_provider_lines(&find_agent_pids_with(&processes, &agents)) {
-        println!("{line}");
+        if !crate::outln!("{line}") {
+            return Ok(0);
+        }
     }
     Ok(0)
 }

@@ -9,6 +9,7 @@ pub mod error;
 pub mod id;
 pub mod job;
 pub mod load;
+pub mod out;
 pub mod providers;
 pub mod remote;
 pub mod skill;

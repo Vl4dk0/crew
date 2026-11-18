@@ -71,7 +71,7 @@ fn run_ssh(ssh_target: &str, remote_cmd: &str, host: &str) -> Result<i32, Error>
 
     // SSH exits with 255 when the connection or authentication fails.
     if code == 255 {
-        eprintln!("[crew] ssh to {host} failed");
+        crate::errln!("[crew] ssh to {host} failed");
     }
 
     Ok(code)
