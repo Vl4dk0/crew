@@ -564,3 +564,112 @@ fn after_skips_cascade_across_failure_limit_timeout_stop_and_lost() {
         "a skipped/stopped waiter started its agent"
     );
 }
+
+#[test]
+fn grok_mid_run_usage_limit_exits_75_and_skips_after() {
+    let env = TestEnv::new("grok-mid-limit");
+    let never_ran = env.root.join("never_ran");
+    let real_limit = "Error: You\u{2019}ve reached your free Grok Build usage limit for now. Get SuperGrok for much higher limits, or try again later: https://grok.com/supergrok?referrer=grok-build";
+    env.write_script(
+        "grok",
+        &format!(
+            "case \"$*\" in\n\
+               *NEVER*)\n\
+                 touch \"{}\"\n\
+                 echo '{{\"type\":\"result\",\"result\":\"oops\"}}'\n\
+                 ;;\n\
+               *LIMIT_MID*)\n\
+                 echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-mid\"}}'\n\
+                 echo '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{{\"cmd\":\"ls\"}}}}]}}}}'\n\
+                 echo '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}}]}}}}'\n\
+                 echo '{{\"type\":\"result\",\"subtype\":\"success\",\"num_turns\":18,\"result\":\"\",\"stop_reason\":\"end_turn\",\"total_cost_usd\":0.941218,\"usage\":{{\"input_tokens\":100,\"output_tokens\":50}}}}'\n\
+                 echo '{real_limit}' >&2\n\
+                 exit 1\n\
+                 ;;\n\
+               *NORMAL_OK*)\n\
+                 echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-ok\"}}'\n\
+                 echo '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"The usage limit check lives in proc.rs.\"}}]}}}}'\n\
+                 echo '{{\"type\":\"result\",\"subtype\":\"success\",\"num_turns\":2,\"result\":\"The usage limit check lives in proc.rs.\",\"stop_reason\":\"end_turn\"}}'\n\
+                 ;;\n\
+               *NORMAL_FAIL*)\n\
+                 echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sess-fail\"}}'\n\
+                 echo '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"The usage limit check lives in proc.rs.\"}}]}}}}'\n\
+                 echo '{{\"type\":\"result\",\"subtype\":\"success\",\"num_turns\":2,\"result\":\"The usage limit check lives in proc.rs.\",\"stop_reason\":\"end_turn\"}}'\n\
+                 echo 'Error: command failed' >&2\n\
+                 exit 1\n\
+                 ;;\n\
+             esac",
+            never_ran.display()
+        ),
+    );
+
+    let direct = env.run_with_stdin(&["grok", "LIMIT_MID"], None);
+    assert_eq!(direct.status.code(), Some(75));
+    let direct_err = String::from_utf8_lossy(&direct.stderr);
+    assert!(direct_err.contains("SESSION_ID=sess-mid"), "{direct_err}");
+    assert!(
+        direct_err.contains("[crew] tokens=150 turns=18 cost=$0.941218"),
+        "{direct_err}"
+    );
+    assert!(
+        direct_err.contains("[crew] grok usage limit:")
+            && direct_err.contains("free Grok Build usage limit"),
+        "{direct_err}"
+    );
+
+    assert!(
+        env.run_with_stdin(&["job", "run", "limited", "grok", "LIMIT_MID"], None)
+            .status
+            .success()
+    );
+    assert!(
+        env.run_with_stdin(
+            &[
+                "job",
+                "run",
+                "afterlimited",
+                "grok",
+                "--after",
+                "limited",
+                "NEVER"
+            ],
+            None
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        env.run_with_stdin(&["job", "wait", "limited"], None)
+            .status
+            .code(),
+        Some(75)
+    );
+    let show_text =
+        String::from_utf8_lossy(&env.run_with_stdin(&["job", "show", "limited"], None).stdout)
+            .into_owned();
+    assert!(show_text.contains("status: failed"), "{show_text}");
+    assert!(show_text.contains("exit_code: 75"), "{show_text}");
+
+    assert_eq!(
+        env.run_with_stdin(&["job", "wait", "afterlimited"], None)
+            .status
+            .code(),
+        Some(1)
+    );
+    let show_after: serde_json::Value = serde_json::from_slice(
+        &env.run_with_stdin(&["job", "show", "afterlimited", "--json"], None)
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(show_after["status"], "skipped");
+    assert_eq!(show_after["skip_reason"], "limited failed (limit, exit 75)");
+    assert!(!never_ran.exists(), "skipped job ran its agent");
+
+    let ok = env.run_with_stdin(&["grok", "NORMAL_OK"], None);
+    assert_eq!(ok.status.code(), Some(0));
+
+    let fail = env.run_with_stdin(&["grok", "NORMAL_FAIL"], None);
+    assert_eq!(fail.status.code(), Some(1));
+    let fail_err = String::from_utf8_lossy(&fail.stderr);
+    assert!(!fail_err.contains("usage limit:"), "{fail_err}");
+}

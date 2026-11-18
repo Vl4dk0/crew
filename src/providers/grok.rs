@@ -154,18 +154,16 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
             Ok(value) => value,
             Err(_) => {
                 if child != 0 && looks_like_usage_limit(out) {
-                    return report(
-                        USAGE_LIMIT_EXIT,
-                        String::new(),
-                        String::new(),
-                        usage_limit_line("grok", out),
-                    );
+                    return limit_report(out, String::new(), String::new());
                 }
                 let mut stdout = String::new();
                 let trimmed = out.trim();
                 if !trimmed.is_empty() {
                     stdout.push_str(trimmed);
                     stdout.push('\n');
+                }
+                if child != 0 && looks_like_usage_limit(err) {
+                    return limit_report(err, stdout, String::new());
                 }
                 let mut after = String::new();
                 if !err.trim().is_empty() {
@@ -176,6 +174,9 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
         }
     };
     if !data.is_object() {
+        if child != 0 && looks_like_usage_limit(err) {
+            return limit_report(err, out.to_string(), String::new());
+        }
         return report(
             code_or_one(child),
             String::new(),
@@ -184,24 +185,24 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
         );
     }
     if data.get("type").and_then(Value::as_str) == Some("error") {
+        let mut after = String::new();
+        if let Some(id) = data.get("sessionId").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            after.push_str(&format!("SESSION_ID={id}\n"));
+        }
         let message = match data.get("message") {
             None => out.to_string(),
             Some(value) => py_display(Some(value)),
         };
         if looks_like_usage_limit(&message) {
-            return report(
-                USAGE_LIMIT_EXIT,
-                String::new(),
-                String::new(),
-                usage_limit_line("grok", &message),
-            );
+            return limit_report(&message, String::new(), after);
         }
-        return report(
-            code_or_one(child),
-            String::new(),
-            String::new(),
-            format!("[crew] error: {message}\n"),
-        );
+        if child != 0 && looks_like_usage_limit(err) {
+            return limit_report(err, String::new(), after);
+        }
+        after.push_str(&format!("[crew] error: {message}\n"));
+        return report(code_or_one(child), String::new(), String::new(), after);
     }
     let text = grok_answer(&data, schema);
     let mut stdout = String::new();
@@ -218,6 +219,9 @@ pub(super) fn assess_grok(raw: bool, schema: bool, child: i32, out: &str, err: &
     if let Some(line) = grok_usage_line(&data) {
         after.push_str(&line);
         after.push('\n');
+    }
+    if child != 0 && looks_like_usage_limit(err) {
+        return limit_report(err, stdout, after);
     }
     if let Some(stop) = stop_reason(&data)
         && norm_stop(&stop) != "endturn"
@@ -280,7 +284,10 @@ fn fold_grok_stream(out: &str) -> Option<String> {
             session_id = proc::session_from_line(&event.to_string());
         }
         match event.get("type").and_then(Value::as_str) {
-            Some("result") => result = Some(event),
+            Some("result") => {
+                result = Some(event);
+                error = None;
+            }
             Some("error") => error = Some(event),
             Some("assistant") if !saw_delta => append_grok_text(event, &mut assistant),
             Some("text" | "thought") => {
@@ -301,7 +308,15 @@ fn fold_grok_stream(out: &str) -> Option<String> {
     if let Some(id) = session_id {
         object.insert("sessionId".to_string(), Value::String(id));
     }
-    if let Some(result) = result {
+    if let Some(error) = error {
+        object.insert("type".to_string(), Value::String("error".to_string()));
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        object.insert("message".to_string(), Value::String(message));
+    } else if let Some(result) = result {
         if let Some(text) = result.get("result").and_then(Value::as_str) {
             object.insert("text".to_string(), Value::String(text.to_string()));
         }
@@ -326,14 +341,6 @@ fn fold_grok_stream(out: &str) -> Option<String> {
                 Value::String("max_turns".to_string()),
             );
         }
-    } else if let Some(error) = error {
-        object.insert("type".to_string(), Value::String("error".to_string()));
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        object.insert("message".to_string(), Value::String(message));
     } else {
         let text = if saw_delta { deltas } else { assistant };
         object.insert("text".to_string(), Value::String(text));
@@ -537,6 +544,11 @@ fn grok_usage_line(data: &Value) -> Option<String> {
         line.push_str(&format!(" cost=${cost}"));
     }
     Some(line)
+}
+
+fn limit_report(message: &str, stdout: String, mut after: String) -> Report {
+    after.push_str(&usage_limit_line("grok", message));
+    report(USAGE_LIMIT_EXIT, String::new(), stdout, after)
 }
 
 fn report(code: i32, before: String, stdout: String, after: String) -> Report {
