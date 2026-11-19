@@ -92,7 +92,7 @@ enum Command {
     #[command(
         about = "Run the Gemini CLI (agy)",
         long_about = "Run agy. Aliases: antigravity, agy. A tier names a base \
-            model (gemini-4-hydrogen, gemini-4-argon, gemini-3.8-flash) and the effort is appended \
+            model (gemini-4-hydrogen, gemini-4-neon, gemini-4-argon, gemini-3.8-flash) and the effort is appended \
             to that slug. A user -m that already ends in -low, -medium, \
             -high, or -xhigh is kept, and an effort word is warned and not applied. \
             Any other model is passed --effort. A deadline kills the process \

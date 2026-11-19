@@ -37,7 +37,7 @@ model = "gemini-4-hydrogen"
 model = "gemini-4-hydrogen"
 
 [gemini.smart]
-model = "gemini-4-hydrogen"
+model = "gemini-4-neon"
 
 [gemini.max]
 model = "gemini-4-argon"

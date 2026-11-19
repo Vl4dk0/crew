@@ -248,6 +248,7 @@ fn family_base(model: &str) -> Option<&'static str> {
         "flash" | "gemini-3.8-flash" => Some("gemini-3.8-flash"),
         "argon" | "gemini-4-argon" => Some("gemini-4-argon"),
         "hydrogen" | "gemini-4-hydrogen" => Some("gemini-4-hydrogen"),
+        "neon" | "gemini-4-neon" => Some("gemini-4-neon"),
         _ => None,
     }
 }
@@ -499,6 +500,20 @@ mod tests {
         invocation.effort = None;
         let (argv, _) = gemini_argv(&invocation, Some("hydrogen"), "medium", "hello", None);
         assert_eq!(flag(&argv, "--model"), Some("gemini-4-hydrogen-medium"));
+        assert!(!has(&argv, "--effort"));
+
+        invocation.model = Some("neon".to_string());
+        invocation.effort = None;
+        let (argv, note) = gemini_argv(&invocation, Some("neon"), "medium", "hello", None);
+        assert_eq!(flag(&argv, "--model"), Some("gemini-4-neon-medium"));
+        assert!(note.is_none());
+        assert!(!has(&argv, "--effort"));
+
+        invocation.model = None;
+        invocation.effort = Some("high".to_string());
+        let (argv, note) = gemini_argv(&invocation, Some("gemini-4-neon"), "high", "hello", None);
+        assert_eq!(flag(&argv, "--model"), Some("gemini-4-neon-high"));
+        assert!(note.is_none());
         assert!(!has(&argv, "--effort"));
 
         invocation.model = Some("gemini-4-hydrogen-xhigh".to_string());
